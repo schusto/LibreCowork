@@ -1,5 +1,7 @@
 require('events').EventEmitter.defaultMaxListeners = 100;
 const { logger } = require('@librechat/data-schemas');
+// [cowork] Deterministic context reduction (thinking strip + tool dedup/truncation)
+const { applyContextReduction } = require('~/server/utils/contextReduction');
 const { getBufferString, HumanMessage } = require('@langchain/core/messages');
 const {
   createRun,
@@ -332,7 +334,14 @@ class AgentClient extends BaseClient {
       return formattedMessage;
     });
 
-    payload = formattedMessages;
+    // [cowork] Apply deterministic context reduction before sending to the backend.
+    // Strips old thinking blocks and truncates/deduplicates old tool results.
+    // No DB writes, no async, no LLM — pure transform. See docs/18_context_reduction.md.
+    payload = applyContextReduction(
+      formattedMessages,
+      orderedMessages,
+      this.options?.conversationId,
+    );
     messages = orderedMessages;
     promptTokens = promptTokenTotal;
 
