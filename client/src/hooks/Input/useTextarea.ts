@@ -217,7 +217,28 @@ export default function useTextarea({
         return;
       }
 
+      // Check for image data in clipboard items (covers screenshots and copied images
+      // where clipboardData.files may be empty but items contains image blobs)
+      const imageItems: File[] = [];
+      for (const item of Array.from(clipboardData.items)) {
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
+          const blob = item.getAsFile();
+          if (blob) {
+            const ext = item.type === 'image/png' ? 'png' : item.type === 'image/jpeg' ? 'jpg' : 'png';
+            imageItems.push(new File([blob], `clipboard_${+new Date()}.${ext}`, { type: item.type }));
+          }
+        }
+      }
+
+      if (imageItems.length > 0) {
+        e.preventDefault();
+        setFilesLoading(true);
+        handleFiles(imageItems);
+        return;
+      }
+
       if (clipboardData.files.length > 0) {
+        e.preventDefault();
         setFilesLoading(true);
         const timestampedFiles: File[] = [];
         for (const file of clipboardData.files) {

@@ -16,8 +16,13 @@ import AgentHandoff from './AgentHandoff';
 import CodeAnalyze from './CodeAnalyze';
 import Container from './Container';
 import WebSearch from './WebSearch';
+import TaskList from './TaskList';
 import ToolCall from './ToolCall';
 import Image from './Image';
+
+/** Tool names that trigger the TaskList widget instead of a generic ToolCall card. */
+const TODO_UPDATE_TOOL = 'todo_update';
+const TODO_CLEAR_TOOL  = 'todo_clear';
 
 type PartProps = {
   part?: TMessageContentParts;
@@ -169,6 +174,17 @@ const Part = memo(function Part({
       );
     } else if (isToolCall && toolCall.name?.startsWith(Constants.LC_TRANSFER_TO_)) {
       return <AgentHandoff args={toolCall.args ?? ''} name={toolCall.name || ''} />;
+    } else if (isToolCall && (toolCall.name?.startsWith(TODO_UPDATE_TOOL) || toolCall.name?.startsWith(TODO_CLEAR_TOOL))) {
+      // Render task-list widget instead of a generic ToolCall card.
+      // MCP tools are named todo_update_mcp_todo_list / todo_clear_mcp_todo_list —
+      // startsWith catches both the bare name and the MCP-suffixed form.
+      // todo_clear passes no args, which TaskList treats as an empty list (dismissed state).
+      return (
+        <TaskList
+          args={toolCall.args ?? '{}'}
+          isSubmitting={isSubmitting}
+        />
+      );
     } else if (isToolCall) {
       return (
         <ToolCall
@@ -179,6 +195,7 @@ const Part = memo(function Part({
           isSubmitting={isSubmitting}
           attachments={attachments}
           auth={toolCall.auth}
+          tool_call_id={toolCall.id}
           isLast={isLast}
         />
       );
@@ -236,6 +253,7 @@ const Part = memo(function Part({
           args={toolCall.function.arguments as string}
           name={toolCall.function.name}
           output={toolCall.function.output}
+          tool_call_id={toolCall.id}
           isLast={isLast}
         />
       );

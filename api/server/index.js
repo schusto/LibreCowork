@@ -208,11 +208,16 @@ const startServer = async () => {
   /** Error handler (must be last - Express identifies error middleware by its 4-arg signature) */
   app.use(ErrorController);
 
-  app.listen(port, host, async (err) => {
+  const server = app.listen(port, host, async (err) => {
     if (err) {
       logger.error('Failed to start server:', err);
       process.exit(1);
     }
+
+    // Node.js 18+ defaults requestTimeout to 300 000 ms (5 min), which kills
+    // long-running SSE streams (e.g. during slow model prefill) before the
+    // model produces its first token.  Set to 0 to disable entirely for SSE.
+    server.requestTimeout = 0;
 
     if (host === '0.0.0.0') {
       logger.info(

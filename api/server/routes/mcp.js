@@ -1,5 +1,6 @@
 const { Router } = require('express');
 const { logger, getTenantId } = require('@librechat/data-schemas');
+const elicitationRouter = require('./mcp/elicitation');
 const {
   CacheKeys,
   Constants,
@@ -829,5 +830,8 @@ router.delete(
   }),
   deleteMCPServerController,
 );
+
+// Mount elicitation routes
+router.use('/elicitations', elicitationRouter);
 
 module.exports = router;

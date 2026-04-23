@@ -21,7 +21,6 @@ const {
   recordCollectedUsage,
   GenerationJobManager,
   getTransactionsConfig,
-  resolveRecursionLimit,
   createMemoryProcessor,
   loadAgent: loadAgentFn,
   createMultiAgentMapper,
@@ -51,7 +50,6 @@ const {
 const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
 const { encodeAndFormat } = require('~/server/services/Files/images/encode');
 const { createContextHandlers } = require('~/app/clients/prompts');
-const { resolveConfigServers } = require('~/server/services/MCP');
 const { getMCPServerTools } = require('~/server/services/Config');
 const BaseClient = require('~/app/clients/BaseClient');
 const { getMCPManager } = require('~/config');
@@ -185,7 +183,7 @@ class AgentClient extends BaseClient {
     const orderedMessages = this.constructor.getMessagesForConversation({
       messages,
       parentMessageId,
-      summary: this.shouldSummarize,
+      summary: false,
       mapMethod: createMultiAgentMapper(this.options.agent, this.agentConfigs),
       mapCondition: (message) => message.addedConvo === true,
     });
@@ -207,12 +205,31 @@ class AgentClient extends BaseClient {
       return agent;
     };
 
+    /**
+     * [cowork] Inject todo_update tool instructions when the tool is available on the agent.
+     * This ensures every agent with the todo_list MCP attached knows how to use the widget
+     * without requiring per-agent system prompt edits.
+     */
+    const injectTodoInstructions = (agent) => {
+      const TODO_TOOL = 'todo_update';
+      const hasTodoTool = Array.isArray(agent.tools) && agent.tools.some((t) => {
+        const name = typeof t === 'string' ? t : t?.name ?? t?.function?.name ?? '';
+        return name === TODO_TOOL || name.startsWith(TODO_TOOL);
+      });
+      if (!hasTodoTool) {
+        return agent;
+      }
+      const todoInstructions = `\n\n## Task tracking\n\nWhen asked to perform a multi-step task, use the \`${TODO_TOOL}\` tool to show progress.\n\nRules:\n- Call \`${TODO_TOOL}\` at the start with all planned steps as "pending"\n- Mark exactly one task "in_progress" at a time before beginning it\n- Mark it "completed" immediately after finishing, before starting the next\n- Pass the full todos array on every call — it is a snapshot, not a diff\n- Use "content" for the imperative form (e.g. "Run tests") and "activeForm" for the present-continuous form (e.g. "Running tests")\n- Do not call \`${TODO_TOOL}\` for simple single-step responses\n- Once every task is "completed", call \`todo_clear\` to dismiss the task list`;
+      agent.instructions = (agent.instructions ? agent.instructions + todoInstructions : todoInstructions.trim());
+      return agent;
+    };
+
     /** Collect all agents for unified processing, extracting base instructions during collection */
     const allAgents = [
-      { agent: extractBaseInstructions(this.options.agent), agentId: this.options.agent.id },
+      { agent: injectTodoInstructions(extractBaseInstructions(this.options.agent)), agentId: this.options.agent.id },
       ...(this.agentConfigs?.size > 0
         ? Array.from(this.agentConfigs.entries()).map(([agentId, agent]) => ({
-            agent: extractBaseInstructions(agent),
+            agent: injectTodoInstructions(extractBaseInstructions(agent)),
             agentId,
           }))
         : []),
@@ -379,9 +396,6 @@ class AgentClient extends BaseClient {
      */
     const ephemeralAgent = this.options.req.body.ephemeralAgent;
     const mcpManager = getMCPManager();
-
-    const configServers = await resolveConfigServers(this.options.req);
-
     await Promise.all(
       allAgents.map(({ agent, agentId }) =>
         applyContextToAgent({
@@ -389,7 +403,6 @@ class AgentClient extends BaseClient {
           agentId,
           logger,
           mcpManager,
-          configServers,
           sharedRunContext,
           ephemeralAgent: agentId === this.options.agent.id ? ephemeralAgent : undefined,
         }),
@@ -734,7 +747,7 @@ class AgentClient extends BaseClient {
           },
           user: createSafeUser(this.options.req.user),
         },
-        recursionLimit: resolveRecursionLimit(agentsEConfig, this.options.agent),
+        recursionLimit: agentsEConfig?.recursionLimit ?? 50,
         signal: abortController.signal,
         streamMode: 'values',
         version: 'v2',
@@ -780,6 +793,17 @@ class AgentClient extends BaseClient {
         // - Agents without incoming edges become start nodes and run in parallel automatically
         if (this.agentConfigs && this.agentConfigs.size > 0) {
           agents.push(...this.agentConfigs.values());
+        }
+
+        if (agents[0].recursion_limit && typeof agents[0].recursion_limit === 'number') {
+          config.recursionLimit = agents[0].recursion_limit;
+        }
+
+        if (
+          agentsEConfig?.maxRecursionLimit &&
+          config.recursionLimit > agentsEConfig?.maxRecursionLimit
+        ) {
+          config.recursionLimit = agentsEConfig?.maxRecursionLimit;
         }
 
         // TODO: needs to be added as part of AgentContext initialization
@@ -1120,9 +1144,6 @@ class AgentClient extends BaseClient {
         } else if (item.tokenUsage) {
           input_tokens = item.tokenUsage.promptTokens;
           output_tokens = item.tokenUsage.completionTokens;
-        } else if (item.usage_metadata) {
-          input_tokens = item.usage_metadata.input_tokens;
-          output_tokens = item.usage_metadata.output_tokens;
         }
 
         return {

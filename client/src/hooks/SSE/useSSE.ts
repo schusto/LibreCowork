@@ -10,7 +10,7 @@ import { useGetStartupConfig, useGetUserBalance } from '~/data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
 import useEventHandlers from './useEventHandlers';
 import { clearAllDrafts } from '~/utils';
-import store from '~/store';
+import store, { activeElicitationsState, elicitationDataState } from '~/store';
 
 type ChatHelpers = Pick<
   EventHandlerParams,
@@ -34,6 +34,8 @@ export default function useSSE(
   const [completed, setCompleted] = useState(new Set());
   const setAbortScroll = useSetRecoilState(store.abortScrollFamily(runIndex));
   const setShowStopButton = useSetRecoilState(store.showStopButtonByIndex(runIndex));
+  const setActiveElicitations = useSetRecoilState(activeElicitationsState);
+  const setElicitationData = useSetRecoilState(elicitationDataState);
 
   const {
     setMessages,
@@ -127,6 +129,18 @@ export default function useSSE(
         createdHandler(data, { ...submission, userMessage } as EventSubmission);
       } else if (data.event != null) {
         stepHandler(data, { ...submission, userMessage } as EventSubmission);
+      } else if (data.type === 'elicitation_created' && data.elicitationData) {
+        const elicitationData = data.elicitationData;
+        setElicitationData((prev) => ({
+          ...prev,
+          [elicitationData.id]: elicitationData,
+        }));
+        if (elicitationData.tool_call_id) {
+          setActiveElicitations((prev) => ({
+            ...prev,
+            [elicitationData.tool_call_id]: { ...elicitationData },
+          }));
+        }
       } else if (data.sync != null) {
         const runId = v4();
         setActiveRunId(runId);

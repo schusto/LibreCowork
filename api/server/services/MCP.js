@@ -600,6 +600,7 @@ function createToolInstance({
       const provider = (config?.metadata?.provider || capturedProvider)?.toLowerCase();
 
       const { args: _args, stepId, ...toolCall } = config.toolCall ?? {};
+      const toolCallId = toolCall?.id || toolCall?.tool_call_id || toolCall?.tool_call_ids?.[0];
       const flowId = `${serverName}:oauth_login:${config.metadata.thread_id}:${config.metadata.run_id}`;
       const runStepDeltaEmitter = createRunStepDeltaEmitter({
         res,
@@ -635,6 +636,7 @@ function createToolInstance({
         toolArguments,
         options: {
           signal: derivedSignal,
+          tool_call_id: toolCallId,
         },
         user: config?.configurable?.user,
         requestBody: config?.configurable?.requestBody,

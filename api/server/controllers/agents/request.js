@@ -1,5 +1,6 @@
 const { logger } = require('@librechat/data-schemas');
 const { Constants, ViolationTypes } = require('librechat-data-provider');
+const { getMCPManager } = require('~/config');
 const {
   sendEvent,
   getViolationInfo,
@@ -65,6 +66,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   const streamId = conversationId;
 
   let client = null;
+  let removeElicitationListener = null;
 
   try {
     logger.debug(`[ResumableAgentController] Creating job`, {
@@ -77,6 +79,26 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     const job = await GenerationJobManager.createJob(streamId, userId, conversationId);
     const jobCreatedAt = job.createdAt; // Capture creation time to detect job replacement
     req._resumableStreamId = streamId;
+
+    const mcpManager = getMCPManager();
+    const elicitationListener = (eventData) => {
+      if (eventData.userId !== userId) {
+        return;
+      }
+      const elicitationState = mcpManager.getElicitationState(eventData.elicitationId);
+      if (!elicitationState) {
+        return;
+      }
+      GenerationJobManager.emitChunk(streamId, {
+        type: 'elicitation_created',
+        elicitationData: elicitationState,
+        timestamp: Date.now(),
+      });
+    };
+    mcpManager.on('elicitationCreated', elicitationListener);
+    removeElicitationListener = () => {
+      mcpManager.removeListener('elicitationCreated', elicitationListener);
+    };
 
     // Send JSON response IMMEDIATELY so client can connect to SSE stream
     // This is critical: tool loading (MCP OAuth) may emit events that the client needs to receive
@@ -163,6 +185,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     if (job.abortController.signal.aborted) {
       GenerationJobManager.completeJob(streamId, 'Request aborted during initialization');
       await decrementPendingRequest(userId);
+      if (removeElicitationListener) {
+        removeElicitationListener();
+      }
       return;
     }
 
@@ -419,6 +444,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     }
     GenerationJobManager.completeJob(streamId, error.message);
     await decrementPendingRequest(userId);
+    if (removeElicitationListener) {
+      removeElicitationListener();
+    }
     if (client) {
       disposeClient(client);
     }
@@ -563,6 +591,24 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
 
     // Store request data in WeakMap keyed by req object
     requestDataMap.set(req, { client });
+
+    const mcpManager = getMCPManager();
+    const elicitationListener = (eventData) => {
+      if (eventData.userId === userId) {
+        const elicitationState = mcpManager.getElicitationState(eventData.elicitationId);
+        if (elicitationState) {
+          sendEvent(res, {
+            type: 'elicitation_created',
+            elicitationData: elicitationState,
+            timestamp: Date.now(),
+          });
+        }
+      }
+    };
+    mcpManager.on('elicitationCreated', elicitationListener);
+    cleanupHandlers.push(() => {
+      mcpManager.removeListener('elicitationCreated', elicitationListener);
+    });
 
     // Create job in GenerationJobManager for abort handling
     // streamId === conversationId (pre-generated above)

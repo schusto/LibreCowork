@@ -1,5 +1,6 @@
 import type { AxiosResponse } from 'axios';
 import type * as t from './types';
+import type { ElicitationResponse } from './types/elicitation';
 import * as endpoints from './api-endpoints';
 import * as a from './types/assistants';
 import * as ag from './types/agents';
@@ -192,6 +193,13 @@ export const getMCPServerConnectionStatus = (
 
 export const getMCPAuthValues = (serverName: string): Promise<q.MCPAuthValuesResponse> => {
   return request.get(endpoints.mcpAuthValues(serverName));
+};
+
+export const respondToElicitation = (
+  elicitationId: string,
+  response: ElicitationResponse,
+): Promise<{ success: boolean; message: string }> => {
+  return request.post(endpoints.mcpElicitationRespond(elicitationId), response);
 };
 
 export function cancelMCPOAuth(serverName: string): Promise<m.CancelMCPOAuthResponse> {

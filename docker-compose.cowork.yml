@@ -1,0 +1,163 @@
+# LibreCowork — runs alongside LibreChat on port 443 (HTTPS).
+# Shares LibreChat's MongoDB so conversations and agents are accessible in both UIs.
+# Build from local source (required for elicitation + TaskList changes).
+#
+# Network note: librecowork joins the LibreChat stack's default network (librechat_default)
+# so it can reach 'mongodb' and 'meilisearch' by their service names, exactly as
+# the upstream LibreChat container does.
+#
+# markitdown_mcp is NOT duplicated here — the LibreChat stack already starts it on
+# port 3001, and both stacks connect to it via host.docker.internal:3001.
+#
+# nginx (cowork-proxy): single nginx container that terminates TLS for both services:
+#   - https://<LAN-IP>       → LibreCowork app  (port 443 → container 3080)
+#   - https://<LAN-IP>:8083  → sandpack-bundler  (port 8083 → container 80)
+#   - http://<LAN-IP>        → redirects to HTTPS
+# LibreChat moves to port 3443 to free up 443 for LibreCowork (primary app).
+# SANDPACK_BUNDLER_URL and SANDPACK_STATIC_BUNDLER_URL in LibreChat/.env point to
+# https://<LAN-IP>:8083 so the browser always loads the bundler over HTTPS.
+#
+# Usage: started automatically by cowork-start.sh alongside the main LibreChat stack.
+
+services:
+  sandpack-bundler:
+    image: ghcr.io/librechat-ai/codesandbox-client/bundler:latest
+    container_name: sandpack-bundler
+    # Exposed on HTTP 8083 directly (for reference), but primary access is via
+    # cowork-proxy on 8084 which also serves the patched preview-protocol.js.
+    # sandbox-startup.js is overridden to load preview-protocol.js from our
+    # local proxy instead of codesandbox.io, so the origin check passes for
+    # private IP origins (192.168.x, etc.).
+    ports:
+      - "0.0.0.0:8083:80"
+    volumes:
+      - type: bind
+        source: ./nginx/sandbox-startup.js
+        target: /usr/share/nginx/html/static/js/sandbox-startup.a0ea8d1cb.js
+        read_only: true
+    networks:
+      - cowork_default
+    restart: unless-stopped
+
+  cowork-proxy:
+    image: nginx:alpine
+    container_name: cowork-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8443:8443"   # HTTPS bundler proxy (sandpack)
+    depends_on:
+      - sandpack-bundler
+      - librecowork
+    networks:
+      - cowork_default
+    volumes:
+      - type: bind
+        source: ./nginx/librecowork.conf
+        target: /etc/nginx/conf.d/librecowork.conf
+      - type: bind
+        source: ./nginx/bundler-tls.conf
+        target: /etc/nginx/conf.d/bundler-tls.conf
+      - type: bind
+        source: /etc/letsencrypt
+        target: /etc/letsencrypt
+        read_only: true
+      - type: bind
+        source: ./nginx
+        target: /etc/nginx/csb-static
+        read_only: true
+    restart: unless-stopped
+
+  librecowork:
+    container_name: LibreCowork
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Also exposed on port 3081 (plain HTTP) for LAN access.
+    # Artifact previews (Sandpack) require HTTP — they don't work over HTTPS
+    # from a private IP without a wildcard domain + trusted cert setup.
+    ports:
+      - "0.0.0.0:3081:3080"
+    depends_on:
+      small_ppt:
+        condition: service_healthy
+    networks:
+      - librechat_default
+      - cowork_default
+    volumes:
+      - type: bind
+        source: ./librechat.yaml
+        target: /app/librechat.yaml
+      - type: bind
+        source: /Users/erik/proj/rag
+        target: /Users/erik/proj/rag
+      - type: bind
+        source: /Users/erik/proj/cowork
+        target: /Users/erik/proj/cowork
+      - type: bind
+        source: /Users/erik/proj/CV
+        target: /Users/erik/proj/CV
+      - type: bind
+        source: /Users/erik/proj/Work
+        target: /Users/erik/proj/Work
+      - type: bind
+        source: /Users/erik/proj/cowork/uploads
+        target: /app/uploads
+      - type: bind
+        source: /Users/erik/proj/cowork/LibreCowork/images
+        target: /app/client/public/images
+      - type: bind
+        source: /Users/erik/proj/cowork/certs
+        target: /app/certs
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3080
+      - MONGO_URI=mongodb://mongodb:27017/LibreChat
+      - MEILI_HOST=http://meilisearch:7700
+      # TLS is terminated by cowork-proxy (nginx); the Node app stays plain HTTP.
+      # [cowork] Context reduction — set to 'false' to disable all reduction for testing
+      - CWK_CONTEXT_REDUCTION=true
+      - CWK_THINK_KEEP_TURNS=2        # strip thinking blocks from turns older than N user messages
+      - CWK_TOOL_TRUNCATE_TURNS=3     # truncate/dedup filesystem tool results older than N user messages
+      - CWK_TOOL_TRUNCATE_CHARS=2000  # max chars per filesystem tool result outside the keep window
+      - CWK_TOOL_DEDUP_MIN_CHARS=300  # minimum result length to be considered for dedup
+      - CWK_RAG_TRUNCATE_TURNS=5      # RAG/knowledge-base results kept verbatim for N turns (longer — chunks referenced later)
+      - CWK_RAG_TRUNCATE_CHARS=2000   # max chars per RAG result outside the keep window
+      - CWK_WEB_TRUNCATE_TURNS=2      # web search results kept verbatim for N turns (shorter — discussed quickly)
+      - CWK_WEB_TRUNCATE_CHARS=1000   # max chars per web result outside the keep window
+      # - CWK_DUMP_CONTEXT=1            # dump raw formattedMessages to ~/proj/cowork/uploads/cwk-context-dumps/ (one file per request)
+      # - CWK_DUMP_DIR=/app/uploads/cwk-context-dumps  # default — maps to ~/proj/cowork/uploads/cwk-context-dumps/ on host
+    env_file:
+      - /Users/erik/proj/cowork/LibreChat/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  small_ppt:
+    build:
+      context: /Users/erik/proj/cowork/mcp/small-powerpoint-mcp
+    container_name: small-ppt-cowork
+    ports:
+      - '8961:8960'
+    volumes:
+      - /Users/erik/proj/cowork:/Users/erik/proj/cowork
+      - /Users/erik/proj/Work:/Users/erik/proj/Work
+      - /Users/erik/proj/CV:/Users/erik/proj/CV
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 8960)); s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+networks:
+  # Join the LibreChat stack's auto-created network so 'mongodb' and 'meilisearch'
+  # resolve by service name. The network name is <librechat_dir_basename>_default —
+  # 'librechat_default' when LibreChat lives in a directory called 'LibreChat'.
+  # If your LibreChat directory has a different name, adjust accordingly.
+  librechat_default:
+    external: true
+  # Own internal network for cowork services
+  cowork_default:
+    driver: bridge

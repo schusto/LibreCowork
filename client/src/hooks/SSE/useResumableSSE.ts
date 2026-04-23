@@ -26,7 +26,7 @@ import type { ActiveJobsResponse } from '~/data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
 import useEventHandlers from './useEventHandlers';
 import { clearAllDrafts } from '~/utils';
-import store from '~/store';
+import store, { activeElicitationsState, elicitationDataState } from '~/store';
 
 type ChatHelpers = Pick<
   EventHandlerParams,
@@ -90,6 +90,8 @@ export default function useResumableSSE(
   const [streamId, setStreamId] = useState<string | null>(null);
   const setAbortScroll = useSetRecoilState(store.abortScrollFamily(runIndex));
   const setShowStopButton = useSetRecoilState(store.showStopButtonByIndex(runIndex));
+  const setActiveElicitations = useSetRecoilState(activeElicitationsState);
+  const setElicitationData = useSetRecoilState(elicitationDataState);
 
   const sseRef = useRef<SSE | null>(null);
   const reconnectAttemptRef = useRef(0);
@@ -211,6 +213,21 @@ export default function useResumableSSE(
               data: data.data,
               submission: currentSubmission as EventSubmission,
             });
+            return;
+          }
+
+          if (data.type === 'elicitation_created' && data.elicitationData) {
+            const elicitationData = data.elicitationData;
+            setElicitationData((prev) => ({
+              ...prev,
+              [elicitationData.id]: elicitationData,
+            }));
+            if (elicitationData.tool_call_id) {
+              setActiveElicitations((prev) => ({
+                ...prev,
+                [elicitationData.tool_call_id]: { ...elicitationData },
+              }));
+            }
             return;
           }
 
@@ -552,6 +569,8 @@ export default function useResumableSSE(
       balanceQuery,
       removeActiveJob,
       queryClient,
+      setActiveElicitations,
+      setElicitationData,
     ],
   );
 
