@@ -1,7 +1,11 @@
+const fs = require('fs');
+const http = require('http');
+const https = require('https');
 const multer = require('multer');
 const express = require('express');
+const yaml = require('js-yaml');
 const { sleep } = require('@librechat/agents');
-const { isEnabled, resolveImportMaxFileSize } = require('@librechat/api');
+const { isEnabled, resolveImportMaxFileSize, sanitizeTitle } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { CacheKeys, EModelEndpoint } = require('librechat-data-provider');
 const {
@@ -325,4 +329,244 @@ router.post('/duplicate', forkIpLimiter, forkUserLimiter, async (req, res) => {
   }
 });
 
-module.exports = router;
+// ── Title regeneration ────────────────────────────────────────────────────────
+
+/**
+ * Read titlePrompt and titleModel from librechat.yaml for a named custom endpoint.
+ * Falls back to the TITLE_PROMPT env var, then a hardcoded default.
+ *
+ * @param {string} endpointName - e.g. "MLX"
+ * @returns {{ titlePrompt: string, titleModel: string|null, baseURL: string }}
+ */
+function loadTitleConfig(endpointName = 'MLX') {
+  const FALLBACK_PROMPT =
+    'Summarize the purpose of this conversation and provide a concise title ' +
+    'in the detected language ({convo})';
+  const FALLBACK_BASE_URL = 'http://host.docker.internal:1235/v1';
+
+  // Candidate paths for librechat.yaml (host path + symlink target)
+  const candidates = [
+    process.env.LIBRECHAT_CONFIG_PATH,
+    '/app/librechat.yaml',
+    '/data/librechat.yaml',
+  ].filter(Boolean);
+
+  for (const p of candidates) {
+    try {
+      const raw = fs.readFileSync(p, 'utf8');
+      const cfg = yaml.load(raw);
+      const customs = cfg?.endpoints?.custom ?? [];
+      const ep = customs.find((e) => e.name === endpointName) ?? customs[0];
+      if (ep) {
+        return {
+          titlePrompt: ep.titlePrompt ?? FALLBACK_PROMPT,
+          titleModel: ep.titleModel === 'current_model' ? null : (ep.titleModel ?? null),
+          baseURL: ep.baseURL ?? FALLBACK_BASE_URL,
+        };
+      }
+    } catch (_) {
+      // file not found or parse error — try next candidate
+    }
+  }
+
+  return { titlePrompt: FALLBACK_PROMPT, titleModel: null, baseURL: FALLBACK_BASE_URL };
+}
+
+/**
+ * Call the mlx-proxy (or any OpenAI-compatible endpoint) for a title completion.
+ * Returns the raw response string, or null on failure.
+ *
+ * @param {{ baseURL: string, model: string, prompt: string }} opts
+ * @returns {Promise<string|null>}
+ */
+function fetchTitle({ baseURL, model, prompt }) {
+  return new Promise((resolve) => {
+    const url = new URL('/chat/completions', baseURL.replace(/\/v1\/?$/, '') + '/v1');
+    const payload = JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 64,
+      temperature: 0.3,
+      stream: false,
+    });
+
+    const lib = url.protocol === 'https:' ? https : http;
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        Authorization: `Bearer ${process.env.MLX_API_KEY || 'mlx-proxy'}`,
+      },
+    };
+
+    const req = lib.request(options, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        try {
+          const body = JSON.parse(data);
+          resolve(body?.choices?.[0]?.message?.content ?? null);
+        } catch (_) {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(45_000, () => { req.destroy(); resolve(null); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+/**
+ * Discover the currently-loaded model from the mlx-proxy /health endpoint.
+ * Returns null if unreachable.
+ *
+ * @param {string} baseURL
+ * @returns {Promise<string|null>}
+ */
+function discoverCurrentModel(baseURL) {
+  return new Promise((resolve) => {
+    const url = new URL('/health', baseURL.replace(/\/v1\/?$/, ''));
+    const lib = url.protocol === 'https:' ? https : http;
+    const req = lib.get(url.toString(), (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)?.current_model ?? null); }
+        catch (_) { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(5_000, () => { req.destroy(); resolve(null); });
+  });
+}
+
+/**
+ * Auth middleware for /regen_title.
+ *
+ * Two accepted paths — exactly one must succeed, otherwise 401:
+ *
+ *   1. X-Internal-Secret header matches LIBRECHAT_INTERNAL_SECRET (set in .env).
+ *      Synthesises a minimal req.user and calls next() immediately — no JWT needed.
+ *      Disabled (falls through to path 2) if LIBRECHAT_INTERNAL_SECRET is not set.
+ *
+ *   2. Valid user JWT cookie/header — delegated to requireJwtAuth, which either
+ *      populates req.user and calls next(), or sends a 401 itself.
+ *
+ * Security note: the route MUST NOT call next() without a valid identity.
+ * Path 1 authenticates the MCP server process; path 2 authenticates a browser session.
+ */
+const INTERNAL_SECRET = process.env.LIBRECHAT_INTERNAL_SECRET || '';
+
+function regenTitleAuth(req, res, next) {
+  const secret = req.headers['x-internal-secret'];
+  if (INTERNAL_SECRET && secret === INTERNAL_SECRET) {
+    // Valid internal secret — synthesise a service identity and proceed.
+    req.user = { id: 'internal-service', role: 'SERVICE' };
+    return next();
+  }
+  // No valid secret (or secret not configured) — require a real user JWT.
+  return requireJwtAuth(req, res, next);
+}
+
+/**
+ * Regenerate the title for an existing conversation using the same titlePrompt
+ * and model configured in librechat.yaml for the MLX (or named) custom endpoint.
+ *
+ * The first user message of the conversation is used as the input — consistent
+ * with how LibreChat generates titles on new conversations.
+ *
+ * Auth: standard JWT (user session) OR X-Internal-Secret header (MCP server).
+ *
+ * @route POST /regen_title
+ * @param {string} req.body.conversationId - ID of the conversation to retitle.
+ * @param {string} [req.body.endpoint]     - Custom endpoint name to read config from (default: "MLX").
+ * @param {string} [req.body.proposedTitle] - Fallback title if LLM call fails.
+ * @returns {object} 200 - { conversationId, title }
+ */
+// regenTitleAuth is a complete auth gate (secret OR JWT) — no unauthenticated path.
+const regenTitleRouter = express.Router();
+regenTitleRouter.post('/regen_title', regenTitleAuth, configMiddleware, async (req, res) => {
+  const { conversationId, endpoint: endpointName = 'MLX', proposedTitle } = req.body ?? {};
+
+  if (!conversationId) {
+    return res.status(400).json({ error: 'conversationId is required' });
+  }
+
+  // 1. Fetch the first user message for this conversation
+  let firstUserText = null;
+  try {
+    // When called via internal secret, req.user.id is the sentinel 'internal-service';
+    // pass user only when it's a real user ID so getMessages doesn't filter nothing out.
+    const msgQuery = { conversationId };
+    if (req.user.id !== 'internal-service') msgQuery.user = req.user.id;
+    const messages = await db.getMessages(msgQuery);
+    const userMessages = (messages ?? [])
+      .filter((m) => m.isCreatedByUser && m.text)
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+    if (userMessages.length === 0) {
+      return res.status(404).json({ error: 'No user messages found for this conversation' });
+    }
+
+    firstUserText = userMessages[0].text.slice(0, 1200);
+  } catch (err) {
+    logger.error('[regen_title] Error fetching messages:', err);
+    return res.status(500).json({ error: 'Failed to fetch conversation messages' });
+  }
+
+  // 2. Load title config from librechat.yaml
+  const { titlePrompt, titleModel, baseURL } = loadTitleConfig(endpointName);
+
+  // 3. Resolve model: use configured titleModel, or discover currently-loaded model
+  let model = titleModel;
+  if (!model) {
+    model = await discoverCurrentModel(baseURL);
+  }
+  if (!model) {
+    return res.status(503).json({ error: 'Could not determine model — is mlx-proxy running?' });
+  }
+
+  // 4. Build the prompt and call the LLM
+  const prompt = titlePrompt.replace('{convo}', firstUserText);
+  const rawTitle = await fetchTitle({ baseURL, model, prompt });
+
+  // 5. Sanitize; fall back to proposedTitle if the LLM returned nothing
+  const generatedTitle = rawTitle ? (sanitizeTitle(rawTitle) ?? rawTitle.trim().slice(0, 60)) : null;
+  const title = generatedTitle ?? (proposedTitle ? proposedTitle.trim().slice(0, 60) : null);
+
+  if (!title) {
+    return res.status(502).json({ error: 'Title generation failed — no response from model and no proposed_title fallback' });
+  }
+
+  try {
+    await db.saveConvo(
+      {
+        userId: req.user.id,
+        isTemporary: false,
+        interfaceConfig: req.config?.interfaceConfig,
+      },
+      { conversationId, title },
+      { context: 'api/server/routes/convos.js /regen_title', noUpsert: true },
+    );
+  } catch (err) {
+    logger.error('[regen_title] Error saving title:', err);
+    return res.status(500).json({ error: 'Title generated but failed to save' });
+  }
+
+  const source = generatedTitle ? 'llm' : 'proposed_title_fallback';
+  logger.debug(`[regen_title] ${conversationId} → "${title}" (source: ${source})`);
+  return res.status(200).json({ conversationId, title });
+});
+
+// Parent router: regenTitleRouter is mounted first (its own auth gate),
+// then the JWT-gated router for everything else.
+const rootRouter = express.Router();
+rootRouter.use(regenTitleRouter);
+rootRouter.use(router);
+module.exports = rootRouter;

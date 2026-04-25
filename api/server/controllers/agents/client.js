@@ -226,12 +226,25 @@ class AgentClient extends BaseClient {
       return agent;
     };
 
+    /**
+     * [cowork] Inject the current conversationId into every agent's system prompt as an
+     * HTML comment. This makes it available to agents (e.g. the title-regen agent) without
+     * cluttering the visible instructions in the UI.
+     */
+    const injectConversationId = (agent) => {
+      const id = this.conversationId;
+      if (!id) return agent;
+      agent.instructions = (agent.instructions ?? '') +
+        `\n\n<!-- cowork:conversationId=${id} -->`;
+      return agent;
+    };
+
     /** Collect all agents for unified processing, extracting base instructions during collection */
     const allAgents = [
-      { agent: injectTodoInstructions(extractBaseInstructions(this.options.agent)), agentId: this.options.agent.id },
+      { agent: injectConversationId(injectTodoInstructions(extractBaseInstructions(this.options.agent))), agentId: this.options.agent.id },
       ...(this.agentConfigs?.size > 0
         ? Array.from(this.agentConfigs.entries()).map(([agentId, agent]) => ({
-            agent: injectTodoInstructions(extractBaseInstructions(agent)),
+            agent: injectConversationId(injectTodoInstructions(extractBaseInstructions(agent))),
             agentId,
           }))
         : []),
