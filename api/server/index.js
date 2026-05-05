@@ -186,6 +186,16 @@ const startServer = async () => {
   app.use('/api/tags', routes.tags);
   app.use('/api/mcp', routes.mcp);
 
+  /** Prefill progress — proxies to mlx-proxy so the browser avoids mixed-content */
+  app.get('/api/prefill_status', async (req, res) => {
+    try {
+      const response = await axios.get('http://host.docker.internal:1235/prefill_status', { timeout: 1000 });
+      res.json(response.data);
+    } catch {
+      res.json({ phase: 'idle' });
+    }
+  });
+
   /** 404 for unmatched API routes */
   app.use('/api', apiNotFound);
 

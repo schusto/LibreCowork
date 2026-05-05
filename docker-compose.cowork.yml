@@ -109,6 +109,9 @@ services:
       - type: bind
         source: /Users/erik/proj/cowork/certs
         target: /app/certs
+      - type: bind
+        source: /Users/erik/proj/cowork-data/memory
+        target: /Users/erik/proj/cowork-data/memory
     environment:
       - HOST=0.0.0.0
       - PORT=3080

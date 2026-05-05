@@ -175,16 +175,10 @@ const Part = memo(function Part({
     } else if (isToolCall && toolCall.name?.startsWith(Constants.LC_TRANSFER_TO_)) {
       return <AgentHandoff args={toolCall.args ?? ''} name={toolCall.name || ''} />;
     } else if (isToolCall && (toolCall.name?.startsWith(TODO_UPDATE_TOOL) || toolCall.name?.startsWith(TODO_CLEAR_TOOL))) {
-      // Render task-list widget instead of a generic ToolCall card.
-      // MCP tools are named todo_update_mcp_todo_list / todo_clear_mcp_todo_list —
-      // startsWith catches both the bare name and the MCP-suffixed form.
-      // todo_clear passes no args, which TaskList treats as an empty list (dismissed state).
-      return (
-        <TaskList
-          args={toolCall.args ?? '{}'}
-          isSubmitting={isSubmitting}
-        />
-      );
+      // The TaskList widget is now rendered as a pinned element by ContentParts,
+      // always showing the latest snapshot above the message content.
+      // Suppress the per-tool-call inline render to avoid duplication.
+      return null;
     } else if (isToolCall) {
       return (
         <ToolCall

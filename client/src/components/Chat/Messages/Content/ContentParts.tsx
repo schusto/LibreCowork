@@ -11,9 +11,33 @@ import { mapAttachments, groupSequentialToolCalls } from '~/utils';
 import { MessageContext, SearchContext } from '~/Providers';
 import { EditTextPart, EmptyText } from './Parts';
 import MemoryArtifacts from './MemoryArtifacts';
+import PrefillProgress from './PrefillProgress';
 import ToolCallGroup from './ToolCallGroup';
 import Container from './Container';
+import TaskList from './TaskList';
 import Part from './Part';
+
+const TODO_TOOL_PREFIX_CP = 'todo_update';
+const TODO_CLEAR_PREFIX_CP = 'todo_clear';
+
+/** Return the args of the last todo_update/todo_clear tool call in content, or null. */
+function getLatestTodoArgs(
+  content: Array<TMessageContentParts | undefined> | undefined,
+): string | null {
+  if (!content) return null;
+  let lastArgs: string | null = null;
+  for (const part of content) {
+    if (!part) continue;
+    const toolCall = part[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined;
+    if (
+      toolCall?.name?.startsWith(TODO_TOOL_PREFIX_CP) ||
+      toolCall?.name?.startsWith(TODO_CLEAR_PREFIX_CP)
+    ) {
+      lastArgs = toolCall.args ?? '{}';
+    }
+  }
+  return lastArgs;
+}
 
 type PartWithContextProps = {
   part: TMessageContentParts;
@@ -193,6 +217,9 @@ const ContentParts = memo(function ContentParts({
   const showEmptyCursor = content.length === 0 && effectiveIsSubmitting;
   const lastContentIdx = content.length - 1;
 
+  // Latest todo_update/todo_clear args for the pinned TaskList widget
+  const latestTodoArgs = getLatestTodoArgs(content);
+
   // Parallel content: use dedicated renderer with columns (TMessageContentParts includes ContentMetadata)
   const hasParallelContent = content.some((part) => part?.groupId != null);
   if (hasParallelContent) {
@@ -218,6 +245,9 @@ const ContentParts = memo(function ContentParts({
   });
   const groupedParts = groupSequentialToolCalls(sequentialParts);
 
+  const showStickyWidgets =
+    (isLatestMessage) || latestTodoArgs !== null;
+
   return (
     <SearchContext.Provider value={{ searchResults }}>
       <MemoryArtifacts attachments={attachments} />
@@ -242,6 +272,16 @@ const ContentParts = memo(function ContentParts({
           />
         );
       })}
+      {showStickyWidgets && (
+        <div className="sticky bottom-0 z-10 -mx-1 px-1 pb-1 pt-0.5 bg-gradient-to-t from-surface-primary via-surface-primary to-transparent">
+          {latestTodoArgs !== null && (
+            <TaskList args={latestTodoArgs} isSubmitting={effectiveIsSubmitting} />
+          )}
+          {isLatestMessage && (
+            <PrefillProgress isLatestMessage={true} />
+          )}
+        </div>
+      )}
     </SearchContext.Provider>
   );
 });
