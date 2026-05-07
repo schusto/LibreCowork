@@ -57,7 +57,7 @@ export async function initializeOpenAI({
     : baseURLOptions[endpoint as keyof typeof baseURLOptions];
 
   if (userProvidesURL && baseURL) {
-    await validateEndpointURL(baseURL, endpoint, appConfig?.endpoints?.allowedAddresses);
+    await validateEndpointURL(baseURL, endpoint);
   }
 
   const clientOptions: OpenAIConfigOptions = {

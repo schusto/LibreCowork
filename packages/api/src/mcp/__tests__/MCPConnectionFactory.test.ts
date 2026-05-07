@@ -1,4 +1,4 @@
-import { logger, getTenantId } from '@librechat/data-schemas';
+import { logger } from '@librechat/data-schemas';
 import type { TokenMethods, IUser } from '@librechat/data-schemas';
 import type { FlowStateManager } from '~/flow/manager';
 import type { MCPOAuthTokens } from '~/mcp/oauth';
@@ -18,7 +18,6 @@ jest.mock('@librechat/data-schemas', () => ({
     error: jest.fn(),
     debug: jest.fn(),
   },
-  getTenantId: jest.fn(),
 }));
 
 const mockLogger = logger as jest.Mocked<typeof logger>;
@@ -242,8 +241,6 @@ describe('MCPConnectionFactory', () => {
         },
       };
 
-      (getTenantId as jest.Mock).mockReturnValue('test-tenant');
-
       mockMCPOAuthHandler.initiateOAuthFlow.mockResolvedValue(mockFlowData);
       // createFlow runs as a background monitor — simulate it staying pending
       mockFlowManager.createFlow.mockReturnValue(new Promise(() => {}));
@@ -275,14 +272,13 @@ describe('MCPConnectionFactory', () => {
         undefined,
         undefined,
         oauthOptions.tokenMethods.findToken,
-        undefined,
       );
 
       // initFlow must be awaited BEFORE the redirect to guarantee state is stored
       expect(mockFlowManager.initFlow).toHaveBeenCalledWith(
         'flow123',
         'mcp_oauth',
-        expect.objectContaining({ ...mockFlowData.flowMetadata, tenantId: 'test-tenant' }),
+        expect.objectContaining(mockFlowData.flowMetadata),
       );
       const initCallOrder = mockFlowManager.initFlow.mock.invocationCallOrder[0];
       const oauthStartCallOrder = (oauthOptions.oauthStart as jest.Mock).mock

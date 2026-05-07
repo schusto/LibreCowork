@@ -13,8 +13,6 @@ import type {
   AnthropicCredentials,
 } from '~/types/anthropic';
 import {
-  FINE_GRAINED_TOOL_STREAMING_BETA,
-  appendAnthropicBetaHeader,
   supportsAdaptiveThinking,
   checkPromptCacheSupport,
   configureReasoning,
@@ -25,8 +23,6 @@ import {
   isAnthropicVertexCredentials,
   getVertexDeploymentName,
 } from './vertex';
-
-const WEB_SEARCH_BETA = 'web-search-2025-03-05';
 
 /**
  * Parses credentials from string or object format
@@ -142,7 +138,7 @@ function getLLMConfig(
   let requestOptions: AnthropicClientOptions & { stream?: boolean } = {
     model: mergedOptions.model,
     stream: mergedOptions.stream,
-    temperature: mergedOptions.temperature ?? undefined,
+    temperature: mergedOptions.temperature,
     stopSequences: mergedOptions.stop,
     maxTokens:
       mergedOptions.maxOutputTokens || anthropicSettings.maxOutputTokens.reset(mergedOptions.model),
@@ -274,9 +270,6 @@ function getLLMConfig(
   }
 
   /** Handle dropParams - only drop from Anthropic config */
-  const shouldDropClientOptions =
-    Array.isArray(options.dropParams) && options.dropParams.includes('clientOptions');
-
   if (options.dropParams && Array.isArray(options.dropParams)) {
     options.dropParams.forEach((param) => {
       if (param === 'web_search') {
@@ -301,26 +294,16 @@ function getLLMConfig(
       name: 'web_search',
     });
 
-    if (isAnthropicVertexCredentials(creds) && !shouldDropClientOptions) {
+    if (isAnthropicVertexCredentials(creds)) {
       if (!requestOptions.clientOptions) {
         requestOptions.clientOptions = {};
       }
 
-      requestOptions.clientOptions.defaultHeaders = appendAnthropicBetaHeader(
-        requestOptions.clientOptions.defaultHeaders as Record<string, string> | undefined,
-        WEB_SEARCH_BETA,
-      );
+      requestOptions.clientOptions.defaultHeaders = {
+        ...requestOptions.clientOptions.defaultHeaders,
+        'anthropic-beta': 'web-search-2025-03-05',
+      };
     }
-  }
-
-  if (!shouldDropClientOptions) {
-    if (!requestOptions.clientOptions) {
-      requestOptions.clientOptions = {};
-    }
-    requestOptions.clientOptions.defaultHeaders = appendAnthropicBetaHeader(
-      requestOptions.clientOptions.defaultHeaders as Record<string, string> | undefined,
-      FINE_GRAINED_TOOL_STREAMING_BETA,
-    );
   }
 
   return {

@@ -1,9 +1,10 @@
 import { logger } from '@librechat/data-schemas';
-import { getRefillEligibilityDate, ViolationTypes } from 'librechat-data-provider';
+import { ViolationTypes } from 'librechat-data-provider';
 import type { BalanceConfig, IBalanceUpdate } from '@librechat/data-schemas';
-import type { RefillIntervalUnit } from 'librechat-data-provider';
 import type { Response } from 'express';
 import type { ServerRequest } from '~/types/http';
+
+type TimeUnit = 'seconds' | 'minutes' | 'hours' | 'days' | 'weeks' | 'months';
 
 interface BalanceRecord {
   tokenCredits: number;
@@ -11,7 +12,7 @@ interface BalanceRecord {
   refillAmount?: number;
   lastRefill?: Date;
   refillIntervalValue?: number;
-  refillIntervalUnit?: RefillIntervalUnit;
+  refillIntervalUnit?: TimeUnit;
 }
 
 interface TxData {
@@ -42,6 +43,33 @@ export interface CheckBalanceDeps {
   balanceConfig?: BalanceConfig;
   /** Upsert function for lazy initialization when no record exists */
   upsertBalanceFields?: (userId: string, fields: IBalanceUpdate) => Promise<BalanceRecord | null>;
+}
+
+function addIntervalToDate(date: Date, value: number, unit: TimeUnit): Date {
+  const result = new Date(date);
+  switch (unit) {
+    case 'seconds':
+      result.setSeconds(result.getSeconds() + value);
+      break;
+    case 'minutes':
+      result.setMinutes(result.getMinutes() + value);
+      break;
+    case 'hours':
+      result.setHours(result.getHours() + value);
+      break;
+    case 'days':
+      result.setDate(result.getDate() + value);
+      break;
+    case 'weeks':
+      result.setDate(result.getDate() + value * 7);
+      break;
+    case 'months':
+      result.setMonth(result.getMonth() + value);
+      break;
+    default:
+      break;
+  }
+  return result;
 }
 
 /** Checks a user's balance record and handles auto-refill if needed. */
@@ -120,7 +148,7 @@ async function checkBalanceRecord(
     if (
       isNaN(lastRefillDate.getTime()) ||
       now >=
-        getRefillEligibilityDate(
+        addIntervalToDate(
           lastRefillDate,
           record.refillIntervalValue ?? 0,
           record.refillIntervalUnit ?? 'days',

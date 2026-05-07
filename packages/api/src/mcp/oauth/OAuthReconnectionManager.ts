@@ -89,35 +89,11 @@ export class OAuthReconnectionManager {
     for (let i = 0; i < serversToReconnect.length; i++) {
       const serverName = serversToReconnect[i];
       if (i === 0) {
-        this.safeTryReconnect(userId, serverName);
+        void this.tryReconnect(userId, serverName);
       } else {
-        setTimeout(() => this.safeTryReconnect(userId, serverName), i * RECONNECT_STAGGER_MS);
+        setTimeout(() => void this.tryReconnect(userId, serverName), i * RECONNECT_STAGGER_MS);
       }
     }
-  }
-
-  /**
-   * Fire-and-forget wrapper around {@link tryReconnect} that guarantees any
-   * unexpected rejection is surfaced via the logger instead of propagating as
-   * an unhandled promise rejection. Also runs the failed-reconnect cleanup so
-   * the tracker does not get stuck in `active` state for the
-   * `RECONNECTION_TIMEOUT_MS` window if an error escapes
-   * {@link tryReconnect}'s internal try/catch.
-   */
-  private safeTryReconnect(userId: string, serverName: string): void {
-    this.tryReconnect(userId, serverName).catch((error) => {
-      logger.error(
-        `[OAuthReconnectionManager][User: ${userId}][${serverName}] Unexpected reconnect error`,
-        error,
-      );
-      this.cleanupOnFailedReconnect(userId, serverName);
-    });
-  }
-
-  private cleanupOnFailedReconnect(userId: string, serverName: string): void {
-    this.reconnectionsTracker.setFailed(userId, serverName);
-    this.reconnectionsTracker.removeActive(userId, serverName);
-    this.mcpManager?.disconnectUserConnection(userId, serverName);
   }
 
   /**
@@ -152,9 +128,15 @@ export class OAuthReconnectionManager {
 
     logger.info(`${logPrefix} Attempting reconnection`);
 
-    try {
-      const config = await MCPServersRegistry.getInstance().getServerConfig(serverName, userId);
+    const config = await MCPServersRegistry.getInstance().getServerConfig(serverName, userId);
 
+    const cleanupOnFailedReconnect = () => {
+      this.reconnectionsTracker.setFailed(userId, serverName);
+      this.reconnectionsTracker.removeActive(userId, serverName);
+      this.mcpManager?.disconnectUserConnection(userId, serverName);
+    };
+
+    try {
       // attempt to get connection (this will use existing tokens and refresh if needed)
       const connection = await this.mcpManager.getUserConnection({
         serverName,
@@ -175,11 +157,11 @@ export class OAuthReconnectionManager {
       } else {
         logger.warn(`${logPrefix} Failed to reconnect`);
         await connection?.disconnect();
-        this.cleanupOnFailedReconnect(userId, serverName);
+        cleanupOnFailedReconnect();
       }
     } catch (error) {
       logger.warn(`${logPrefix} Failed to reconnect: ${error}`);
-      this.cleanupOnFailedReconnect(userId, serverName);
+      cleanupOnFailedReconnect();
     }
   }
 

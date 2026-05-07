@@ -5,7 +5,6 @@ import {
   permissionsSchema,
   agentPermissionsSchema,
   promptPermissionsSchema,
-  skillPermissionsSchema,
   memoryPermissionsSchema,
   runCodePermissionsSchema,
   bookmarkPermissionsSchema,
@@ -104,12 +103,6 @@ const defaultRolesSchema = z.object({
         [Permissions.SHARE]: z.boolean().default(true),
         [Permissions.SHARE_PUBLIC]: z.boolean().default(true),
       }),
-      [PermissionTypes.SKILLS]: skillPermissionsSchema.extend({
-        [Permissions.USE]: z.boolean().default(true),
-        [Permissions.CREATE]: z.boolean().default(true),
-        [Permissions.SHARE]: z.boolean().default(true),
-        [Permissions.SHARE_PUBLIC]: z.boolean().default(true),
-      }),
     }),
   }),
   [SystemRoles.USER]: roleSchema.extend({
@@ -192,12 +185,6 @@ export const roleDefaults = defaultRolesSchema.parse({
         [Permissions.SHARE]: true,
         [Permissions.SHARE_PUBLIC]: true,
       },
-      [PermissionTypes.SKILLS]: {
-        [Permissions.USE]: true,
-        [Permissions.CREATE]: true,
-        [Permissions.SHARE]: true,
-        [Permissions.SHARE_PUBLIC]: true,
-      },
     },
   },
   [SystemRoles.USER]: {
@@ -240,12 +227,6 @@ export const roleDefaults = defaultRolesSchema.parse({
       [PermissionTypes.REMOTE_AGENTS]: {
         [Permissions.USE]: false,
         [Permissions.CREATE]: false,
-        [Permissions.SHARE]: false,
-        [Permissions.SHARE_PUBLIC]: false,
-      },
-      [PermissionTypes.SKILLS]: {
-        [Permissions.USE]: true,
-        [Permissions.CREATE]: true,
         [Permissions.SHARE]: false,
         [Permissions.SHARE_PUBLIC]: false,
       },

@@ -8,8 +8,6 @@ const { Strategy: SamlStrategy } = require('@node-saml/passport-saml');
 const {
   getBalanceConfig,
   isEmailDomainAllowed,
-  getAvatarFileStrategy,
-  getAvatarSaveParams,
   resolveAppConfigForUser,
 } = require('@librechat/api');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
@@ -273,16 +271,14 @@ function createSamlCallback(existingUsersOnly = false) {
             fileName = profile.nameID + '.png';
           }
 
-          const fileStrategy = getAvatarFileStrategy(appConfig, process.env.CDN_PROVIDER);
-          const { saveBuffer } = getStrategyFunctions(fileStrategy);
-          const imagePath = await saveBuffer(
-            getAvatarSaveParams(fileStrategy, {
-              fileName,
-              userId: user._id.toString(),
-              buffer: imageBuffer,
-              tenantId: user.tenantId,
-            }),
+          const { saveBuffer } = getStrategyFunctions(
+            appConfig?.fileStrategy ?? process.env.CDN_PROVIDER,
           );
+          const imagePath = await saveBuffer({
+            fileName,
+            userId: user._id.toString(),
+            buffer: imageBuffer,
+          });
           user.avatar = imagePath ?? '';
         }
       }

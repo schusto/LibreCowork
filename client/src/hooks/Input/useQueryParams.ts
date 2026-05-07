@@ -266,10 +266,7 @@ export default function useQueryParams({
       const { decodedPrompt, validSettings, shouldAutoSubmit } = processQueryParams();
       const hasSettings = Object.keys(validSettings).length > 0;
 
-      const autoSubmitAllowed = startupConfig.interface?.autoSubmitFromUrl !== false;
-      const willAutoSubmit = shouldAutoSubmit && autoSubmitAllowed;
-
-      if (!willAutoSubmit) {
+      if (!shouldAutoSubmit) {
         submissionHandledRef.current = true;
       }
 
@@ -294,7 +291,7 @@ export default function useQueryParams({
       }
 
       // Handle auto-submission
-      if (willAutoSubmit && decodedPrompt) {
+      if (shouldAutoSubmit && decodedPrompt) {
         if (hasSettings) {
           // Settings are changing, defer submission
           pendingSubmitRef.current = true;

@@ -2,13 +2,7 @@ const path = require('path');
 const fs = require('fs');
 const winston = require('winston');
 require('winston-daily-rotate-file');
-const {
-  redactFormat,
-  redactMessage,
-  debugTraverse,
-  jsonTruncateFormat,
-  formatConsoleMeta,
-} = require('./parsers');
+const { redactFormat, redactMessage, debugTraverse, jsonTruncateFormat } = require('./parsers');
 
 /**
  * Determine the log directory.
@@ -116,16 +110,12 @@ const consoleFormat = winston.format.combine(
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
   // redactErrors(),
   winston.format.printf((info) => {
-    const base = `${info.timestamp} ${info.level}: ${info.message}`;
-    const isErrorOrWarn = info.level.includes('error') || info.level.includes('warn');
-
-    if (isErrorOrWarn) {
-      const metaTrailer = formatConsoleMeta(info);
-      const line = metaTrailer ? `${base} ${metaTrailer}` : base;
-      return redactMessage(line);
+    const message = `${info.timestamp} ${info.level}: ${info.message}`;
+    if (info.level.includes('error')) {
+      return redactMessage(message);
     }
 
-    return base;
+    return message;
   }),
 );
 

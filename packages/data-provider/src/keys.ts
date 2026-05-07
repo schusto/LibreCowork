@@ -34,7 +34,6 @@ export enum QueryKeys {
   assistantDocs = 'assistantDocs',
   agentDocs = 'agentDocs',
   fileDownload = 'fileDownload',
-  filePreview = 'filePreview',
   voices = 'voices',
   customConfigSpeech = 'customConfigSpeech',
   prompts = 'prompts',
@@ -66,20 +65,6 @@ export enum QueryKeys {
   activeJobs = 'activeJobs',
   /* Agent API Keys */
   agentApiKeys = 'agentApiKeys',
-  /* Skills */
-  skills = 'skills',
-  skill = 'skill',
-  skillFiles = 'skillFiles',
-  skillFileContent = 'skillFileContent',
-  /* Skill tree (phase 2 — filesystem-style node view) */
-  skillTree = 'skillTree',
-  skillNodeContent = 'skillNodeContent',
-  /* Skill favorites (star a skill in the sidebar) */
-  skillFavorites = 'skillFavorites',
-  /* Per-user skill active/inactive overrides */
-  skillStates = 'skillStates',
-  /* General user favorites */
-  favorites = 'favorites',
 }
 
 // Dynamic query keys that require parameters
@@ -112,10 +97,4 @@ export enum MutationKeys {
   enableTwoFactor = 'enableTwoFactor',
   verifyTwoFactor = 'verifyTwoFactor',
   updateMemoryPreferences = 'updateMemoryPreferences',
-  /* Skill mutations from the original UI PR — tree/node operations are
-   * phase 2 and currently stubbed in the data-service layer. */
-  createSkillNode = 'createSkillNode',
-  updateSkillNode = 'updateSkillNode',
-  deleteSkillNode = 'deleteSkillNode',
-  updateSkillNodeContent = 'updateSkillNodeContent',
 }

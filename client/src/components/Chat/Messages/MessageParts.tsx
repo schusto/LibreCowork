@@ -141,7 +141,6 @@ export default function Message(props: TMessageProps) {
                     attachments={attachments}
                     isSubmitting={isSubmitting}
                     searchResults={searchResults}
-                    manualSkills={message.manualSkills}
                     messageId={message.messageId}
                     setSiblingIdx={setSiblingIdx}
                     isCreatedByUser={message.isCreatedByUser}

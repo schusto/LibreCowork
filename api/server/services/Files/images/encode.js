@@ -80,12 +80,7 @@ const base64Only = new Set([
   EModelEndpoint.bedrock,
 ]);
 
-const blobStorageSources = new Set([
-  FileSources.azure_blob,
-  FileSources.s3,
-  FileSources.firebase,
-  FileSources.cloudfront,
-]);
+const blobStorageSources = new Set([FileSources.azure_blob, FileSources.s3, FileSources.firebase]);
 
 /**
  * Encodes and formats the given files.

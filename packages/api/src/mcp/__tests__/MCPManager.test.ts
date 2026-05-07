@@ -35,7 +35,6 @@ const mockRegistryInstance = {
   getOAuthServers: jest.fn(),
   shouldEnableSSRFProtection: jest.fn().mockReturnValue(false),
   getAllowedDomains: jest.fn().mockReturnValue(null),
-  getAllowedAddresses: jest.fn().mockReturnValue(null),
 };
 
 jest.mock('~/mcp/registry/MCPServersRegistry', () => ({

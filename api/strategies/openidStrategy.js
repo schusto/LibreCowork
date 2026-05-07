@@ -13,12 +13,8 @@ const {
   logHeaders,
   safeStringify,
   findOpenIDUser,
-  getOpenIdEmail,
-  getOpenIdIssuer,
   getBalanceConfig,
   isEmailDomainAllowed,
-  getAvatarFileStrategy,
-  getAvatarSaveParams,
   resolveAppConfigForUser,
 } = require('@librechat/api');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
@@ -273,6 +269,34 @@ function getFullName(userinfo) {
 }
 
 /**
+ * Resolves the user identifier from OpenID claims.
+ * Configurable via OPENID_EMAIL_CLAIM; defaults to: email -> preferred_username -> upn.
+ *
+ * @param {Object} userinfo - The user information object from OpenID Connect
+ * @returns {string|undefined} The resolved identifier string
+ */
+function getOpenIdEmail(userinfo) {
+  const claimKey = process.env.OPENID_EMAIL_CLAIM?.trim();
+  if (claimKey) {
+    const value = userinfo[claimKey];
+    if (typeof value === 'string' && value) {
+      return value;
+    }
+    if (value !== undefined && value !== null) {
+      logger.warn(
+        `[openidStrategy] OPENID_EMAIL_CLAIM="${claimKey}" resolved to a non-string value (type: ${typeof value}). Falling back to: email -> preferred_username -> upn.`,
+      );
+    } else {
+      logger.warn(
+        `[openidStrategy] OPENID_EMAIL_CLAIM="${claimKey}" not present in userinfo. Falling back to: email -> preferred_username -> upn.`,
+      );
+    }
+  }
+  const fallback = userinfo.email || userinfo.preferred_username || userinfo.upn;
+  return typeof fallback === 'string' ? fallback : undefined;
+}
+
+/**
  * Converts an input into a string suitable for a username.
  * If the input is a string, it will be returned as is.
  * If the input is an array, elements will be joined with underscores.
@@ -446,7 +470,6 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
   }
 
   const email = getOpenIdEmail(userinfo);
-  const openidIssuer = getOpenIdIssuer(claims, openidConfig);
 
   const baseConfig = await getAppConfig({ baseOnly: true });
   if (!isEmailDomainAllowed(email, baseConfig?.registration?.allowedDomains)) {
@@ -460,7 +483,6 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
     findUser,
     email: email,
     openidId: claims.sub || userinfo.sub,
-    openidIssuer,
     idOnTheSource: claims.oid || userinfo.oid,
     strategyName: 'openidStrategy',
   });
@@ -566,7 +588,6 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
       emailVerified: userinfo.email_verified || false,
       name: fullName,
       idOnTheSource: userinfo.oid,
-      openidIssuer,
     };
 
     const balanceConfig = getBalanceConfig(appConfig);
@@ -574,9 +595,6 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
   } else {
     user.provider = 'openid';
     user.openidId = userinfo.sub;
-    if (openidIssuer) {
-      user.openidIssuer = openidIssuer;
-    }
     user.username = username;
     user.name = fullName;
     user.idOnTheSource = userinfo.oid;
@@ -664,16 +682,14 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
       userinfo.sub,
     );
     if (imageBuffer) {
-      const fileStrategy = getAvatarFileStrategy(appConfig, process.env.CDN_PROVIDER);
-      const { saveBuffer } = getStrategyFunctions(fileStrategy);
-      const imagePath = await saveBuffer(
-        getAvatarSaveParams(fileStrategy, {
-          fileName,
-          userId: user._id.toString(),
-          buffer: imageBuffer,
-          tenantId: user.tenantId,
-        }),
+      const { saveBuffer } = getStrategyFunctions(
+        appConfig?.fileStrategy ?? process.env.CDN_PROVIDER,
       );
+      const imagePath = await saveBuffer({
+        fileName,
+        userId: user._id.toString(),
+        buffer: imageBuffer,
+      });
       user.avatar = imagePath ?? '';
     }
   }

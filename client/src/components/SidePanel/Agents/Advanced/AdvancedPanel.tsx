@@ -4,7 +4,6 @@ import { AgentCapabilities } from 'librechat-data-provider';
 import { useFormContext, Controller } from 'react-hook-form';
 import type { AgentForm } from '~/common';
 import { useAgentPanelContext } from '~/Providers';
-import AgentSubagents from './AgentSubagents';
 import MaxAgentSteps from './MaxAgentSteps';
 import AgentHandoffs from './AgentHandoffs';
 import { useLocalize } from '~/hooks';
@@ -20,10 +19,6 @@ export default function AdvancedPanel() {
   const { agentsConfig, setActivePanel } = useAgentPanelContext();
   const chainEnabled = useMemo(
     () => agentsConfig?.capabilities.includes(AgentCapabilities.chain) ?? false,
-    [agentsConfig],
-  );
-  const subagentsEnabled = useMemo(
-    () => agentsConfig?.capabilities.includes(AgentCapabilities.subagents) ?? false,
     [agentsConfig],
   );
 
@@ -48,13 +43,6 @@ export default function AdvancedPanel() {
       </div>
       <div className="flex flex-col gap-4 px-2 pb-2">
         <MaxAgentSteps />
-        {subagentsEnabled && (
-          <Controller
-            name="subagents"
-            control={control}
-            render={({ field }) => <AgentSubagents field={field} currentAgentId={currentAgentId} />}
-          />
-        )}
         <Controller
           name="edges"
           control={control}

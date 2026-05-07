@@ -2,7 +2,7 @@ const cookies = require('cookie');
 const jwt = require('jsonwebtoken');
 const openIdClient = require('openid-client');
 const { logger } = require('@librechat/data-schemas');
-const { isEnabled, findOpenIDUser, getOpenIdIssuer } = require('@librechat/api');
+const { isEnabled, findOpenIDUser } = require('@librechat/api');
 const {
   requestPasswordReset,
   setOpenIDAuthTokens,
@@ -85,12 +85,10 @@ const refreshController = async (req, res) => {
         refreshParams,
       );
       const claims = tokenset.claims();
-      const openidIssuer = getOpenIdIssuer(claims, openIdConfig);
       const { user, error, migration } = await findOpenIDUser({
         findUser,
         email: getOpenIdEmail(claims),
         openidId: claims.sub,
-        openidIssuer,
         idOnTheSource: claims.oid,
         strategyName: 'refreshController',
       });
@@ -113,18 +111,13 @@ const refreshController = async (req, res) => {
         await updateUser(user._id.toString(), {
           provider: 'openid',
           openidId: claims.sub,
-          ...(openidIssuer ? { openidIssuer } : {}),
         });
         logger.info(
           `[refreshController] Updated user ${user.email} openidId (${reason}): ${user.openidId ?? 'null'} -> ${claims.sub}`,
         );
       }
 
-      const token = setOpenIDAuthTokens(tokenset, req, res, {
-        userId: user._id.toString(),
-        existingRefreshToken: refreshToken,
-        tenantId: user.tenantId,
-      });
+      const token = setOpenIDAuthTokens(tokenset, req, res, user._id.toString(), refreshToken);
 
       const { password: _pw, __v: _v, totpSecret: _ts, backupCodes: _bc, ...safeUser } = user;
       return res.status(200).send({ token, user: safeUser });
@@ -150,7 +143,7 @@ const refreshController = async (req, res) => {
     const userId = payload.id;
 
     if (process.env.NODE_ENV === 'CI') {
-      const token = await setAuthTokens(userId, res, null, req);
+      const token = await setAuthTokens(userId, res);
       return res.status(200).send({ token, user });
     }
 
@@ -164,7 +157,7 @@ const refreshController = async (req, res) => {
     );
 
     if (session && session.expiration > new Date()) {
-      const token = await setAuthTokens(userId, res, session, req);
+      const token = await setAuthTokens(userId, res, session);
 
       res.status(200).send({ token, user });
     } else if (req?.query?.retry) {

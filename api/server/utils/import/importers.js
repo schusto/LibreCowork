@@ -3,7 +3,6 @@ const { logger, getTenantId } = require('@librechat/data-schemas');
 const { EModelEndpoint, Constants, openAISettings } = require('librechat-data-provider');
 const { getEndpointsConfig } = require('~/server/services/Config');
 const { createImportBatchBuilder } = require('./importBatchBuilder');
-const { resolveImportDefaultModel } = require('./defaults');
 const { cloneMessagesWithTimestamps } = require('./fork');
 
 /**
@@ -54,17 +53,11 @@ async function importChatBotUiConvo(
   jsonData,
   requestUserId,
   builderFactory = createImportBatchBuilder,
-  userRole,
 ) {
   // this have been tested with chatbot-ui V1 export https://github.com/mckaywrigley/chatbot-ui/tree/b865b0555f53957e96727bc0bbb369c9eaecd83b#legacy-code
   try {
     /** @type {ImportBatchBuilder} */
     const importBatchBuilder = builderFactory(requestUserId);
-    const defaultModel = await resolveImportDefaultModel({
-      endpoint: EModelEndpoint.openAI,
-      requestUserId,
-      userRole,
-    });
 
     for (const historyItem of jsonData.history) {
       importBatchBuilder.startConversation(EModelEndpoint.openAI);
@@ -75,7 +68,7 @@ async function importChatBotUiConvo(
           importBatchBuilder.addUserMessage(message.content);
         }
       }
-      importBatchBuilder.finishConversation(historyItem.name, new Date(), {}, defaultModel);
+      importBatchBuilder.finishConversation(historyItem.name, new Date());
     }
     await importBatchBuilder.saveBatch();
     logger.info(`user: ${requestUserId} | ChatbotUI conversation imported`);
@@ -122,15 +115,9 @@ async function importClaudeConvo(
   jsonData,
   requestUserId,
   builderFactory = createImportBatchBuilder,
-  userRole,
 ) {
   try {
     const importBatchBuilder = builderFactory(requestUserId);
-    const defaultModel = await resolveImportDefaultModel({
-      endpoint: EModelEndpoint.anthropic,
-      requestUserId,
-      userRole,
-    });
 
     for (const conv of jsonData) {
       importBatchBuilder.startConversation(EModelEndpoint.anthropic);
@@ -185,12 +172,7 @@ async function importClaudeConvo(
       }
 
       const createdAt = conv.created_at ? new Date(conv.created_at) : new Date();
-      importBatchBuilder.finishConversation(
-        conv.name || 'Imported Claude Chat',
-        createdAt,
-        {},
-        defaultModel,
-      );
+      importBatchBuilder.finishConversation(conv.name || 'Imported Claude Chat', createdAt);
     }
 
     await importBatchBuilder.saveBatch();
@@ -232,12 +214,6 @@ async function importLibreChatConvo(
     }
 
     importBatchBuilder.startConversation(endpoint);
-
-    const defaultModel = await resolveImportDefaultModel({
-      endpoint,
-      requestUserId,
-      userRole,
-    });
 
     let firstMessageDate = null;
 
@@ -295,12 +271,7 @@ async function importLibreChatConvo(
       firstMessageDate = null;
     }
 
-    importBatchBuilder.finishConversation(
-      jsonData.title,
-      firstMessageDate ?? new Date(),
-      options,
-      defaultModel,
-    );
+    importBatchBuilder.finishConversation(jsonData.title, firstMessageDate ?? new Date(), options);
     await importBatchBuilder.saveBatch();
     logger.debug(`user: ${requestUserId} | Conversation "${jsonData.title}" imported`);
   } catch (error) {
@@ -321,17 +292,11 @@ async function importChatGptConvo(
   jsonData,
   requestUserId,
   builderFactory = createImportBatchBuilder,
-  userRole,
 ) {
   try {
     const importBatchBuilder = builderFactory(requestUserId);
-    const defaultModel = await resolveImportDefaultModel({
-      endpoint: EModelEndpoint.openAI,
-      requestUserId,
-      userRole,
-    });
     for (const conv of jsonData) {
-      processConversation(conv, importBatchBuilder, requestUserId, defaultModel);
+      processConversation(conv, importBatchBuilder, requestUserId);
     }
     await importBatchBuilder.saveBatch();
   } catch (error) {
@@ -346,10 +311,9 @@ async function importChatGptConvo(
  * @param {ChatGPTConvo} conv - A single conversation object that contains multiple messages and other details.
  * @param {ImportBatchBuilder} importBatchBuilder - The batch builder instance used to manage and batch conversation data.
  * @param {string} requestUserId - The ID of the user who initiated the import process.
- * @param {string} [defaultModel] - Resolved default model for the openAI endpoint.
  * @returns {void}
  */
-function processConversation(conv, importBatchBuilder, requestUserId, defaultModel) {
+function processConversation(conv, importBatchBuilder, requestUserId) {
   importBatchBuilder.startConversation(EModelEndpoint.openAI);
 
   // Map all message IDs to new UUIDs
@@ -473,8 +437,7 @@ function processConversation(conv, importBatchBuilder, requestUserId, defaultMod
 
     const isCreatedByUser = role === 'user';
     let sender = isCreatedByUser ? 'user' : 'assistant';
-    const model =
-      mapping.message.metadata.model_slug || defaultModel || openAISettings.model.default;
+    const model = mapping.message.metadata.model_slug || openAISettings.model.default;
 
     if (!isCreatedByUser) {
       /** Extracted model name from model slug */
@@ -524,12 +487,7 @@ function processConversation(conv, importBatchBuilder, requestUserId, defaultMod
     importBatchBuilder.saveMessage(message);
   }
 
-  importBatchBuilder.finishConversation(
-    conv.title,
-    new Date(conv.create_time * 1000),
-    {},
-    defaultModel,
-  );
+  importBatchBuilder.finishConversation(conv.title, new Date(conv.create_time * 1000));
 }
 
 /**

@@ -174,7 +174,16 @@ export class AccessControlService {
 
       this.validateResourceType(resourceType);
 
-      return await this._dbMethods.findPublicResourceIds(resourceType, requiredPermissions);
+      // Find all public ACL entries where the public principal has at least the required permission bits
+      const entries = await this._aclModel
+        .find({
+          principalType: PrincipalType.PUBLIC,
+          resourceType,
+          permBits: { $bitsAllSet: requiredPermissions },
+        })
+        .distinct('resourceId');
+
+      return entries;
     } catch (error) {
       if (error instanceof Error) {
         logger.error(`[PermissionService.findPubliclyAccessibleResources] Error: ${error.message}`);

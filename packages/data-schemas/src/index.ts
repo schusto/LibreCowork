@@ -14,7 +14,6 @@ export {
   cacheTokenValues,
   premiumTokenValues,
   defaultRate,
-  permissionBitSupersets,
 } from './methods';
 export type * from './types';
 export type * from './methods';

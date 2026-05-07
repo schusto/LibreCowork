@@ -1,4 +1,4 @@
-const { getEnvironmentVariable } = require('@librechat/agents/langchain/utils/env');
+const { getEnvironmentVariable } = require('@langchain/core/utils/env');
 
 function getApiKey(envVar, override) {
   const key = getEnvironmentVariable(envVar);

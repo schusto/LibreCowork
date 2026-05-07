@@ -1,6 +1,5 @@
 import { AnthropicEffort, ThinkingDisplay } from 'librechat-data-provider';
 import type * as t from '~/types';
-import { FINE_GRAINED_TOOL_STREAMING_BETA } from './helpers';
 import { getLLMConfig } from './llm';
 
 jest.mock('https-proxy-agent', () => ({
@@ -42,17 +41,6 @@ describe('getLLMConfig', () => {
     });
 
     expect(result.llmConfig.clientOptions).toHaveProperty('baseURL', 'http://reverse-proxy');
-    expect(result.llmConfig).toHaveProperty('anthropicApiUrl', 'http://reverse-proxy');
-  });
-
-  it('should honor dropParams for clientOptions', () => {
-    const result = getLLMConfig('test-api-key', {
-      modelOptions: {},
-      reverseProxyUrl: 'http://reverse-proxy',
-      dropParams: ['clientOptions'],
-    });
-
-    expect(result.llmConfig).not.toHaveProperty('clientOptions');
     expect(result.llmConfig).toHaveProperty('anthropicApiUrl', 'http://reverse-proxy');
   });
 
@@ -100,20 +88,21 @@ describe('getLLMConfig', () => {
     expect(result.llmConfig.thinking).toHaveProperty('budget_tokens', 2000);
   });
 
-  it('should pass promptCache without long-context beta header for claude-sonnet-4 model', () => {
+  it('should add "context-1m" beta header and promptCache boolean for claude-sonnet-4 model', () => {
     const modelOptions = {
       model: 'claude-sonnet-4-20250514',
       promptCache: true,
     };
     const result = getLLMConfig('test-key', { modelOptions });
     const clientOptions = result.llmConfig.clientOptions;
-    expect(clientOptions?.defaultHeaders).toEqual({
-      'anthropic-beta': FINE_GRAINED_TOOL_STREAMING_BETA,
-    });
+    expect(clientOptions?.defaultHeaders).toBeDefined();
+    expect(clientOptions?.defaultHeaders).toHaveProperty('anthropic-beta');
+    const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
+    expect(defaultHeaders['anthropic-beta']).toBe('context-1m-2025-08-07');
     expect(result.llmConfig.promptCache).toBe(true);
   });
 
-  it('should pass promptCache without long-context beta header for claude-sonnet-4 model formats', () => {
+  it('should add "context-1m" beta header and promptCache boolean for claude-sonnet-4 model formats', () => {
     const modelVariations = [
       'claude-sonnet-4-20250514',
       'claude-sonnet-4-latest',
@@ -124,27 +113,29 @@ describe('getLLMConfig', () => {
       const modelOptions = { model, promptCache: true };
       const result = getLLMConfig('test-key', { modelOptions });
       const clientOptions = result.llmConfig.clientOptions;
-      expect(clientOptions?.defaultHeaders).toEqual({
-        'anthropic-beta': FINE_GRAINED_TOOL_STREAMING_BETA,
-      });
+      expect(clientOptions?.defaultHeaders).toBeDefined();
+      expect(clientOptions?.defaultHeaders).toHaveProperty('anthropic-beta');
+      const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
+      expect(defaultHeaders['anthropic-beta']).toBe('context-1m-2025-08-07');
       expect(result.llmConfig.promptCache).toBe(true);
     });
   });
 
-  it('should pass promptCache without long-context beta header for claude-sonnet-4-6 model', () => {
+  it('should add "context-1m" beta header for claude-sonnet-4-6 model', () => {
     const modelOptions = {
       model: 'claude-sonnet-4-6',
       promptCache: true,
     };
     const result = getLLMConfig('test-key', { modelOptions });
     const clientOptions = result.llmConfig.clientOptions;
-    expect(clientOptions?.defaultHeaders).toEqual({
-      'anthropic-beta': FINE_GRAINED_TOOL_STREAMING_BETA,
-    });
+    expect(clientOptions?.defaultHeaders).toBeDefined();
+    expect(clientOptions?.defaultHeaders).toHaveProperty('anthropic-beta');
+    const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
+    expect(defaultHeaders['anthropic-beta']).toBe('context-1m-2025-08-07');
     expect(result.llmConfig.promptCache).toBe(true);
   });
 
-  it('should pass promptCache without long-context beta header for claude-sonnet-4-6 model formats', () => {
+  it('should add "context-1m" beta header for claude-sonnet-4-6 model formats', () => {
     const modelVariations = [
       'claude-sonnet-4-6',
       'claude-sonnet-4-6-20260101',
@@ -155,9 +146,10 @@ describe('getLLMConfig', () => {
       const modelOptions = { model, promptCache: true };
       const result = getLLMConfig('test-key', { modelOptions });
       const clientOptions = result.llmConfig.clientOptions;
-      expect(clientOptions?.defaultHeaders).toEqual({
-        'anthropic-beta': FINE_GRAINED_TOOL_STREAMING_BETA,
-      });
+      expect(clientOptions?.defaultHeaders).toBeDefined();
+      expect(clientOptions?.defaultHeaders).toHaveProperty('anthropic-beta');
+      const defaultHeaders = clientOptions?.defaultHeaders as Record<string, string>;
+      expect(defaultHeaders['anthropic-beta']).toBe('context-1m-2025-08-07');
       expect(result.llmConfig.promptCache).toBe(true);
     });
   });
@@ -169,9 +161,7 @@ describe('getLLMConfig', () => {
     };
     const result = getLLMConfig('test-key', { modelOptions });
     const clientOptions = result.llmConfig.clientOptions;
-    expect(clientOptions?.defaultHeaders).toEqual({
-      'anthropic-beta': FINE_GRAINED_TOOL_STREAMING_BETA,
-    });
+    expect(clientOptions?.defaultHeaders).toBeUndefined();
     expect(result.llmConfig.promptCache).toBe(true);
   });
 
@@ -187,9 +177,7 @@ describe('getLLMConfig', () => {
       const modelOptions = { model, promptCache: true };
       const result = getLLMConfig('test-key', { modelOptions });
       const clientOptions = result.llmConfig.clientOptions;
-      expect(clientOptions?.defaultHeaders).toEqual({
-        'anthropic-beta': FINE_GRAINED_TOOL_STREAMING_BETA,
-      });
+      expect(clientOptions?.defaultHeaders).toBeUndefined();
       expect(result.llmConfig.promptCache).toBe(true);
     });
   });
@@ -351,7 +339,7 @@ describe('getLLMConfig', () => {
 
       // claude-3-5-sonnet supports prompt caching and should get the max-tokens header and promptCache boolean
       expect(result.llmConfig.clientOptions?.defaultHeaders).toEqual({
-        'anthropic-beta': `max-tokens-3-5-sonnet-2024-07-15,${FINE_GRAINED_TOOL_STREAMING_BETA}`,
+        'anthropic-beta': 'max-tokens-3-5-sonnet-2024-07-15',
       });
       expect(result.llmConfig.promptCache).toBe(true);
     });
@@ -561,7 +549,7 @@ describe('getLLMConfig', () => {
         expect(result.llmConfig).not.toHaveProperty('topK');
         // Should have appropriate headers for Claude-3.7 with prompt cache
         expect(result.llmConfig.clientOptions?.defaultHeaders).toEqual({
-          'anthropic-beta': `token-efficient-tools-2025-02-19,output-128k-2025-02-19,${FINE_GRAINED_TOOL_STREAMING_BETA}`,
+          'anthropic-beta': 'token-efficient-tools-2025-02-19,output-128k-2025-02-19',
         });
         // Should pass promptCache boolean
         expect(result.llmConfig.promptCache).toBe(true);
@@ -1497,7 +1485,7 @@ describe('getLLMConfig', () => {
 
       it('should handle prompt cache support logic for different models', () => {
         const testCases = [
-          // Models that support prompt cache and have other beta headers
+          // Models that support prompt cache (and have other beta headers)
           {
             model: 'claude-3-5-sonnet',
             promptCache: true,
@@ -1525,13 +1513,7 @@ describe('getLLMConfig', () => {
           {
             model: 'claude-sonnet-4-20250514',
             promptCache: true,
-            shouldHaveHeaders: false,
-            shouldHavePromptCache: true,
-          },
-          {
-            model: 'claude-sonnet-4-6',
-            promptCache: true,
-            shouldHaveHeaders: false,
+            shouldHaveHeaders: true,
             shouldHavePromptCache: true,
           },
           // Models that support prompt cache but have no additional beta headers needed
@@ -1569,14 +1551,12 @@ describe('getLLMConfig', () => {
           });
 
           const headers = result.llmConfig.clientOptions?.defaultHeaders;
-          expect(headers).toBeDefined();
-          const betaHeader = (headers as Record<string, string>)['anthropic-beta'];
-          expect(betaHeader).toContain(FINE_GRAINED_TOOL_STREAMING_BETA);
 
           if (shouldHaveHeaders) {
-            expect(betaHeader).not.toBe(FINE_GRAINED_TOOL_STREAMING_BETA);
+            expect(headers).toBeDefined();
+            expect((headers as Record<string, string>)['anthropic-beta']).toBeDefined();
           } else {
-            expect(betaHeader).toBe(FINE_GRAINED_TOOL_STREAMING_BETA);
+            expect(headers).toBeUndefined();
           }
 
           if (shouldHavePromptCache) {

@@ -1,4 +1,4 @@
-import { ToolMessage, AIMessage, HumanMessage } from '@librechat/agents/langchain/messages';
+import { ToolMessage, AIMessage, HumanMessage } from '@langchain/core/messages';
 import { extractDiscoveredToolsFromHistory } from './run';
 
 describe('extractDiscoveredToolsFromHistory', () => {

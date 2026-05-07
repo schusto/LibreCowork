@@ -23,7 +23,6 @@ jest.mock('~/models', () => ({
 jest.mock('@librechat/api', () => ({
   isEnabled: jest.fn(),
   findOpenIDUser: jest.fn(),
-  getOpenIdIssuer: jest.fn(() => 'https://issuer.example.com'),
 }));
 
 const openIdClient = require('openid-client');
@@ -158,7 +157,6 @@ describe('refreshController – OpenID path', () => {
   };
 
   const baseClaims = {
-    iss: 'https://issuer.example.com',
     sub: 'oidc-sub-123',
     oid: 'oid-456',
     email: 'user@example.com',
@@ -206,10 +204,7 @@ describe('refreshController – OpenID path', () => {
 
     expect(getOpenIdEmail).toHaveBeenCalledWith(baseClaims);
     expect(findOpenIDUser).toHaveBeenCalledWith(
-      expect.objectContaining({
-        email: baseClaims.email,
-        openidIssuer: baseClaims.iss,
-      }),
+      expect.objectContaining({ email: baseClaims.email }),
     );
     expect(res.status).toHaveBeenCalledWith(200);
   });
@@ -230,10 +225,7 @@ describe('refreshController – OpenID path', () => {
 
     expect(getOpenIdEmail).toHaveBeenCalledWith(claimsWithUpn);
     expect(findOpenIDUser).toHaveBeenCalledWith(
-      expect.objectContaining({
-        email: 'user@corp.example.com',
-        openidIssuer: baseClaims.iss,
-      }),
+      expect.objectContaining({ email: 'user@corp.example.com' }),
     );
     expect(res.status).toHaveBeenCalledWith(200);
   });
@@ -244,10 +236,7 @@ describe('refreshController – OpenID path', () => {
     await refreshController(req, res);
 
     expect(findOpenIDUser).toHaveBeenCalledWith(
-      expect.objectContaining({
-        email: baseClaims.email,
-        openidIssuer: baseClaims.iss,
-      }),
+      expect.objectContaining({ email: baseClaims.email }),
     );
   });
 
@@ -278,11 +267,7 @@ describe('refreshController – OpenID path', () => {
 
     expect(updateUser).toHaveBeenCalledWith(
       'user-db-id',
-      expect.objectContaining({
-        provider: 'openid',
-        openidId: baseClaims.sub,
-        openidIssuer: baseClaims.iss,
-      }),
+      expect.objectContaining({ provider: 'openid', openidId: baseClaims.sub }),
     );
     expect(res.status).toHaveBeenCalledWith(200);
   });

@@ -21,27 +21,6 @@ export interface BalanceMiddlewareOptions {
   upsertBalanceFields: (userId: string, fields: IBalanceUpdate) => Promise<IBalance | null>;
 }
 
-const balanceUpdateLocks = new Map<string, Promise<void>>();
-
-async function runBalanceUpdate(userId: string, task: () => Promise<void>): Promise<void> {
-  const previous = balanceUpdateLocks.get(userId) ?? Promise.resolve();
-  const current = previous.catch(() => undefined).then(task);
-  const tail = current.then(
-    () => undefined,
-    () => undefined,
-  );
-
-  balanceUpdateLocks.set(userId, tail);
-
-  try {
-    await current;
-  } finally {
-    if (balanceUpdateLocks.get(userId) === tail) {
-      balanceUpdateLocks.delete(userId);
-    }
-  }
-}
-
 /**
  * Build an object containing fields that need updating
  * @param config - The balance configuration
@@ -133,16 +112,14 @@ export function createSetBalanceConfig({
         return next();
       }
       const userId = typeof user._id === 'string' ? user._id : user._id.toString();
-      await runBalanceUpdate(userId, async () => {
-        const userBalanceRecord = await findBalanceByUser(userId);
-        const updateFields = buildUpdateFields(balanceConfig, userBalanceRecord, userId);
+      const userBalanceRecord = await findBalanceByUser(userId);
+      const updateFields = buildUpdateFields(balanceConfig, userBalanceRecord, userId);
 
-        if (Object.keys(updateFields).length === 0) {
-          return;
-        }
+      if (Object.keys(updateFields).length === 0) {
+        return next();
+      }
 
-        await upsertBalanceFields(userId, updateFields);
-      });
+      await upsertBalanceFields(userId, updateFields);
 
       next();
     } catch (error) {

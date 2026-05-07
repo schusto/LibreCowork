@@ -1,5 +1,4 @@
-import type { RefillIntervalUnit } from 'librechat-data-provider';
-import type { Document, Types } from 'mongoose';
+import { Document, Types } from 'mongoose';
 
 export interface IBalance extends Document {
   user: Types.ObjectId;
@@ -7,7 +6,7 @@ export interface IBalance extends Document {
   // Automatic refill settings
   autoRefillEnabled: boolean;
   refillIntervalValue: number;
-  refillIntervalUnit: RefillIntervalUnit;
+  refillIntervalUnit: 'seconds' | 'minutes' | 'hours' | 'days' | 'weeks' | 'months';
   lastRefill: Date;
   refillAmount: number;
   tenantId?: string;
@@ -19,7 +18,7 @@ export interface IBalanceUpdate {
   tokenCredits?: number;
   autoRefillEnabled?: boolean;
   refillIntervalValue?: number;
-  refillIntervalUnit?: RefillIntervalUnit;
+  refillIntervalUnit?: string;
   refillAmount?: number;
   lastRefill?: Date;
 }

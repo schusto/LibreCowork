@@ -1,5 +1,4 @@
-import DOMPurify from 'dompurify';
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect } from 'react';
 import { useForm, Controller } from 'react-hook-form';
 import { Button, Input, Label, OGDialog, OGDialogTemplate } from '@librechat/client';
 import type { ConfigFieldDetail } from '~/common';
@@ -35,25 +34,6 @@ export default function MCPConfigDialog({
   } = useForm<Record<string, string>>({
     defaultValues: initialValues,
   });
-
-  const sanitizer = useMemo(() => {
-    const instance = DOMPurify();
-    instance.addHook('afterSanitizeAttributes', (node) => {
-      if (node.tagName === 'A') {
-        node.setAttribute('target', '_blank');
-        node.setAttribute('rel', 'noopener noreferrer');
-      }
-    });
-    return instance;
-  }, []);
-
-  const sanitize = (html: string) =>
-    sanitizer.sanitize(html, {
-      ALLOWED_TAGS: ['a', 'strong', 'b', 'em', 'i', 'br', 'code', 'span', 'p'],
-      ALLOWED_ATTR: ['href', 'class', 'target', 'rel'],
-      ALLOW_DATA_ATTR: false,
-      ALLOW_ARIA_ATTR: false,
-    });
 
   useEffect(() => {
     if (isOpen) {
@@ -103,7 +83,7 @@ export default function MCPConfigDialog({
                 {details.description && (
                   <p
                     className="text-xs text-text-secondary [&_a]:text-blue-500 [&_a]:hover:text-blue-600 dark:[&_a]:text-blue-400 dark:[&_a]:hover:text-blue-300"
-                    dangerouslySetInnerHTML={{ __html: sanitize(details.description) }}
+                    dangerouslySetInnerHTML={{ __html: details.description }}
                   />
                 )}
                 {errors[key] && <p className="text-xs text-red-500">{errors[key]?.message}</p>}

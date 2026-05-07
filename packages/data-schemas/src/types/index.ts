@@ -23,8 +23,6 @@ export * from './pluginAuth';
 export * from './memory';
 /* Prompts */
 export * from './prompts';
-/* Skills */
-export * from './skill';
 /* Access Control */
 export * from './accessRole';
 export * from './aclEntry';

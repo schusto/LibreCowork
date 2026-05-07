@@ -1,4 +1,3 @@
-export { default as useAttachmentPreviewSync } from './useAttachmentPreviewSync';
 export { default as useDeleteFilesFromTable } from './useDeleteFilesFromTable';
 export { default as useSetFilesToDelete } from './useSetFilesToDelete';
 export { default as useFileHandling, useFileHandlingNoChatContext } from './useFileHandling';

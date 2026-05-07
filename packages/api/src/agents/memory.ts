@@ -1,22 +1,22 @@
 /** Memories */
 import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
 import { Tools } from 'librechat-data-provider';
 import { logger } from '@librechat/data-schemas';
-import { tool } from '@librechat/agents/langchain/tools';
+import { HumanMessage } from '@langchain/core/messages';
 import { Run, Providers, GraphEvents } from '@librechat/agents';
-import { HumanMessage } from '@librechat/agents/langchain/messages';
 import type {
   OpenAIClientOptions,
   StreamEventData,
   ToolEndCallback,
+  ClientOptions,
   EventHandler,
   ToolEndData,
   LLMConfig,
 } from '@librechat/agents';
-import type { BaseMessage, ToolMessage } from '@librechat/agents/langchain/messages';
-import type { DynamicStructuredTool } from '@librechat/agents/langchain/tools';
 import type { ObjectId, MemoryMethods, IUser } from '@librechat/data-schemas';
 import type { TAttachment, MemoryArtifact } from 'librechat-data-provider';
+import type { BaseMessage, ToolMessage } from '@langchain/core/messages';
 import type { Response as ServerResponse } from 'express';
 import { GenerationJobManager } from '~/stream/GenerationJobManager';
 import { resolveHeaders, createSafeUser } from '~/utils';
@@ -32,21 +32,11 @@ type ToolEndMetadata = Record<string, unknown> & {
   thread_id?: string;
 };
 
-type SanitizedMemoryLLMConfig = Omit<Partial<LLMConfig>, 'apiKey'> & { apiKey?: string };
-
 export interface MemoryConfig {
   validKeys?: string[];
   instructions?: string;
   llmConfig?: Partial<LLMConfig>;
   tokenLimit?: number;
-}
-
-function normalizeMemoryLLMConfig(llmConfig?: Partial<LLMConfig>): SanitizedMemoryLLMConfig {
-  const config = { ...(llmConfig ?? {}) } as Record<string, unknown>;
-  if (typeof config.apiKey !== 'string') {
-    delete config.apiKey;
-  }
-  return config as SanitizedMemoryLLMConfig;
 }
 
 export const memoryInstructions =
@@ -98,7 +88,7 @@ export const createMemoryTool = ({
   validKeys?: string[];
   tokenLimit?: number;
   totalTokens?: number;
-}): DynamicStructuredTool => {
+}) => {
   const remainingTokens = tokenLimit ? tokenLimit - totalTokens : Infinity;
   const isOverflowing = tokenLimit ? remainingTokens <= 0 : false;
 
@@ -352,15 +342,15 @@ ${memory ?? 'No existing memories'}`;
       disableStreaming: true,
     };
 
-    const finalLLMConfig = {
+    const finalLLMConfig: ClientOptions = {
       ...defaultLLMConfig,
-      ...normalizeMemoryLLMConfig(llmConfig),
+      ...llmConfig,
       /**
        * Ensure streaming is always disabled for memory processing
        */
       streaming: false,
       disableStreaming: true,
-    } as LLMConfig;
+    };
 
     // Handle GPT-5+ models
     if ('model' in finalLLMConfig && /\bgpt-[5-9](?:\.\d+)?\b/i.test(finalLLMConfig.model ?? '')) {

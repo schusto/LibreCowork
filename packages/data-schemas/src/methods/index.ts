@@ -18,7 +18,7 @@ import { createPluginAuthMethods, type PluginAuthMethods } from './pluginAuth';
 /* Permissions */
 import { createAccessRoleMethods, type AccessRoleMethods } from './accessRole';
 import { createUserGroupMethods, type UserGroupMethods } from './userGroup';
-import { createAclEntryMethods, permissionBitSupersets, type AclEntryMethods } from './aclEntry';
+import { createAclEntryMethods, type AclEntryMethods } from './aclEntry';
 import { createSystemGrantMethods, type SystemGrantMethods } from './systemGrant';
 import { createShareMethods, type ShareMethods } from './share';
 /* Tier 1 — Simple CRUD */
@@ -45,19 +45,6 @@ import {
 import { createTransactionMethods, type TransactionMethods } from './transaction';
 import { createSpendTokensMethods, type SpendTokensMethods } from './spendTokens';
 import { createPromptMethods, type PromptMethods, type PromptDeps } from './prompt';
-import {
-  createSkillMethods,
-  type SkillMethods,
-  type SkillDeps,
-  type CreateSkillInput,
-  type CreateSkillResult,
-  type UpdateSkillInput,
-  type UpsertSkillFileInput,
-  type ListSkillsByAccessParams,
-  type ListSkillsByAccessResult,
-  type UpdateSkillResult,
-  type ValidationIssue,
-} from './skill';
 /* Tier 5 — Agent */
 import { createAgentMethods, type AgentMethods, type AgentDeps } from './agent';
 /* Config */
@@ -65,7 +52,6 @@ import { createConfigMethods, type ConfigMethods } from './config';
 
 export { RoleConflictError, DEFAULT_REFRESH_TOKEN_EXPIRY, DEFAULT_SESSION_EXPIRY };
 export { tokenValues, cacheTokenValues, premiumTokenValues, defaultRate };
-export { permissionBitSupersets };
 
 export type AllMethods = UserMethods &
   SessionMethods &
@@ -96,7 +82,6 @@ export type AllMethods = UserMethods &
   TransactionMethods &
   SpendTokensMethods &
   PromptMethods &
-  SkillMethods &
   AgentMethods &
   ConfigMethods;
 
@@ -169,12 +154,6 @@ export function createMethods(
   };
   const promptMethods = createPromptMethods(mongoose, promptDeps);
 
-  const skillDeps: SkillDeps = {
-    removeAllPermissions,
-    getSoleOwnedResourceIds: aclEntryMethods.getSoleOwnedResourceIds,
-  };
-  const skillMethods = createSkillMethods(mongoose, skillDeps);
-
   // Role methods with optional cache injection
   const roleDeps: RoleDeps = { getCache: deps.getCache };
   const roleMethods = createRoleMethods(mongoose, roleDeps);
@@ -223,7 +202,6 @@ export function createMethods(
     ...transactionMethods,
     ...spendTokensMethods,
     ...promptMethods,
-    ...skillMethods,
     /* Tier 5 */
     ...agentMethods,
     /* Config */
@@ -261,16 +239,6 @@ export type {
   TransactionMethods,
   SpendTokensMethods,
   PromptMethods,
-  SkillMethods,
-  SkillDeps,
-  CreateSkillInput,
-  CreateSkillResult,
-  UpdateSkillInput,
-  UpsertSkillFileInput,
-  ListSkillsByAccessParams,
-  ListSkillsByAccessResult,
-  UpdateSkillResult,
-  ValidationIssue,
   AgentMethods,
   ConfigMethods,
 };

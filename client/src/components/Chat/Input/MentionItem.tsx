@@ -6,7 +6,7 @@ export interface MentionItemProps {
   name: string;
   onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
   index: number;
-  type?: 'prompt' | 'mention' | 'add-convo' | 'skill';
+  type?: 'prompt' | 'mention' | 'add-convo';
   icon?: React.ReactNode;
   isActive?: boolean;
   description?: string;

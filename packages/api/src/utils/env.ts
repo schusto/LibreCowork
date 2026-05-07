@@ -92,14 +92,7 @@ export function createSafeUser(
   const safeUser: Partial<SafeUser> & { federatedTokens?: IUser['federatedTokens'] } = {};
   for (const field of ALLOWED_USER_FIELDS) {
     if (field in user) {
-      /**
-       * Indexed write through a union-typed key would otherwise fail strict
-       * checking — TS computes the LHS type as the *intersection* of all
-       * field write types (which collapses to `undefined` when fields have
-       * mixed types). `Object.assign` widens the assignment so each field
-       * preserves its concrete type at runtime.
-       */
-      Object.assign(safeUser, { [field]: user[field] });
+      safeUser[field] = user[field];
     }
   }
 

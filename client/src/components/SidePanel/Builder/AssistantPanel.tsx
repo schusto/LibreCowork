@@ -215,7 +215,7 @@ export default function AssistantPanel({
     <FormProvider {...methods}>
       <form
         onSubmit={handleSubmit(onSubmit)}
-        className="h-auto w-full flex-shrink-0 overflow-x-hidden pt-2"
+        className="h-auto w-full flex-shrink-0 overflow-x-hidden"
       >
         <div className="flex w-full flex-wrap">
           <Controller

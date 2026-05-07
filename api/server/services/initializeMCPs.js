@@ -11,11 +11,7 @@ async function initializeMCPs() {
   const mcpServers = appConfig.mcpConfig;
 
   try {
-    createMCPServersRegistry(
-      mongoose,
-      appConfig?.mcpSettings?.allowedDomains,
-      appConfig?.mcpSettings?.allowedAddresses,
-    );
+    createMCPServersRegistry(mongoose, appConfig?.mcpSettings?.allowedDomains);
   } catch (error) {
     logger.error('[MCP] Failed to initialize MCPServersRegistry:', error);
     throw error;

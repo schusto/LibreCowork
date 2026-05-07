@@ -17,7 +17,6 @@ export * from './mcp';
 export * from './favorites';
 export * from './elicitation';
 export * from './mlxStatus';
-export * from './subagents';
 
 export default {
   ...artifacts,

@@ -1,5 +1,4 @@
 import mongoose, { FilterQuery } from 'mongoose';
-import type { RefillIntervalUnit } from 'librechat-data-provider';
 import type { IUser, BalanceConfig, CreateUserRequest, UserDeleteResult } from '~/types';
 import { signPayload } from '~/crypto';
 
@@ -106,7 +105,7 @@ export function createUserMethods(mongoose: typeof import('mongoose')) {
         $set?: {
           autoRefillEnabled: boolean;
           refillIntervalValue: number;
-          refillIntervalUnit: RefillIntervalUnit;
+          refillIntervalUnit: string;
           refillAmount: number;
         };
       } = {

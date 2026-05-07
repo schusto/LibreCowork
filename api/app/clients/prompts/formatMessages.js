@@ -1,10 +1,6 @@
+const { ToolMessage } = require('@langchain/core/messages');
 const { EModelEndpoint, ContentTypes } = require('librechat-data-provider');
-const {
-  AIMessage,
-  ToolMessage,
-  HumanMessage,
-  SystemMessage,
-} = require('@librechat/agents/langchain/messages');
+const { HumanMessage, AIMessage, SystemMessage } = require('@langchain/core/messages');
 
 /**
  * Formats a message to OpenAI Vision API payload format.
@@ -195,7 +191,7 @@ const formatAgentMessages = (payload) => {
         let args = _args;
         try {
           args = JSON.parse(_args);
-        } catch (_e) {
+        } catch (e) {
           if (typeof _args === 'string') {
             args = { input: _args };
           }

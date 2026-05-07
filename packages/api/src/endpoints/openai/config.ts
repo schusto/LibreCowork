@@ -11,26 +11,6 @@ import { createFetch } from '~/utils/generators';
 
 type Fetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
-function mergeHeadersPreservingAnthropicBeta(
-  headers: Record<string, string> | undefined,
-  defaultHeaders: Record<string, string>,
-): Record<string, string> {
-  const mergedHeaders = Object.assign({}, headers ?? {}, defaultHeaders);
-  const existingBetaHeader = headers?.['anthropic-beta'];
-  const defaultBetaHeader = defaultHeaders['anthropic-beta'];
-
-  if (existingBetaHeader && defaultBetaHeader) {
-    const betaValues = [existingBetaHeader, defaultBetaHeader]
-      .flatMap((value) => value.split(','))
-      .map((value) => value.trim())
-      .filter(Boolean);
-
-    mergedHeaders['anthropic-beta'] = Array.from(new Set(betaValues)).join(',');
-  }
-
-  return mergedHeaders;
-}
-
 /**
  * Generates configuration options for creating a language model (LLM) instance.
  * @param apiKey - The API key for authentication.
@@ -94,10 +74,7 @@ export function getOpenAIConfig(
     llmConfig = transformed.llmConfig;
     tools = anthropicResult.tools;
     if (transformed.configOptions?.defaultHeaders) {
-      headers = mergeHeadersPreservingAnthropicBeta(
-        headers,
-        transformed.configOptions.defaultHeaders as Record<string, string>,
-      );
+      headers = Object.assign(headers ?? {}, transformed.configOptions?.defaultHeaders);
     }
   } else if (isGoogle) {
     const googleResult = getGoogleConfig(

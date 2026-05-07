@@ -1,7 +1,7 @@
 import React from 'react';
 import { FileSources } from 'librechat-data-provider';
 import { useToastContext } from '@librechat/client';
-import { revokeDownloadURL, useCodeOutputDownload, useFileDownload } from '~/data-provider';
+import { useCodeOutputDownload, useFileDownload } from '~/data-provider';
 
 interface LogLinkProps {
   href: string;
@@ -29,13 +29,9 @@ const isLocallyStoredSource = (source?: string): boolean => {
   if (!source) {
     return false;
   }
-  return [
-    FileSources.local,
-    FileSources.firebase,
-    FileSources.s3,
-    FileSources.cloudfront,
-    FileSources.azure_blob,
-  ].includes(source as FileSources);
+  return [FileSources.local, FileSources.firebase, FileSources.s3, FileSources.azure_blob].includes(
+    source as FileSources,
+  );
 };
 
 export const useAttachmentLink = ({
@@ -48,7 +44,7 @@ export const useAttachmentLink = ({
   const { showToast } = useToastContext();
 
   const useLocalDownload = isLocallyStoredSource(source) && !!file_id && !!user;
-  const { refetch: downloadFromApi } = useFileDownload(user, file_id, { source });
+  const { refetch: downloadFromApi } = useFileDownload(user, file_id);
   const { refetch: downloadFromUrl } = useCodeOutputDownload(href);
 
   const handleDownload = async (event: React.MouseEvent<HTMLAnchorElement | HTMLButtonElement>) => {
@@ -69,7 +65,7 @@ export const useAttachmentLink = ({
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      revokeDownloadURL(stream.data);
+      window.URL.revokeObjectURL(stream.data);
     } catch (error) {
       console.error('Error downloading file:', error);
     }

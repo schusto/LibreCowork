@@ -85,7 +85,6 @@ export class ConnectionsRepository {
         dbSourced: isUserSourced(serverConfig as t.ParsedServerConfig),
         useSSRFProtection: registry.shouldEnableSSRFProtection(),
         allowedDomains: registry.getAllowedDomains(),
-        allowedAddresses: registry.getAllowedAddresses(),
       },
       this.oauthOpts,
     );

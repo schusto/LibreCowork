@@ -402,34 +402,26 @@ export function findLastSeparatorIndex(text: string, separators = SEPARATORS): n
   return lastIndex;
 }
 
-export function replaceSpecialVars({
-  text,
-  user,
-  now: inputNow,
-}: {
-  text: string;
-  user?: t.TUser | null;
-  now?: string | number | Date;
-}) {
+export function replaceSpecialVars({ text, user }: { text: string; user?: t.TUser | null }) {
   let result = text;
   if (!result) {
     return result;
   }
 
-  const now = inputNow != null ? dayjs(inputNow) : dayjs();
+  const now = dayjs();
   const weekdayName = now.format('dddd');
 
   const currentDate = now.format('YYYY-MM-DD');
-  result = result.replace(/{{\s*current_date\s*}}/gi, `${currentDate} (${weekdayName})`);
+  result = result.replace(/{{current_date}}/gi, `${currentDate} (${weekdayName})`);
 
   const currentDatetime = now.format('YYYY-MM-DD HH:mm:ss Z');
-  result = result.replace(/{{\s*current_datetime\s*}}/gi, `${currentDatetime} (${weekdayName})`);
+  result = result.replace(/{{current_datetime}}/gi, `${currentDatetime} (${weekdayName})`);
 
   const isoDatetime = now.toISOString();
-  result = result.replace(/{{\s*iso_datetime\s*}}/gi, isoDatetime);
+  result = result.replace(/{{iso_datetime}}/gi, isoDatetime);
 
   if (user && user.name) {
-    result = result.replace(/{{\s*current_user\s*}}/gi, user.name);
+    result = result.replace(/{{current_user}}/gi, user.name);
   }
 
   return result;

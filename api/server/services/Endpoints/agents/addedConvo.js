@@ -40,9 +40,6 @@ const loadAddedAgent = (params) =>
  * @param {Map} params.agentConfigs - Map of agent configs to add to
  * @param {string} params.primaryAgentId - The primary agent ID
  * @param {Object|undefined} params.userMCPAuthMap - User MCP auth map to merge into
- * @param {boolean} [params.codeEnvAvailable] - `execute_code` capability flag;
- *   forwarded verbatim to the added agent's `initializeAgent`. @see
- *   InitializeAgentParams.codeEnvAvailable for full semantics.
  * @returns {Promise<{userMCPAuthMap: Object|undefined}>} The updated userMCPAuthMap
  */
 const processAddedConvo = async ({
@@ -60,7 +57,6 @@ const processAddedConvo = async ({
   primaryAgentId,
   primaryAgent,
   userMCPAuthMap,
-  codeEnvAvailable,
 }) => {
   const addedConvo = endpointOption.addedConvo;
   if (addedConvo == null) {
@@ -105,7 +101,6 @@ const processAddedConvo = async ({
         agent: addedAgent,
         endpointOption,
         allowedProviders,
-        codeEnvAvailable,
       },
       {
         getFiles: db.getFiles,

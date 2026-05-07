@@ -10,7 +10,6 @@ const resourceToPermissionType = {
   [ResourceType.PROMPTGROUP]: PermissionTypes.PROMPTS,
   [ResourceType.MCPSERVER]: PermissionTypes.MCP_SERVERS,
   [ResourceType.REMOTE_AGENT]: PermissionTypes.REMOTE_AGENTS,
-  [ResourceType.SKILL]: PermissionTypes.SKILLS,
 };
 
 /**

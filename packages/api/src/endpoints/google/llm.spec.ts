@@ -384,7 +384,7 @@ describe('getGoogleConfig', () => {
       expect(result.llmConfig).toHaveProperty('thinkingConfig');
       expect((result.llmConfig as Record<string, unknown>).thinkingConfig).toMatchObject({
         includeThoughts: true,
-        thinkingLevel: 'HIGH',
+        thinkingLevel: ThinkingLevel.high,
       });
       expect((result.llmConfig as Record<string, unknown>).thinkingConfig).not.toHaveProperty(
         'thinkingBudget',
@@ -406,26 +406,7 @@ describe('getGoogleConfig', () => {
 
       expect((result.llmConfig as Record<string, unknown>).thinkingConfig).toMatchObject({
         includeThoughts: true,
-        thinkingLevel: 'MEDIUM',
-      });
-    });
-
-    it('should preserve minimal thinkingLevel for Gemini 3 Flash models', () => {
-      const credentials = {
-        [AuthKeys.GOOGLE_API_KEY]: 'test-api-key',
-      };
-
-      const result = getGoogleConfig(credentials, {
-        modelOptions: {
-          model: 'gemini-3-flash-preview',
-          thinking: true,
-          thinkingLevel: ThinkingLevel.minimal,
-        },
-      });
-
-      expect((result.llmConfig as Record<string, unknown>).thinkingConfig).toMatchObject({
-        includeThoughts: true,
-        thinkingLevel: 'MINIMAL',
+        thinkingLevel: ThinkingLevel.medium,
       });
     });
 
@@ -485,7 +466,7 @@ describe('getGoogleConfig', () => {
       expect(result.provider).toBe(Providers.VERTEXAI);
       expect((result.llmConfig as Record<string, unknown>).thinkingConfig).toMatchObject({
         includeThoughts: true,
-        thinkingLevel: 'LOW',
+        thinkingLevel: ThinkingLevel.low,
       });
       expect(result.llmConfig).toHaveProperty('includeThoughts', true);
     });

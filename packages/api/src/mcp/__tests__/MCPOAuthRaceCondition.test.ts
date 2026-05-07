@@ -85,7 +85,6 @@ describe('MCP OAuth Race Condition Fixes', () => {
           getServerConfig: jest.fn().mockResolvedValue(mockConfig),
           shouldEnableSSRFProtection: jest.fn().mockReturnValue(false),
           getAllowedDomains: jest.fn().mockReturnValue(null),
-          getAllowedAddresses: jest.fn().mockReturnValue(null),
         });
 
       const { MCPConnectionFactory } = await import('~/mcp/MCPConnectionFactory');
@@ -152,7 +151,6 @@ describe('MCP OAuth Race Condition Fixes', () => {
           getServerConfig: jest.fn().mockResolvedValue(mockConfig),
           shouldEnableSSRFProtection: jest.fn().mockReturnValue(false),
           getAllowedDomains: jest.fn().mockReturnValue(null),
-          getAllowedAddresses: jest.fn().mockReturnValue(null),
         });
 
       const { MCPConnectionFactory } = await import('~/mcp/MCPConnectionFactory');

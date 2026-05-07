@@ -32,8 +32,6 @@ export default function useClearStates() {
           reset(store.showMentionPopoverFamily(key));
           reset(store.showPlusPopoverFamily(key));
           reset(store.showPromptsPopoverFamily(key));
-          reset(store.showSkillsPopoverFamily(key));
-          reset(store.pendingManualSkillsByConvoId(key.toString()));
           reset(store.activePromptByIndex(key));
           reset(store.globalAudioURLFamily(key));
           reset(store.globalAudioFetchingFamily(key));

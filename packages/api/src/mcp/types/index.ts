@@ -180,8 +180,6 @@ export interface BasicConnectionOptions {
   serverConfig: MCPOptions;
   useSSRFProtection?: boolean;
   allowedDomains?: string[] | null;
-  /** Admin exemption list of hostnames/IPs that bypass the SSRF private-IP block */
-  allowedAddresses?: string[] | null;
   /** When true, only resolve customUserVars in processMCPEnv (for DB-stored servers) */
   dbSourced?: boolean;
 }

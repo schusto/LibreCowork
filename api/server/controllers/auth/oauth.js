@@ -68,12 +68,9 @@ function createOAuthHandler(redirectUri = domains.client) {
         isEnabled(process.env.OPENID_REUSE_TOKENS) === true
       ) {
         await syncUserEntraGroupMemberships(req.user, req.user.tokenset.access_token);
-        setOpenIDAuthTokens(req.user.tokenset, req, res, {
-          userId: req.user._id.toString(),
-          tenantId: req.user.tenantId,
-        });
+        setOpenIDAuthTokens(req.user.tokenset, req, res, req.user._id.toString());
       } else {
-        await setAuthTokens(req.user._id, res, null, req);
+        await setAuthTokens(req.user._id, res);
       }
       res.redirect(redirectUri);
     } catch (err) {

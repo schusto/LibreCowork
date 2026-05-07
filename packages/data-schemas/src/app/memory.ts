@@ -1,8 +1,5 @@
 import { memorySchema } from 'librechat-data-provider';
-
 import type { TCustomConfig, TMemoryConfig } from 'librechat-data-provider';
-
-import logger from '~/config/winston';
 
 const hasValidAgent = (agent: TMemoryConfig['agent']) =>
   !!agent &&
@@ -16,10 +13,8 @@ export function loadMemoryConfig(config: TCustomConfig['memory']): TMemoryConfig
   if (!config) return undefined;
   if (isDisabled(config)) return config as TMemoryConfig;
 
-  if (hasValidAgent(config.agent) && config.agent?.enabled == null) {
-    logger.warn(
-      '[memory] Agent config detected without explicit `enabled: true`. Automatic memory extraction is now opt-in. Add `memory.agent.enabled: true` to keep automatic memory updates.',
-    );
+  if (!hasValidAgent(config.agent)) {
+    return { ...config, disabled: true } as TMemoryConfig;
   }
 
   const charLimit = memorySchema.shape.charLimit.safeParse(config.charLimit).data ?? 10000;
@@ -28,10 +23,6 @@ export function loadMemoryConfig(config: TCustomConfig['memory']): TMemoryConfig
 }
 
 export function isMemoryEnabled(config: TMemoryConfig | undefined): boolean {
-  return !isDisabled(config);
-}
-
-export function isMemoryAgentEnabled(config: TMemoryConfig | undefined): boolean {
-  if (!isMemoryEnabled(config)) return false;
-  return config?.agent?.enabled === true && hasValidAgent(config.agent);
+  if (isDisabled(config)) return false;
+  return hasValidAgent(config!.agent);
 }

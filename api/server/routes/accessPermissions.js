@@ -11,7 +11,7 @@ const {
 const { requireJwtAuth, checkBan, uaParser, canAccessResource } = require('~/server/middleware');
 const { checkPeoplePickerAccess } = require('~/server/middleware/checkPeoplePickerAccess');
 const { checkSharePublicAccess } = require('~/server/middleware/checkSharePublicAccess');
-const { findMCPServerByObjectId, getSkillById } = require('~/models');
+const { findMCPServerByObjectId } = require('~/models');
 
 const router = express.Router();
 
@@ -71,13 +71,6 @@ const checkResourcePermissionAccess = (requiredPermission) => (req, res, next) =
       requiredPermission,
       resourceIdParam: 'resourceId',
       idResolver: findMCPServerByObjectId,
-    });
-  } else if (resourceType === ResourceType.SKILL) {
-    middleware = canAccessResource({
-      resourceType: ResourceType.SKILL,
-      requiredPermission,
-      resourceIdParam: 'resourceId',
-      idResolver: getSkillById,
     });
   } else {
     return res.status(400).json({

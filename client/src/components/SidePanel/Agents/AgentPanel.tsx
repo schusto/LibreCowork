@@ -69,15 +69,12 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
     provider: _provider,
     agent_ids,
     edges,
-    subagents,
     end_after_tools,
     hide_sequential_outputs,
     recursion_limit,
     category,
     support_contact,
     tool_options,
-    skills,
-    skills_enabled,
     avatar_action: avatarActionState,
   } = data;
 
@@ -98,15 +95,12 @@ export function composeAgentUpdatePayload(data: AgentForm, agent_id?: string | n
       model_parameters,
       agent_ids,
       edges,
-      subagents,
       end_after_tools,
       hide_sequential_outputs,
       recursion_limit,
       category,
       support_contact,
       tool_options,
-      skills,
-      skills_enabled,
       ...(shouldResetAvatar ? { avatar: null } : {}),
     },
     provider,
@@ -486,7 +480,7 @@ export default function AgentPanel() {
     <FormProvider {...methods}>
       <form
         onSubmit={handleSubmit(onSubmit)}
-        className="scrollbar-gutter-stable flex flex-1 flex-col px-3 pb-3 pt-2"
+        className="scrollbar-gutter-stable flex flex-1 flex-col px-3 pb-3"
         aria-label="Agent configuration form"
       >
         <div className="flex-1">

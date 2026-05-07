@@ -1,7 +1,6 @@
 import { Schema } from 'mongoose';
 import { PrincipalType, PrincipalModel, ResourceType } from 'librechat-data-provider';
 import type { IAclEntry } from '~/types';
-import { MAX_PERM_BITS } from '~/common/permissions';
 
 const aclEntrySchema = new Schema<IAclEntry>(
   {
@@ -38,12 +37,6 @@ const aclEntrySchema = new Schema<IAclEntry>(
     permBits: {
       type: Number,
       default: 1,
-      min: 0,
-      max: MAX_PERM_BITS,
-      validate: {
-        validator: Number.isInteger,
-        message: '`permBits` must be an integer',
-      },
     },
     roleId: {
       type: Schema.Types.ObjectId,

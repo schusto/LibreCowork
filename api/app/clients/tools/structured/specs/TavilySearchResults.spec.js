@@ -2,6 +2,7 @@ const { fetch, ProxyAgent } = require('undici');
 const TavilySearchResults = require('../TavilySearchResults');
 
 jest.mock('undici');
+jest.mock('@langchain/core/utils/env');
 
 describe('TavilySearchResults', () => {
   let originalEnv;

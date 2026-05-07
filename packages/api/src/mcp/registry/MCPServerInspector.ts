@@ -21,7 +21,6 @@ export class MCPServerInspector {
     private connection: MCPConnection | undefined,
     private readonly useSSRFProtection: boolean = false,
     private readonly allowedDomains?: string[] | null,
-    private readonly allowedAddresses?: string[] | null,
   ) {}
 
   /**
@@ -38,10 +37,9 @@ export class MCPServerInspector {
     rawConfig: t.MCPOptions,
     connection?: MCPConnection,
     allowedDomains?: string[] | null,
-    allowedAddresses?: string[] | null,
   ): Promise<t.ParsedServerConfig> {
     // Validate domain against allowlist BEFORE attempting connection
-    const isDomainAllowed = await isMCPDomainAllowed(rawConfig, allowedDomains, allowedAddresses);
+    const isDomainAllowed = await isMCPDomainAllowed(rawConfig, allowedDomains);
     if (!isDomainAllowed) {
       const domain = extractMCPServerDomain(rawConfig);
       throw new MCPDomainNotAllowedError(domain ?? 'unknown');
@@ -55,7 +53,6 @@ export class MCPServerInspector {
       connection,
       useSSRFProtection,
       allowedDomains,
-      allowedAddresses,
     );
     await inspector.inspectServer();
     inspector.config.initDuration = Date.now() - start;
@@ -79,7 +76,6 @@ export class MCPServerInspector {
           dbSourced: isUserSourced(this.config),
           useSSRFProtection: this.useSSRFProtection,
           allowedDomains: this.allowedDomains,
-          allowedAddresses: this.allowedAddresses,
         });
       }
 

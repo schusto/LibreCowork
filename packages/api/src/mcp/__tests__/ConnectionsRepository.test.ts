@@ -26,7 +26,6 @@ const mockRegistryInstance = {
   getAllServerConfigs: jest.fn(),
   shouldEnableSSRFProtection: jest.fn().mockReturnValue(false),
   getAllowedDomains: jest.fn().mockReturnValue(null),
-  getAllowedAddresses: jest.fn().mockReturnValue(null),
 };
 
 jest.mock('../registry/MCPServersRegistry', () => ({
@@ -113,7 +112,6 @@ describe('ConnectionsRepository', () => {
           serverConfig: mockServerConfigs.server1,
           useSSRFProtection: false,
           allowedDomains: null,
-          allowedAddresses: null,
           dbSourced: false,
         },
         undefined,
@@ -138,7 +136,6 @@ describe('ConnectionsRepository', () => {
           serverConfig: mockServerConfigs.server1,
           useSSRFProtection: false,
           allowedDomains: null,
-          allowedAddresses: null,
           dbSourced: false,
         },
         undefined,
@@ -180,7 +177,6 @@ describe('ConnectionsRepository', () => {
           serverConfig: configWithCachedAt,
           useSSRFProtection: false,
           allowedDomains: null,
-          allowedAddresses: null,
           dbSourced: false,
         },
         undefined,
