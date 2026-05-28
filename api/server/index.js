@@ -25,7 +25,12 @@ const {
 } = require('@librechat/api');
 const { connectDb, indexSync } = require('~/db');
 const initializeOAuthReconnectManager = require('./services/initializeOAuthReconnectManager');
-const { getRoleByName, updateAccessPermissions, seedDatabase } = require('~/models');
+const {
+  getRoleByName,
+  updateAccessPermissions,
+  seedDatabase,
+  sweepOrphanedPreviews,
+} = require('~/models');
 const { capabilityContextMiddleware } = require('./middleware/roles/capabilities');
 const createValidateImageRequest = require('./middleware/validateImageRequest');
 const { jwtLogin, ldapLogin, passportLogin } = require('~/strategies');
@@ -69,6 +74,13 @@ const startServer = async () => {
   }
 
   await runAsSystem(seedDatabase);
+  /* Recover stuck `status: 'pending'` records from a crash mid-render.
+   * `runAsSystem` is required — `File` is tenant-isolated and strict
+   * mode rejects unscoped queries. Lazy sweep in the preview endpoint
+   * covers anything younger than the boot cutoff. */
+  runAsSystem(sweepOrphanedPreviews).catch((err) => {
+    logger.error('[sweepOrphanedPreviews] Background sweep failed:', err);
+  });
   const appConfig = await getAppConfig({ baseOnly: true });
   initializeFileStorage(appConfig);
   await runAsSystem(async () => {
@@ -168,6 +180,7 @@ const startServer = async () => {
   app.use('/api/convos', routes.convos);
   app.use('/api/presets', routes.presets);
   app.use('/api/prompts', routes.prompts);
+  app.use('/api/skills', routes.skills);
   app.use('/api/categories', routes.categories);
   app.use('/api/endpoints', routes.endpoints);
   app.use('/api/balance', routes.balance);
@@ -193,6 +206,18 @@ const startServer = async () => {
       res.json(response.data);
     } catch {
       res.json({ phase: 'idle' });
+    }
+  });
+
+  /** Todo status — proxies to mlx-proxy so sub-agent todo_update calls are visible
+   *  in the parent conversation's TaskList widget even though they occur in a
+   *  different message context and never appear in the parent's content stream. */
+  app.get('/api/todo_status', async (req, res) => {
+    try {
+      const response = await axios.get('http://host.docker.internal:1235/todo_status', { timeout: 1000 });
+      res.json(response.data);
+    } catch {
+      res.json({ todos: [], updated_at: null });
     }
   });
 
@@ -225,6 +250,44 @@ const startServer = async () => {
   const http = require('http');
   const server = http.createServer(app);
   server.requestTimeout = 0;
+
+  // OpenAI SDK v5 uses Node.js's built-in fetch (backed by the INTERNAL undici
+  // instance bundled with Node.js).  The npm `undici` package is a SEPARATE
+  // module instance — setGlobalDispatcher() on it does not affect the built-in
+  // fetch.  We must use `node:undici` (the built-in) to reach the same dispatcher
+  // that the built-in fetch uses.
+  //
+  // The built-in undici defaults headersTimeout and bodyTimeout to 300 000 ms
+  // (5 min).  During long LM Studio prefills the mlx-proxy holds the HTTP
+  // connection completely silent until the first token arrives; undici fires
+  // headersTimeout and closes the socket with a SocketError('terminated').
+  // Disabling both timeouts via the global dispatcher lets prefills run as long
+  // as they need.  connect.timeout keeps a fast-fail for unreachable backends.
+  // node:undici is the built-in undici instance that backs globalThis.fetch
+  // (and therefore OpenAI SDK v5's HTTP client).  The npm `undici` package is a
+  // separate module instance — patching it does nothing to the built-in fetch.
+  // headersTimeout / bodyTimeout both default to 300 000 ms; either fires during
+  // long LM Studio prefills and kills the socket with SocketError('terminated').
+  (() => {
+    let setGlobalDispatcher, Agent;
+    try {
+      ({ setGlobalDispatcher, Agent } = require('node:undici'));
+    } catch (_) {
+      try {
+        // Fallback: some Node 20 Alpine builds expose it without the node: prefix
+        ({ setGlobalDispatcher, Agent } = require('undici'));
+      } catch (e2) {
+        console.warn('[server] undici not available — long-prefill timeout not disabled:', e2.message);
+        return;
+      }
+    }
+    try {
+      setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0 }));
+      console.info('[server] undici global dispatcher set — headersTimeout and bodyTimeout disabled');
+    } catch (e) {
+      console.warn('[server] setGlobalDispatcher failed:', e.message);
+    }
+  })();
   server.listen(port, host, async (err) => {
     if (err) {
       logger.error('Failed to start server:', err);
@@ -239,25 +302,49 @@ const startServer = async () => {
       logger.info(`Server listening at http://${host == '0.0.0.0' ? 'localhost' : host}:${port}`);
     }
 
-    await runAsSystem(async () => {
-      await initializeMCPs();
-      await initializeOAuthReconnectManager();
-    });
-    await checkMigrations();
+    /**
+     * The listen callback is async, so any rejection from these awaits would
+     * otherwise be detached from `startServer().catch(...)` (which only
+     * catches errors that happen before `app.listen`). Without explicit
+     * handling, the global `unhandledRejection` handler would swallow init
+     * failures and leave the server listening but only partially
+     * initialized — passing liveness checks while serving broken requests.
+     */
+    try {
+      await runAsSystem(async () => {
+        await initializeMCPs();
+        await initializeOAuthReconnectManager();
+      });
+      await checkMigrations();
 
-    // Configure stream services (auto-detects Redis from USE_REDIS env var)
-    const streamServices = createStreamServices();
-    GenerationJobManager.configure(streamServices);
-    GenerationJobManager.initialize();
+      // Configure stream services (auto-detects Redis from USE_REDIS env var)
+      const streamServices = createStreamServices();
+      GenerationJobManager.configure(streamServices);
+      GenerationJobManager.initialize();
 
-    const inspectFlags = process.execArgv.some((arg) => arg.startsWith('--inspect'));
-    if (inspectFlags || isEnabled(process.env.MEM_DIAG)) {
-      memoryDiagnostics.start();
+      const inspectFlags = process.execArgv.some((arg) => arg.startsWith('--inspect'));
+      if (inspectFlags || isEnabled(process.env.MEM_DIAG)) {
+        memoryDiagnostics.start();
+      }
+    } catch (initErr) {
+      logger.error('Post-listen initialization failed:', initErr);
+      process.exit(1);
     }
   });
 };
 
-startServer();
+/**
+ * Boot rejections (e.g. `connectDb`, `getAppConfig`, `performStartupChecks`)
+ * must remain fail-fast: a half-initialized process with no listening HTTP
+ * server should die immediately so the orchestrator restarts it, instead of
+ * being kept alive by the `unhandledRejection` handler below until the
+ * liveness probe eventually times out. Mirrors the pattern in
+ * `experimental.js`.
+ */
+startServer().catch((err) => {
+  logger.error('Failed to start server:', err);
+  process.exit(1);
+});
 
 let messageCount = 0;
 process.on('uncaughtException', (err) => {
@@ -314,6 +401,32 @@ process.on('uncaughtException', (err) => {
   }
 
   process.exit(1);
+});
+
+/**
+ * Unhandled promise rejection handler.
+ *
+ * Node 15+ terminates the process by default when a promise rejection is
+ * unhandled. MCP OAuth reconnect storms and streamable-HTTP transport resets
+ * can produce transient fire-and-forget rejections (ECONNRESET, token refresh
+ * races) that are recoverable — the server should log and keep serving other
+ * requests rather than silently crash under load.
+ *
+ * Non-Error reasons are forwarded as-is so structured payloads (e.g.
+ * `{ code: "ECONNRESET", errno: -104 }`) survive instead of being collapsed to
+ * "[object Object]" by `String()`.
+ */
+process.on('unhandledRejection', (reason) => {
+  if (reason instanceof Error) {
+    logger.error('Unhandled promise rejection. The app will continue running.', {
+      name: reason.name,
+      message: reason.message,
+      stack: reason.stack,
+      cause: reason.cause,
+    });
+    return;
+  }
+  logger.error('Unhandled promise rejection. The app will continue running.', { reason });
 });
 
 /** Export app for easier testing purposes */

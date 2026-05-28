@@ -385,7 +385,7 @@ function fetchTitle({ baseURL, model, prompt }) {
     const payload = JSON.stringify({
       model,
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: 64,
+      max_tokens: 256,
       temperature: 0.3,
       stream: false,
     });
@@ -500,6 +500,7 @@ regenTitleRouter.post('/regen_title', regenTitleAuth, configMiddleware, async (r
 
   // 1. Fetch the first user message for this conversation
   let firstUserText = null;
+  let convoUserId = req.user.id;
   try {
     // When called via internal secret, req.user.id is the sentinel 'internal-service';
     // pass user only when it's a real user ID so getMessages doesn't filter nothing out.
@@ -515,6 +516,16 @@ regenTitleRouter.post('/regen_title', regenTitleAuth, configMiddleware, async (r
     }
 
     firstUserText = userMessages[0].text.slice(0, 1200);
+
+    // Resolve real userId — when called via X-Internal-Secret, req.user.id is the
+    // sentinel 'internal-service' which doesn't match any conversation's user field.
+    // Extract the real owner from the first user message instead.
+    convoUserId =
+      req.user.id === 'internal-service'
+        ? (userMessages[0]?.user?.toString?.() ?? req.user.id)
+        : req.user.id;
+
+    logger.info(`[regen_title] conversationId=${conversationId} convoUserId=${convoUserId} (req.user.id=${req.user.id})`);
   } catch (err) {
     logger.error('[regen_title] Error fetching messages:', err);
     return res.status(500).json({ error: 'Failed to fetch conversation messages' });
@@ -544,10 +555,11 @@ regenTitleRouter.post('/regen_title', regenTitleAuth, configMiddleware, async (r
     return res.status(502).json({ error: 'Title generation failed — no response from model and no proposed_title fallback' });
   }
 
+  let savedConvo;
   try {
-    await db.saveConvo(
+    savedConvo = await db.saveConvo(
       {
-        userId: req.user.id,
+        userId: convoUserId,
         isTemporary: false,
         interfaceConfig: req.config?.interfaceConfig,
       },
@@ -559,8 +571,19 @@ regenTitleRouter.post('/regen_title', regenTitleAuth, configMiddleware, async (r
     return res.status(500).json({ error: 'Title generated but failed to save' });
   }
 
+  // saveConvo returns null when noUpsert:true and no document matched.
+  // It returns { message: '...' } on internal error.
+  if (!savedConvo) {
+    logger.error(`[regen_title] saveConvo returned null — no conversation matched { conversationId: ${conversationId}, user: ${convoUserId} }. Title "${title}" was NOT saved.`);
+    return res.status(404).json({ error: `Conversation not found for userId=${convoUserId}`, title });
+  }
+  if (savedConvo.message) {
+    logger.error(`[regen_title] saveConvo returned error: ${savedConvo.message}`);
+    return res.status(500).json({ error: 'Title generated but saveConvo reported an error', title });
+  }
+
   const source = generatedTitle ? 'llm' : 'proposed_title_fallback';
-  logger.debug(`[regen_title] ${conversationId} → "${title}" (source: ${source})`);
+  logger.info(`[regen_title] ${conversationId} → "${title}" (source: ${source}) — saved OK for user ${convoUserId}`);
   return res.status(200).json({ conversationId, title });
 });
 

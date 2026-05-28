@@ -1,6 +1,9 @@
-import { useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { CheckCircle2, Circle, Loader2 } from 'lucide-react';
 import { cn } from '~/utils';
+
+const TODO_POLL_INTERVAL_MS = 1000;
+const TODO_STATUS_URL = '/api/todo_status';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -99,7 +102,51 @@ function TodoRow({ todo }: { todo: Todo }) {
  *   { todos: Array<{ content: string, activeForm: string, status: 'pending'|'in_progress'|'completed' }> }
  */
 export default function TaskList({ args, isSubmitting }: TaskListProps) {
-  const todos = useMemo(() => parseTodos(args), [args]);
+  // Todos parsed from the parent message's content (last todo_update the parent
+  // agent called directly — may be stale if sub-agents have since updated).
+  const contentTodos = useMemo(() => parseTodos(args), [args]);
+
+  // Polled todos from mlx-proxy → todos.json (reflects ALL agents, including
+  // sub-agents whose tool calls never appear in this conversation's content).
+  const [polledTodos, setPolledTodos] = useState<Todo[] | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (!isSubmitting) {
+      // Stop polling when the assistant has finished; keep last polled state
+      // so the widget remains accurate after the final sub-agent turn.
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+      return;
+    }
+
+    const poll = async () => {
+      try {
+        const res = await fetch(TODO_STATUS_URL, { cache: 'no-store' });
+        const data = await res.json();
+        if (Array.isArray(data?.todos) && data.todos.length > 0) {
+          setPolledTodos(data.todos as Todo[]);
+        }
+      } catch {
+        // ignore — keep last known state
+      }
+    };
+
+    poll();
+    pollTimerRef.current = setInterval(poll, TODO_POLL_INTERVAL_MS);
+
+    return () => {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+  }, [isSubmitting]);
+
+  // Prefer the polled state (always current) over the content-derived state.
+  const todos = (polledTodos && polledTodos.length > 0) ? polledTodos : contentTodos;
 
   if (todos.length === 0) {
     return null;

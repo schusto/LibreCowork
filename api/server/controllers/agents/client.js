@@ -1188,7 +1188,23 @@ class AgentClient extends BaseClient {
     if (!this.run) {
       throw new Error('Run not initialized');
     }
-    const { handleLLMEnd, collected: collectedMetadata } = createMetadataAggregator();
+    const { handleLLMEnd: _handleLLMEnd, collected: collectedMetadata } = createMetadataAggregator();
+    // [cowork] @librechat/agents@3.1.78 has a bug in handleLLMEnd: it accesses
+    // `generations[last][0].message` without null-guarding [0]. When the title
+    // model (Phi-4-mini via LM Studio) returns an empty generations sub-array,
+    // this throws "Cannot read properties of undefined (reading 'message')" and
+    // aborts titleConvo entirely. Wrap with try/catch until agents is bumped to
+    // ≥3.1.79 (which added the ?.[0] null guard and the inner fallback in generateTitle).
+    const handleLLMEnd = (...args) => {
+      try {
+        return _handleLLMEnd(...args);
+      } catch (err) {
+        logger.warn(
+          '[api/server/controllers/agents/client.js #titleConvo] handleLLMEnd callback error (ignored, agents bug):',
+          err?.message,
+        );
+      }
+    };
     const { req, agent } = this.options;
 
     if (req?.body?.isTemporary) {
@@ -1298,6 +1314,17 @@ class AgentClient extends BaseClient {
       ),
     );
 
+    // [cowork] Re-apply titleModel here — getOptions() rebuilds clientOptions from
+    // options.llmConfig (which reflects the request body / current chat model),
+    // overwriting the titleModel we set earlier.  Apply it again after the rebuild.
+    if (
+      endpointConfig &&
+      endpointConfig.titleModel &&
+      endpointConfig.titleModel !== Constants.CURRENT_MODEL
+    ) {
+      clientOptions.model = endpointConfig.titleModel;
+    }
+
     if (
       provider === Providers.GOOGLE &&
       (endpointConfig?.titleMethod === TitleMethod.FUNCTIONS ||
@@ -1321,48 +1348,77 @@ class AgentClient extends BaseClient {
       });
     }
 
+    logger.debug(
+      `[api/server/controllers/agents/client.js #titleConvo] starting generateTitle` +
+      ` provider=${provider} model=${clientOptions.model}` +
+      ` titleMethod=${endpointConfig?.titleMethod ?? 'undefined'}`,
+    );
+
     try {
-      const titleResult = await this.run.generateTitle({
-        provider,
-        clientOptions,
-        inputText: text,
-        contentParts: this.contentParts,
-        titleMethod: endpointConfig?.titleMethod,
-        titlePrompt: endpointConfig?.titlePrompt,
-        titlePromptTemplate: endpointConfig?.titlePromptTemplate,
-        chainOptions: {
-          runName: 'TitleRun',
-          signal: abortController.signal,
-          callbacks: [
-            {
-              handleLLMEnd,
+      let titleResult;
+      try {
+        titleResult = await this.run.generateTitle({
+          provider,
+          clientOptions,
+          inputText: text,
+          contentParts: this.contentParts,
+          titleMethod: endpointConfig?.titleMethod,
+          titlePrompt: endpointConfig?.titlePrompt,
+          titlePromptTemplate: endpointConfig?.titlePromptTemplate,
+          chainOptions: {
+            runName: 'TitleRun',
+            // [cowork] Do NOT pass abortController.signal here — the main run's
+            // controller is already aborted when the SSE stream closes at response
+            // end, which causes LangChain to throw AbortError immediately.
+            // Title generation must run to completion independently of the main run.
+            callbacks: [
+              {
+                handleLLMEnd,
+              },
+            ],
+            configurable: {
+              thread_id: this.conversationId,
+              user_id: this.user ?? this.options.req.user?.id,
             },
-          ],
-          configurable: {
-            thread_id: this.conversationId,
-            user_id: this.user ?? this.options.req.user?.id,
           },
-        },
-      });
+        });
+        logger.debug(
+          `[api/server/controllers/agents/client.js #titleConvo] generateTitle returned: ${JSON.stringify(titleResult)}`,
+        );
+      } catch (genErr) {
+        logger.warn(
+          `[api/server/controllers/agents/client.js #titleConvo] generateTitle threw: ${genErr?.message ?? String(genErr)}`,
+        );
+        return;
+      }
 
-      const collectedUsage = collectedMetadata.map((item) => {
-        let input_tokens, output_tokens;
+      let collectedUsage;
+      try {
+        collectedUsage = collectedMetadata.map((item) => {
+          let input_tokens, output_tokens;
 
-        if (item.usage) {
-          input_tokens =
-            item.usage.prompt_tokens || item.usage.input_tokens || item.usage.inputTokens;
-          output_tokens =
-            item.usage.completion_tokens || item.usage.output_tokens || item.usage.outputTokens;
-        } else if (item.tokenUsage) {
-          input_tokens = item.tokenUsage.promptTokens;
-          output_tokens = item.tokenUsage.completionTokens;
-        }
+          if (item.usage) {
+            input_tokens =
+              item.usage.prompt_tokens || item.usage.input_tokens || item.usage.inputTokens;
+            output_tokens =
+              item.usage.completion_tokens || item.usage.output_tokens || item.usage.outputTokens;
+          } else if (item.tokenUsage) {
+            input_tokens = item.tokenUsage.promptTokens;
+            output_tokens = item.tokenUsage.completionTokens;
+          }
 
-        return {
-          input_tokens: input_tokens,
-          output_tokens: output_tokens,
-        };
-      });
+          return {
+            input_tokens: input_tokens,
+            output_tokens: output_tokens,
+          };
+        });
+      } catch (mapErr) {
+        logger.error(
+          '[api/server/controllers/agents/client.js #titleConvo] collectedMetadata.map threw',
+          { message: mapErr?.message, stack: mapErr?.stack },
+        );
+        throw mapErr;
+      }
 
       const balanceConfig = getBalanceConfig(appConfig);
       const transactionsConfig = getTransactionsConfig(appConfig);
@@ -1380,9 +1436,16 @@ class AgentClient extends BaseClient {
         );
       });
 
+      logger.debug(
+        `[api/server/controllers/agents/client.js #titleConvo] sanitizing titleResult.title="${titleResult?.title}"`,
+      );
       return sanitizeTitle(titleResult.title);
     } catch (err) {
-      logger.error('[api/server/controllers/agents/client.js #titleConvo] Error', err);
+      // [cowork] Log full stack so we know exactly which file/line threw
+      logger.error('[api/server/controllers/agents/client.js #titleConvo] Error', {
+        message: err?.message,
+        stack: err?.stack,
+      });
       return;
     }
   }
