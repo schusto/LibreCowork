@@ -45,6 +45,7 @@ export const excludedKeys = new Set([
   'createdAt',
   'updatedAt',
   'expiredAt',
+  'isTemporary',
   'messages',
   'isArchived',
   'tags',
@@ -69,7 +70,9 @@ export const fileSourceSchema = z.nativeEnum(FileSources);
 /**
  * `allowedAddresses` is an SSRF exemption list scoped to private IP space.
  * Validate at config-load time:
- *  - Reject URLs, paths, CIDR ranges, host:port forms, and whitespace.
+ *  - Reject URLs, paths, CIDR ranges, bare host/IP forms, and whitespace.
+ *  - Require `host:port` or `[ipv6]:port` entries so an exemption is scoped
+ *    to one service port instead of every port on a private host.
  *  - Reject IPv4 literals that fall outside the private/loopback/link-local
  *    ranges. Public IPs are never SSRF targets, so listing one has no
  *    defensive purpose and must not silently grant trust.
@@ -114,20 +117,28 @@ function isPrivateIPv6Literal(value: string): boolean {
 }
 
 /**
- * Detects `host:port` and `[ipv6]:port` shapes — both are invalid as
- * allowedAddresses entries. Bare `::1`, `[::1]`, and other IPv6 literals
- * with no port are intentionally not matched.
- *
- * Mirrors `looksLikeHostPort` in `@librechat/api`'s `auth/allowedAddresses`.
+ * Mirrors the allowedAddresses parser in `@librechat/api`'s auth helpers.
  * Kept as a local copy because the data-provider package cannot import from
  * `@librechat/api` without creating a circular dependency. Keep the two
  * implementations in sync.
  */
-function looksLikeHostPort(entry: string): boolean {
-  if (/^\[[^\]]+\]:\d+$/.test(entry)) return true;
-  const colonCount = (entry.match(/:/g) ?? []).length;
-  if (colonCount !== 1) return false;
-  return /^[^:]+:\d+$/.test(entry);
+function normalizePort(port: unknown): string {
+  if (typeof port !== 'string' && typeof port !== 'number') return '';
+  const portString = String(port).trim();
+  if (!/^\d+$/.test(portString)) return '';
+  const parsed = Number(portString);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) return '';
+  return String(parsed);
+}
+
+function parseAllowedAddressEntry(entry: string): { address: string; port: string } | null {
+  const trimmed = entry.toLowerCase().trim();
+  const bracketedIPv6 = trimmed.match(/^\[([^\]]+)\]:(\d+)$/);
+  const hostPort = bracketedIPv6 ? null : trimmed.match(/^([^:]+):(\d+)$/);
+  const address = (bracketedIPv6?.[1] ?? hostPort?.[1] ?? '').replace(/^\[|\]$/g, '');
+  const port = normalizePort(bracketedIPv6?.[2] ?? hostPort?.[2] ?? '');
+  if (!address || !port) return null;
+  return { address, port };
 }
 
 const allowedAddressEntrySchema = z
@@ -137,17 +148,17 @@ const allowedAddressEntrySchema = z
   })
   .refine((entry) => !entry.includes('://') && !entry.includes('/') && !/\s/.test(entry), {
     message:
-      'allowedAddresses entries must be bare hostnames or IPs — no URLs, paths, CIDR ranges, or whitespace',
+      'allowedAddresses entries must be host:port pairs — no URLs, paths, CIDR ranges, or whitespace',
   })
-  .refine((entry) => !looksLikeHostPort(entry), {
-    message: 'allowedAddresses entries must not include a port — list the bare hostname or IP only',
+  .refine((entry) => parseAllowedAddressEntry(entry) != null, {
+    message:
+      'allowedAddresses entries must include a port, for example localhost:11434 or [::1]:11434',
   })
   .refine(
     (entry) => {
-      const stripped = entry
-        .toLowerCase()
-        .trim()
-        .replace(/^\[|\]$/g, '');
+      const parsed = parseAllowedAddressEntry(entry);
+      if (!parsed) return false;
+      const stripped = parsed.address;
       const isIPv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(stripped);
       const isIPv6 = !isIPv4 && stripped.includes(':');
       if (!isIPv4 && !isIPv6) {
@@ -157,7 +168,7 @@ const allowedAddressEntrySchema = z
     },
     {
       message:
-        'allowedAddresses is scoped to private IP space — public IP literals are not permitted (use a hostname if it resolves to a private IP)',
+        'allowedAddresses is scoped to private IP space — public IP literals are not permitted (use hostname:port if it resolves to a private IP)',
     },
   );
 
@@ -205,6 +216,7 @@ export const cloudfrontConfigSchema = z
       .optional(),
     storageRegion: z.string().min(1).optional(),
     includeRegionInPath: z.boolean().default(false),
+    requireSignedAccess: z.boolean().default(false),
   })
   .refine((data) => !data.invalidateOnDelete || !!data.distributionId, {
     message: 'distributionId is required when invalidateOnDelete is true',
@@ -214,6 +226,11 @@ export const cloudfrontConfigSchema = z
     message:
       'cookieDomain is required when imageSigning is "cookies" (e.g., ".example.com" for API at api.example.com and CDN at cdn.example.com)',
     path: ['cookieDomain'],
+  })
+  .refine((data) => !data.requireSignedAccess || data.imageSigning === 'cookies', {
+    message:
+      'cloudfront.requireSignedAccess=true requires cloudfront.imageSigning="cookies" (signed URL mode is not yet implemented)',
+    path: ['requireSignedAccess'],
   })
   .optional();
 
@@ -386,10 +403,18 @@ export const baseEndpointSchema = z.object({
 
 export type TBaseEndpoint = z.infer<typeof baseEndpointSchema>;
 
+export const bedrockGuardrailConfigSchema = z.object({
+  guardrailIdentifier: z.string(),
+  guardrailVersion: z.string(),
+  trace: z.enum(['enabled', 'disabled', 'enabled_full']).optional(),
+  streamProcessingMode: z.enum(['sync', 'async']).optional(),
+});
+
 export const bedrockEndpointSchema = baseEndpointSchema.merge(
   z.object({
     availableRegions: z.array(z.string()).optional(),
     models: z.array(z.string()).optional(),
+    guardrailConfig: bedrockGuardrailConfigSchema.optional(),
     inferenceProfiles: z.record(z.string(), z.string()).optional(),
   }),
 );
@@ -483,7 +508,7 @@ const remoteApiOidcSchema = z
   .object({
     enabled: z.boolean().default(false),
     issuer: remoteApiOidcUrlSchema.optional(),
-    audience: z.string().optional(),
+    audience: z.string().min(1).optional(),
     jwksUri: remoteApiOidcUrlSchema.optional(),
     scope: remoteApiOidcScopeSchema.optional(),
   })
@@ -493,6 +518,13 @@ const remoteApiOidcSchema = z
         code: z.ZodIssueCode.custom,
         path: ['issuer'],
         message: 'issuer is required when OIDC auth is enabled',
+      });
+    }
+    if (oidc.enabled === true && !oidc.audience) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['audience'],
+        message: 'audience is required when OIDC auth is enabled',
       });
     }
   });
@@ -872,6 +904,11 @@ const mcpServersSchema = z
 
 export type TMcpServersConfig = z.infer<typeof mcpServersSchema>;
 
+export enum RetentionMode {
+  ALL = 'all',
+  TEMPORARY = 'temporary',
+}
+
 export const interfaceSchema = z
   .object({
     privacyPolicy: z
@@ -914,6 +951,7 @@ export const interfaceSchema = z
     temporaryChat: z.boolean().optional(),
     temporaryChatRetention: z.number().min(1).max(8760).optional(),
     autoSubmitFromUrl: z.boolean().optional(),
+    retentionMode: z.nativeEnum(RetentionMode).default(RetentionMode.TEMPORARY),
     runCode: z.boolean().optional(),
     webSearch: z.boolean().optional(),
     peoplePicker: z
@@ -930,6 +968,7 @@ export const interfaceSchema = z
       .optional(),
     fileSearch: z.boolean().optional(),
     fileCitations: z.boolean().optional(),
+    buildInfo: z.boolean().optional(),
     remoteAgents: z
       .object({
         use: z.boolean().optional(),
@@ -990,6 +1029,7 @@ export const interfaceSchema = z
     },
     fileSearch: true,
     fileCitations: true,
+    buildInfo: true,
     remoteAgents: {
       use: false,
       create: false,
@@ -1025,6 +1065,23 @@ export const turnstileSchema = z.object({
 });
 
 export type TTurnstileConfig = z.infer<typeof turnstileSchema>;
+
+export type TRumConfig = {
+  provider: 'hyperdx';
+  enabled: boolean;
+  url: string;
+  serviceName: string;
+  authMode: 'publicToken';
+  publicToken?: string;
+  tracePropagationTargets?: string[];
+  consoleCapture?: boolean;
+  disableReplay?: boolean;
+  advancedNetworkCapture?: boolean;
+  sampleRate?: number;
+  environment?: string;
+};
+
+export type StartupConfigContext = 'share';
 
 export type TStartupConfig = {
   appTitle: string;
@@ -1066,6 +1123,7 @@ export type TStartupConfig = {
   sharedLinksEnabled: boolean;
   publicSharedLinksEnabled: boolean;
   analyticsGtmId?: string;
+  rum?: TRumConfig;
   bundlerURL?: string;
   staticBundlerURL?: string;
   sharePointFilePickerEnabled?: boolean;
@@ -1079,6 +1137,12 @@ export type TStartupConfig = {
     searchProvider?: SearchProviders;
     scraperProvider?: ScraperProviders;
     rerankerType?: RerankerTypes;
+  };
+  cloudFront?: {
+    cookieRefresh?: {
+      endpoint: string;
+      domain: string;
+    };
   };
   mcpServers?: Record<
     string,
@@ -1098,6 +1162,12 @@ export type TStartupConfig = {
   >;
   mcpPlaceholder?: string;
   conversationImportMaxFileSize?: number;
+  buildInfo?: {
+    commit?: string | null;
+    commitShort?: string | null;
+    branch?: string | null;
+    buildDate?: string | null;
+  };
 };
 
 export enum OCRStrategy {
@@ -1498,6 +1568,7 @@ const sharedOpenAIModels = [
 ];
 
 const sharedAnthropicModels = [
+  'claude-opus-4-8',
   'claude-opus-4-7',
   'claude-sonnet-4-6',
   'claude-opus-4-6',
@@ -1521,6 +1592,7 @@ const sharedAnthropicModels = [
 ];
 
 export const bedrockModels = [
+  'anthropic.claude-opus-4-8',
   'anthropic.claude-opus-4-7',
   'anthropic.claude-sonnet-4-6',
   'anthropic.claude-opus-4-6-v1',
@@ -1559,6 +1631,8 @@ export const defaultModels = {
   [EModelEndpoint.assistants]: [...sharedOpenAIModels, 'chatgpt-4o-latest'],
   [EModelEndpoint.agents]: sharedOpenAIModels, // TODO: Add agent models (agentsModels)
   [EModelEndpoint.google]: [
+    // Gemini 3.5 Models
+    'gemini-3.5-flash',
     // Gemini 3.1 Models
     'gemini-3.1-pro-preview',
     'gemini-3.1-pro-preview-customtools',
@@ -2068,6 +2142,10 @@ export enum SettingsTabValues {
    * Tab for Personalization Settings
    */
   PERSONALIZATION = 'personalization',
+  /**
+   * Tab for About / Build Info
+   */
+  ABOUT = 'about',
 }
 
 export enum STTProviders {
@@ -2102,10 +2180,18 @@ export enum TTSProviders {
 
 /** Enum for app-wide constants */
 export enum Constants {
-  /** Key for the app's version. */
-  VERSION = 'v0.8.5',
+  /**
+   * Key for the app's version. The placeholder `__LIBRECHAT_VERSION__` is
+   * swapped in by `@rollup/plugin-replace` during `npm run build:data-provider`
+   * using the value of the root `package.json`'s `version` field. Consumers
+   * always import this via the built dist bundle (see `main` field in
+   * `packages/data-provider/package.json`), so production and UI code get the
+   * substituted value. Only tests that import the TypeScript source directly
+   * would observe the raw placeholder.
+   */
+  VERSION = '__LIBRECHAT_VERSION__',
   /** Key for the Custom Config's version (librechat.yaml). */
-  CONFIG_VERSION = '1.3.9',
+  CONFIG_VERSION = '1.3.12',
   /** Standard value for the first message's `parentMessageId` value, to indicate no parent exists. */
   NO_PARENT = '00000000-0000-0000-0000-000000000000',
   /** Standard value to use whatever the submission prelim. `responseMessageId` is */
@@ -2153,12 +2239,23 @@ export enum Constants {
   EPHEMERAL_AGENT_ID = 'ephemeral',
   /** Programmatic Tool Calling tool name */
   PROGRAMMATIC_TOOL_CALLING = 'run_tools_with_code',
+  /** Bash Programmatic Tool Calling tool name */
+  BASH_PROGRAMMATIC_TOOL_CALLING = 'run_tools_with_bash',
   /** Subagent spawn tool name (must match `@librechat/agents` `Constants.SUBAGENT`). */
   SUBAGENT = 'subagent',
 }
 
 /** Maximum number of explicit subagents per parent agent. UI + Zod schema share this. */
 export const MAX_SUBAGENTS = 10;
+
+/** Maximum explicit subagent hops allowed from any root agent at runtime. */
+export const MAX_SUBAGENT_DEPTH = 5;
+
+/** Maximum unique explicit subagent targets that may be loaded at runtime. */
+export const MAX_SUBAGENT_GRAPH_NODES = 50;
+
+/** Maximum expanded SubagentConfig entries embedded into one run request. */
+export const MAX_SUBAGENT_RUN_CONFIGS = 100;
 
 export enum LocalStorageKeys {
   /** Key for the admin defined App Title */

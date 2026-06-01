@@ -7,12 +7,20 @@ jest.mock('node:dns', () => {
 });
 
 import dns from 'node:dns';
+import http from 'node:http';
 import type { LookupFunction } from 'node:net';
 import { createSSRFSafeAgents, createSSRFSafeUndiciConnect } from './agent';
 
-type LookupCallback = (err: NodeJS.ErrnoException | null, address: string, family: number) => void;
+type LookupCallback = (
+  err: NodeJS.ErrnoException | null,
+  address: string | dns.LookupAddress[],
+  family?: number,
+) => void;
 
 const mockedDnsLookup = dns.lookup as jest.MockedFunction<typeof dns.lookup>;
+const httpAgentPrototype = http.Agent.prototype as unknown as {
+  createConnection: (options: Record<string, unknown>) => unknown;
+};
 
 function mockDnsResult(address: string, family: number): void {
   mockedDnsLookup.mockImplementation(((
@@ -21,6 +29,16 @@ function mockDnsResult(address: string, family: number): void {
     callback: LookupCallback,
   ) => {
     callback(null, address, family);
+  }) as never);
+}
+
+function mockDnsAllResult(addresses: dns.LookupAddress[]): void {
+  mockedDnsLookup.mockImplementation(((
+    _hostname: string,
+    _options: unknown,
+    callback: LookupCallback,
+  ) => {
+    callback(null, addresses);
   }) as never);
 }
 
@@ -36,6 +54,7 @@ function mockDnsError(err: NodeJS.ErrnoException): void {
 
 describe('createSSRFSafeAgents', () => {
   afterEach(() => {
+    jest.restoreAllMocks();
     jest.clearAllMocks();
   });
 
@@ -51,6 +70,29 @@ describe('createSSRFSafeAgents', () => {
       createConnection: (opts: Record<string, unknown>) => unknown;
     };
     expect(internal.createConnection).toBeInstanceOf(Function);
+  });
+
+  it('should scope allowedAddresses by the request port in the HTTP agent lookup', async () => {
+    mockDnsResult('10.0.0.5', 4);
+    let lookupError: NodeJS.ErrnoException | null = null;
+    jest.spyOn(httpAgentPrototype, 'createConnection').mockImplementation(((
+      options: Record<string, unknown>,
+    ) => {
+      const lookup = options.lookup as LookupFunction;
+      lookup('private.example.com', {}, (err) => {
+        lookupError = err;
+      });
+      return {};
+    }) as never);
+
+    const agents = createSSRFSafeAgents(['10.0.0.5:11434']);
+    const internal = agents.httpAgent as unknown as {
+      createConnection: (opts: Record<string, unknown>) => unknown;
+    };
+    internal.createConnection({ host: 'private.example.com', port: 22 });
+
+    expect(lookupError).toBeTruthy();
+    expect(lookupError!.code).toBe('ESSRF');
   });
 });
 
@@ -95,6 +137,73 @@ describe('createSSRFSafeUndiciConnect', () => {
     expect(result.address).toBe('93.184.216.34');
   });
 
+  it('lookup should block private IPs when DNS returns all addresses', async () => {
+    mockDnsAllResult([{ address: '127.0.0.1', family: 4 }]);
+    const connect = createSSRFSafeUndiciConnect();
+
+    const result = await new Promise<{ err: NodeJS.ErrnoException | null }>((resolve) => {
+      connect.lookup('localhost', { all: true }, (err) => {
+        resolve({ err });
+      });
+    });
+
+    expect(result.err).toBeTruthy();
+    expect(result.err!.code).toBe('ESSRF');
+  });
+
+  it('lookup should allow public IPs when DNS returns all addresses', async () => {
+    const addresses = [{ address: '93.184.216.34', family: 4 }];
+    mockDnsAllResult(addresses);
+    const connect = createSSRFSafeUndiciConnect();
+
+    const result = await new Promise<{
+      err: NodeJS.ErrnoException | null;
+      address: string | dns.LookupAddress[];
+    }>((resolve) => {
+      connect.lookup('example.com', { all: true }, (err, address) => {
+        resolve({ err, address });
+      });
+    });
+
+    expect(result.err).toBeNull();
+    expect(result.address).toEqual(addresses);
+  });
+
+  it('lookup should block mixed public and private all-address results', async () => {
+    mockDnsAllResult([
+      { address: '93.184.216.34', family: 4 },
+      { address: '10.0.0.1', family: 4 },
+    ]);
+    const connect = createSSRFSafeUndiciConnect();
+
+    const result = await new Promise<{ err: NodeJS.ErrnoException | null }>((resolve) => {
+      connect.lookup('rebinding.example.com', { all: true }, (err) => {
+        resolve({ err });
+      });
+    });
+
+    expect(result.err).toBeTruthy();
+    expect(result.err!.code).toBe('ESSRF');
+  });
+
+  it('lookup should honor allowedAddresses when DNS returns all addresses', async () => {
+    const addresses = [{ address: '10.0.0.5', family: 4 }];
+    mockDnsAllResult(addresses);
+    const connect = createSSRFSafeUndiciConnect(['10.0.0.5:11434'], '11434');
+
+    const result = await new Promise<{
+      err: NodeJS.ErrnoException | null;
+      address: string | dns.LookupAddress[];
+    }>((resolve) => {
+      connect.lookup('private.example.com', { all: true }, (err, address) => {
+        resolve({ err, address });
+      });
+    });
+
+    expect(result.err).toBeNull();
+    expect(result.address).toEqual(addresses);
+  });
+
   it('lookup should forward DNS errors', async () => {
     const dnsError = Object.assign(new Error('ENOTFOUND'), {
       code: 'ENOTFOUND',
@@ -132,25 +241,41 @@ describe('SSRF agents — allowedAddresses exemption', () => {
     });
   }
 
-  it('exempts a hostname literal that the admin permitted', async () => {
+  it('exempts a hostname literal on the admin-permitted port', async () => {
     mockDnsResult('10.0.0.5', 4);
-    const { lookup } = createSSRFSafeUndiciConnect(['ollama.internal']);
+    const { lookup } = createSSRFSafeUndiciConnect(['ollama.internal:11434'], '11434');
     const result = await runLookup(lookup, 'ollama.internal');
     expect(result.err).toBeNull();
     expect(result.address).toBe('10.0.0.5');
   });
 
-  it('exempts a private IP that the admin permitted (DNS resolves to it)', async () => {
+  it('exempts a private IP on the admin-permitted port (DNS resolves to it)', async () => {
     mockDnsResult('10.0.0.5', 4);
-    const { lookup } = createSSRFSafeUndiciConnect(['10.0.0.5']);
+    const { lookup } = createSSRFSafeUndiciConnect(['10.0.0.5:11434'], '11434');
     const result = await runLookup(lookup, 'private.example.com');
     expect(result.err).toBeNull();
     expect(result.address).toBe('10.0.0.5');
   });
 
+  it('blocks a private IP on a different port of an allowed address', async () => {
+    mockDnsResult('10.0.0.5', 4);
+    const { lookup } = createSSRFSafeUndiciConnect(['10.0.0.5:11434'], '22');
+    const result = await runLookup(lookup, 'private.example.com');
+    expect(result.err).toBeTruthy();
+    expect(result.err!.code).toBe('ESSRF');
+  });
+
+  it('ignores legacy bare allowedAddresses entries', async () => {
+    mockDnsResult('10.0.0.5', 4);
+    const { lookup } = createSSRFSafeUndiciConnect(['10.0.0.5'], '11434');
+    const result = await runLookup(lookup, 'private.example.com');
+    expect(result.err).toBeTruthy();
+    expect(result.err!.code).toBe('ESSRF');
+  });
+
   it('still blocks an unlisted private IP when allowedAddresses is set', async () => {
     mockDnsResult('192.168.1.42', 4);
-    const { lookup } = createSSRFSafeUndiciConnect(['10.0.0.5']);
+    const { lookup } = createSSRFSafeUndiciConnect(['10.0.0.5:11434'], '11434');
     const result = await runLookup(lookup, 'other.private.example.com');
     expect(result.err).toBeTruthy();
     expect(result.err!.code).toBe('ESSRF');
@@ -159,7 +284,7 @@ describe('SSRF agents — allowedAddresses exemption', () => {
   it('drops public-IP entries from allowedAddresses (private-IP scope only)', async () => {
     // Admin mistakenly listed a public IP. It must NOT grant exemption.
     mockDnsResult('10.0.0.5', 4);
-    const { lookup } = createSSRFSafeUndiciConnect(['8.8.8.8']);
+    const { lookup } = createSSRFSafeUndiciConnect(['8.8.8.8:53'], '53');
     const result = await runLookup(lookup, 'private.example.com');
     expect(result.err).toBeTruthy();
     expect(result.err!.code).toBe('ESSRF');
@@ -167,11 +292,10 @@ describe('SSRF agents — allowedAddresses exemption', () => {
 
   it('drops URL/CIDR/whitespace entries from allowedAddresses', async () => {
     mockDnsResult('10.0.0.5', 4);
-    const { lookup } = createSSRFSafeUndiciConnect([
-      'http://10.0.0.5',
-      '10.0.0.0/24',
-      ' 10.0.0.5 ',
-    ]);
+    const { lookup } = createSSRFSafeUndiciConnect(
+      ['http://10.0.0.5', '10.0.0.0/24', ' 10.0.0.5 '],
+      '11434',
+    );
     // Even though the value 10.0.0.5 is among the admin entries, none of them
     // pass the schema-shape filter (URL, CIDR, embedded whitespace), so no
     // exemption is granted.
@@ -182,18 +306,17 @@ describe('SSRF agents — allowedAddresses exemption', () => {
 
   it('createSSRFSafeAgents propagates the exemption-aware lookup to both agents', async () => {
     // The agent factory wraps `createConnection` to inject a custom lookup.
-    // We can't realistically exercise the wrapped function from a unit test
-    // (the underlying socket op fails), so we drive the same lookup factory
-    // with the same exemption list and verify it allows the exempt address.
+    // The HTTP wrapper is covered above; this keeps the shared lookup factory
+    // expectation explicit for the exemption list.
     mockDnsResult('10.0.0.5', 4);
-    const agents = createSSRFSafeAgents(['10.0.0.5']);
+    const agents = createSSRFSafeAgents(['10.0.0.5:11434']);
     expect(agents.httpAgent).toBeDefined();
     expect(agents.httpsAgent).toBeDefined();
 
     // The undici-connect path uses the same `buildSSRFSafeLookup` factory, so
     // verifying the exemption holds there is sufficient evidence that the
     // agent factory built the right lookup.
-    const { lookup } = createSSRFSafeUndiciConnect(['10.0.0.5']);
+    const { lookup } = createSSRFSafeUndiciConnect(['10.0.0.5:11434'], '11434');
     const result = await runLookup(lookup, 'private.example.com');
     expect(result.err).toBeNull();
     expect(result.address).toBe('10.0.0.5');

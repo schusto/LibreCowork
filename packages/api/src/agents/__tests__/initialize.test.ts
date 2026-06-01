@@ -5,6 +5,25 @@
  */
 jest.mock('@librechat/agents', () => ({
   ...jest.requireActual('@librechat/agents'),
+  ReadFileToolDefinition: {
+    name: 'read_file',
+    description: 'read skill files using {skillName}/{filePath} and SKILL.md',
+    parameters: {
+      type: 'object',
+      properties: {
+        file_path: {
+          type: 'string',
+          description: 'For skill files: "{skillName}/{path}".',
+        },
+      },
+    },
+    responseFormat: 'content',
+  },
+  BashExecutionToolDefinition: {
+    name: 'bash_tool',
+    description: 'bash',
+    schema: { type: 'object', properties: {} },
+  },
   buildBashExecutionToolDescription: ({
     enableToolOutputReferences,
   }: {
@@ -14,26 +33,40 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 import { Providers } from '@librechat/agents';
-import { EModelEndpoint } from 'librechat-data-provider';
+import { EModelEndpoint, Tools } from 'librechat-data-provider';
 import type { Agent } from 'librechat-data-provider';
 import type { ServerRequest, InitializeResultBase, EndpointTokenConfig } from '~/types';
 import type { InitializeAgentDbMethods } from '../initialize';
 import { DEFAULT_MAX_CONTEXT_TOKENS } from '../initialize';
 
-// Mock logger
+// Mock logger — `format` must be a callable factory so @librechat/data-schemas
+// dist module-load completes cleanly; see api/test/__mocks__/logger.js.
 jest.mock('winston', () => ({
   createLogger: jest.fn(() => ({
     debug: jest.fn(),
     warn: jest.fn(),
     error: jest.fn(),
+    info: jest.fn(),
   })),
-  format: {
-    combine: jest.fn(),
-    colorize: jest.fn(),
-    simple: jest.fn(),
-  },
+  format: Object.assign(
+    jest.fn((fn) => () => ({ transform: fn })),
+    {
+      combine: jest.fn(),
+      colorize: jest.fn(),
+      simple: jest.fn(),
+      label: jest.fn(),
+      timestamp: jest.fn(),
+      printf: jest.fn(),
+      errors: jest.fn(),
+      splat: jest.fn(),
+      json: jest.fn(),
+    },
+  ),
+  addColors: jest.fn(),
   transports: {
     Console: jest.fn(),
+    DailyRotateFile: jest.fn(),
+    File: jest.fn(),
   },
 }));
 
@@ -93,6 +126,13 @@ function createMocks(overrides?: {
   maxOutputTokens?: number;
   endpointTokenConfig?: EndpointTokenConfig;
   useRealTokenLookup?: boolean;
+  providerTools?: unknown[];
+  loadedToolDefinitions?: Array<{
+    name: string;
+    description?: string;
+    parameters?: object;
+  }>;
+  structuredTools?: unknown[];
 }) {
   const {
     provider = Providers.OPENAI,
@@ -103,6 +143,9 @@ function createMocks(overrides?: {
     maxOutputTokens = 4096,
     endpointTokenConfig,
     useRealTokenLookup = false,
+    providerTools,
+    loadedToolDefinitions = [],
+    structuredTools = [],
   } = overrides ?? {};
 
   const resolvedOverrideProvider = overrideProvider ?? provider;
@@ -125,6 +168,7 @@ function createMocks(overrides?: {
   const mockGetOptions = jest.fn().mockResolvedValue({
     llmConfig: { model, maxTokens: maxOutputTokens },
     endpointTokenConfig,
+    ...(providerTools !== undefined ? { tools: providerTools } : {}),
   } satisfies InitializeResultBase);
 
   mockGetProviderConfig.mockReturnValue({
@@ -148,12 +192,12 @@ function createMocks(overrides?: {
   mockOptionalChainWithEmptyCheck.mockImplementation(realUtils.optionalChainWithEmptyCheck);
 
   const loadTools = jest.fn().mockResolvedValue({
-    tools: [],
+    tools: structuredTools,
     toolContextMap: {},
     dynamicToolContextMap: {},
     userMCPAuthMap: undefined,
     toolRegistry: undefined,
-    toolDefinitions: [],
+    toolDefinitions: loadedToolDefinitions,
     hasDeferredTools: false,
   });
 
@@ -167,6 +211,36 @@ function createMocks(overrides?: {
   };
 
   return { agent, req, res, loadTools, db };
+}
+
+function countNamedWebSearchTools(tools: unknown[] | undefined): number {
+  return (
+    tools?.filter((tool) => {
+      if (tool == null || typeof tool !== 'object') {
+        return false;
+      }
+      const { name } = tool as { name?: unknown };
+      return name === Tools.web_search;
+    }).length ?? 0
+  );
+}
+
+function countGoogleSearchTools(tools: unknown[] | undefined): number {
+  return (
+    tools?.filter((tool) => {
+      if (tool == null || typeof tool !== 'object') {
+        return false;
+      }
+      return 'googleSearch' in tool || 'googleSearchRetrieval' in tool;
+    }).length ?? 0
+  );
+}
+
+function countWebSearchDefinitions(toolDefinitions: Array<{ name: string }> | undefined): number {
+  return (
+    toolDefinitions?.filter((toolDefinition) => toolDefinition.name === Tools.web_search).length ??
+    0
+  );
 }
 
 describe('initializeAgent — custom provider token lookup', () => {
@@ -240,6 +314,207 @@ describe('initializeAgent — custom provider token lookup', () => {
     // optionalChainWithEmptyCheck → Math.max formula. The toHaveBeenCalledWith
     // assertion above catches the actual provider-resolution regression.
     expect(result.maxContextTokens).toBe(Math.round((65536 - 4096) * 0.95));
+  });
+});
+
+describe('initializeAgent — provider web_search precedence', () => {
+  const nativeWebSearchTool = {
+    type: 'web_search_20250305',
+    name: Tools.web_search,
+  };
+  const nativeGoogleSearchTool = { googleSearch: {} };
+  const libreChatWebSearchDefinition = {
+    name: Tools.web_search,
+    description: 'Search the web',
+    parameters: { type: 'object', properties: {} },
+  };
+  const mcpToolDefinition = {
+    name: 'mcp_lookup',
+    description: 'Lookup context',
+    parameters: { type: 'object', properties: {} },
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('keeps Anthropic native web_search when LibreChat search is not selected', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: Providers.ANTHROPIC,
+      providerTools: [nativeWebSearchTool],
+    });
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.ANTHROPIC]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(result.tools).toEqual([nativeWebSearchTool]);
+    expect(countNamedWebSearchTools(result.tools)).toBe(1);
+    expect(countWebSearchDefinitions(result.toolDefinitions)).toBe(0);
+  });
+
+  it('keeps LibreChat web_search definitions when native Anthropic search is not enabled', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: Providers.ANTHROPIC,
+      loadedToolDefinitions: [libreChatWebSearchDefinition],
+    });
+    agent.tools = [Tools.web_search];
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.ANTHROPIC]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(result.tools).toEqual([]);
+    expect(countNamedWebSearchTools(result.tools)).toBe(0);
+    expect(countWebSearchDefinitions(result.toolDefinitions)).toBe(1);
+  });
+
+  it('prefers LibreChat web_search when Anthropic native search is also enabled', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: Providers.ANTHROPIC,
+      providerTools: [nativeWebSearchTool],
+      loadedToolDefinitions: [libreChatWebSearchDefinition],
+    });
+    agent.tools = [Tools.web_search];
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.ANTHROPIC]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(result.tools).toEqual([]);
+    expect(countNamedWebSearchTools(result.tools)).toBe(0);
+    expect(countWebSearchDefinitions(result.toolDefinitions)).toBe(1);
+  });
+
+  it('keeps Google native search when LibreChat web_search is not selected', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: Providers.GOOGLE,
+      model: 'gemini-3.5-flash',
+      providerTools: [nativeGoogleSearchTool],
+      loadedToolDefinitions: [mcpToolDefinition],
+    });
+    agent.tools = ['mcp_lookup'];
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.GOOGLE]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(result.tools).toEqual([nativeGoogleSearchTool]);
+    expect(countGoogleSearchTools(result.tools)).toBe(1);
+    expect(result.toolDefinitions).toContain(mcpToolDefinition);
+  });
+
+  it('rejects Google native search with external tools for unsupported Gemini models', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: Providers.GOOGLE,
+      model: 'gemini-2.5-flash',
+      providerTools: [nativeGoogleSearchTool],
+      loadedToolDefinitions: [mcpToolDefinition],
+    });
+    agent.tools = ['mcp_lookup'];
+
+    await expect(
+      initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set([Providers.GOOGLE]),
+          isInitialAgent: true,
+        },
+        db,
+      ),
+    ).rejects.toThrow(/google_tool_conflict/);
+  });
+
+  it('prefers LibreChat web_search when Google native search is also enabled', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: Providers.GOOGLE,
+      providerTools: [nativeGoogleSearchTool],
+      loadedToolDefinitions: [libreChatWebSearchDefinition],
+    });
+    agent.tools = [Tools.web_search];
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.GOOGLE]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(result.tools).toEqual([]);
+    expect(countGoogleSearchTools(result.tools)).toBe(0);
+    expect(countWebSearchDefinitions(result.toolDefinitions)).toBe(1);
+  });
+
+  it('leaves providers without a native web search conflict unchanged', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: Providers.OPENAI,
+      providerTools: [nativeWebSearchTool],
+      loadedToolDefinitions: [libreChatWebSearchDefinition],
+    });
+    agent.tools = [Tools.web_search];
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(result.tools).toEqual([nativeWebSearchTool]);
+    expect(countNamedWebSearchTools(result.tools)).toBe(1);
+    expect(countWebSearchDefinitions(result.toolDefinitions)).toBe(1);
   });
 });
 
@@ -317,6 +592,45 @@ describe('initializeAgent — stable and dynamic instruction fields', () => {
     );
 
     expect(result.additional_instructions).toBe('Existing dynamic\n\nArtifact guidance');
+  });
+});
+
+describe('initializeAgent — attachment scoping', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('keeps request attachments separate from agent context attachments', async () => {
+    const { primeResources } = jest.requireMock('../resources') as {
+      primeResources: jest.Mock;
+    };
+    const requestFile = { file_id: 'request-file', filename: 'request.txt' };
+    const agentContextFile = { file_id: 'agent-context-file', filename: 'agent-context.txt' };
+    primeResources.mockResolvedValueOnce({
+      attachments: [agentContextFile, requestFile],
+      requestAttachments: [requestFile],
+      agentContextAttachments: [agentContextFile],
+      tool_resources: undefined,
+    });
+
+    const { agent, req, res, loadTools, db } = createMocks();
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(result.attachments).toEqual([agentContextFile, requestFile]);
+    expect(result.requestAttachments).toEqual([requestFile]);
+    expect(result.agentContextAttachments).toEqual([agentContextFile]);
   });
 });
 
@@ -1064,6 +1378,52 @@ describe('initializeAgent — execute_code capability expansion', () => {
        path — the string stays in `agent.tools` as the capability trigger
        but never appears in the tool definitions the LLM sees. */
     expect(names).not.toContain('execute_code');
+    const readFile = result.toolDefinitions?.find((d) => d.name === 'read_file');
+    expect(readFile?.description).toContain('code-execution sandbox');
+    expect(readFile?.description).not.toContain('{skillName}');
+    expect(readFile?.description).not.toContain('SKILL.md');
+  });
+
+  it('upgrades read_file to the skill-aware description when active skills are in scope', async () => {
+    const { agent, req, res, loadTools, db } = createMocks();
+    agent.tools = ['execute_code'];
+    const { Types } = await import('mongoose');
+    const skillId = new Types.ObjectId();
+    const author = { toString: () => req.user?.id } as unknown as import('mongoose').Types.ObjectId;
+
+    const result = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+        codeEnvAvailable: true,
+        accessibleSkillIds: [skillId],
+      },
+      {
+        ...db,
+        listSkillsByAccess: jest.fn().mockResolvedValue({
+          skills: [
+            {
+              _id: skillId,
+              name: 'data-cleaner',
+              description: 'Clean tabular data.',
+              author,
+            },
+          ],
+          has_more: false,
+          after: null,
+        }),
+      },
+    );
+
+    const readFile = result.toolDefinitions?.find((d) => d.name === 'read_file');
+    expect(readFile?.description).toContain('{skillName}/{filePath}');
+    expect(readFile?.description).toContain('SKILL.md');
+    expect(result.toolDefinitions?.map((d) => d.name)).toContain('skill');
   });
 
   it('does not register bash_tool + read_file when codeEnvAvailable=false', async () => {
@@ -1189,27 +1549,21 @@ describe('initializeAgent — execute_code capability expansion', () => {
     expect(neitherAgent.codeEnvAvailable).toBe(false);
   });
 
-  it('trips GOOGLE_TOOL_CONFLICT on Google/Vertex when execute_code expands alongside provider tools', async () => {
-    /* Pre-Phase 8, an `execute_code`-only agent on Google/Vertex with
-       `options.tools` populated would throw GOOGLE_TOOL_CONFLICT because
-       `CodeExecutionToolDefinition` populated `toolDefinitions` and
-       `hasAgentTools` was true. After dropping that registry entry, the
-       check is now gated on the runtime-expanded `bash_tool` + `read_file`
-       pair — so the expansion MUST happen before `hasAgentTools` is
-       computed or the guard silently goes away for this scenario. */
+  it('allows Google provider tools alongside execute_code definitions', async () => {
     const { agent, req, res, loadTools, db } = createMocks({
       provider: Providers.GOOGLE,
       overrideProvider: Providers.GOOGLE,
+      model: 'gemini-3.5-flash',
     });
     agent.tools = ['execute_code'];
 
     /* Surface an options.tools array from the provider config — this is
-       the `google_search` / `url_context` built-in LLM tooling that
+       the `googleSearch` / `urlContext` built-in LLM tooling that
        Google/Vertex exposes via provider options. */
     mockGetProviderConfig.mockReturnValue({
       getOptions: jest.fn().mockResolvedValue({
-        llmConfig: { model: 'test-model', maxTokens: 4096 },
-        tools: [{ google_search: {} }],
+        llmConfig: { model: 'gemini-3.5-flash', maxTokens: 4096 },
+        tools: [{ googleSearch: {} }],
       } satisfies InitializeResultBase),
       overrideProvider: Providers.GOOGLE,
     });
@@ -1228,6 +1582,230 @@ describe('initializeAgent — execute_code capability expansion', () => {
         },
         db,
       ),
-    ).rejects.toThrow(/google_tool_conflict/);
+    ).resolves.toEqual(
+      expect.objectContaining({
+        tools: [{ googleSearch: {} }],
+        toolDefinitions: expect.arrayContaining([
+          expect.objectContaining({ name: 'bash_tool' }),
+          expect.objectContaining({ name: 'read_file' }),
+        ]),
+      }),
+    );
+  });
+
+  it('combines Google provider tools with structured external tools', async () => {
+    const structuredTool = {
+      name: 'weather',
+      description: 'Get weather',
+      schema: { type: 'object', properties: {} },
+    };
+    const providerTool = { googleSearch: {} };
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: Providers.GOOGLE,
+      overrideProvider: Providers.GOOGLE,
+      model: 'gemini-3.5-flash',
+      providerTools: [providerTool],
+      structuredTools: [structuredTool],
+    });
+    agent.tools = ['weather'];
+
+    await expect(
+      initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set([Providers.GOOGLE]),
+          isInitialAgent: true,
+          codeEnvAvailable: false,
+        },
+        db,
+      ),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        tools: [structuredTool, providerTool],
+      }),
+    );
+  });
+});
+
+describe('initializeAgent — code-generated file thread filter (regression)', () => {
+  /* Sibling-branched conversation regression. Pre-fix the priming chain
+   * filtered code-generated files by `messageId IN threadMessageIds`,
+   * which excluded files whose creator messageId lived on a sibling
+   * branch (preserved on the File record by `processCodeOutput` for
+   * provenance). The fix anchors `getCodeGeneratedFiles` on
+   * `threadFileIds` instead — file_ids referenced by the thread's
+   * `messages.files[]` arrays. This block locks the new contract at
+   * the integration boundary: assert the right call shape, not the
+   * underlying Mongo query (covered separately by
+   * `data-schemas/methods/file.spec`). */
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockExtractLibreChatParams.mockReset();
+    mockGetThreadData.mockReset();
+  });
+
+  function setupExecuteCodeAgent() {
+    const { agent, req, res, loadTools, db } = createMocks({
+      provider: Providers.OPENAI,
+    });
+    agent.tools = ['execute_code'];
+
+    /* `resendFiles: true` is the gate that opens the thread-file
+     * priming block in initialize.ts. Without it the whole
+     * codeGeneratedFiles fetch is skipped. */
+    mockExtractLibreChatParams.mockReturnValue({
+      resendFiles: true,
+      maxContextTokens: undefined,
+      modelOptions: { model: 'test-model' },
+    });
+
+    return { agent, req, res, loadTools, db };
+  }
+
+  it('passes threadFileIds (not threadMessageIds) to getCodeGeneratedFiles', async () => {
+    const { agent, req, res, loadTools, db } = setupExecuteCodeAgent();
+
+    /* Simulate the branched scenario: parent message N is a sibling
+     * regeneration. `getThreadData` walks back from N and collects
+     * messageIds [N, root] plus fileIds referenced by N.files[]. */
+    mockGetThreadData.mockReturnValue({
+      messageIds: ['msgN', 'msgRoot'],
+      fileIds: ['file-pptx-skill', 'file-output-csv'],
+    });
+
+    const getCodeGeneratedFiles = jest.fn().mockResolvedValue([]);
+    const getUserCodeFiles = jest.fn().mockResolvedValue([]);
+    const getMessages = jest
+      .fn()
+      .mockResolvedValue([{ messageId: 'msgN', parentMessageId: 'msgRoot', files: [] }]);
+
+    const dbWithThreadCalls: InitializeAgentDbMethods = {
+      ...db,
+      getMessages,
+      getCodeGeneratedFiles,
+      getUserCodeFiles,
+    };
+
+    await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        conversationId: 'conv-1',
+        parentMessageId: 'msgN',
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+        codeEnvAvailable: true,
+      },
+      dbWithThreadCalls,
+    );
+
+    expect(getCodeGeneratedFiles).toHaveBeenCalledTimes(1);
+    expect(getCodeGeneratedFiles).toHaveBeenCalledWith('conv-1', [
+      'file-pptx-skill',
+      'file-output-csv',
+    ]);
+    /* Both functions now share the same primary anchor — symmetric
+     * design that closes the sibling-branch hole. */
+    expect(getUserCodeFiles).toHaveBeenCalledWith(['file-pptx-skill', 'file-output-csv']);
+  });
+
+  it('selects messages.attachments alongside messages.files (regression)', async () => {
+    /* Code-execution outputs land on `messages.attachments` via
+     * `processCodeOutput`; user uploads land on `messages.files`.
+     * Selecting only `files` silently dropped every code-output
+     * file_id from the thread walk, so the next turn's
+     * `tool_resources.execute_code.file_ids` came up empty and the
+     * sandbox saw `_injected_files: []`. The visible symptom: "the
+     * previous file isn't persisted between executions" on a single
+     * linear thread. Lock the select string so a future field
+     * trim doesn't silently re-introduce the bug. */
+    const { agent, req, res, loadTools, db } = setupExecuteCodeAgent();
+
+    mockGetThreadData.mockReturnValue({ messageIds: [], fileIds: [] });
+
+    const getCodeGeneratedFiles = jest.fn().mockResolvedValue([]);
+    const getUserCodeFiles = jest.fn().mockResolvedValue([]);
+    const getMessages = jest.fn().mockResolvedValue([]);
+
+    const dbWithThreadCalls: InitializeAgentDbMethods = {
+      ...db,
+      getMessages,
+      getCodeGeneratedFiles,
+      getUserCodeFiles,
+    };
+
+    await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        conversationId: 'conv-1',
+        parentMessageId: 'msgN',
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+        codeEnvAvailable: true,
+      },
+      dbWithThreadCalls,
+    );
+
+    expect(getMessages).toHaveBeenCalledTimes(1);
+    const [, selectFields] = getMessages.mock.calls[0];
+    /* Asserting on a substring instead of exact equality keeps the
+     * test resilient to future ordering / new fields, while still
+     * catching a regression where `attachments` is dropped. */
+    expect(selectFields).toMatch(/\battachments\b/);
+    expect(selectFields).toMatch(/\bfiles\b/);
+    expect(selectFields).toMatch(/\bmessageId\b/);
+    expect(selectFields).toMatch(/\bparentMessageId\b/);
+  });
+
+  it('skips the code-generated fetch entirely when threadFileIds is empty', async () => {
+    /* Empty `messages.files[]` across the thread — nothing to look up.
+     * The function returns early without hitting Mongo, mirroring the
+     * pre-fix behavior for empty-thread cases. */
+    const { agent, req, res, loadTools, db } = setupExecuteCodeAgent();
+
+    mockGetThreadData.mockReturnValue({
+      messageIds: ['msgN', 'msgRoot'],
+      fileIds: [],
+    });
+
+    const getCodeGeneratedFiles = jest.fn().mockResolvedValue([]);
+    const getUserCodeFiles = jest.fn().mockResolvedValue([]);
+    const getMessages = jest
+      .fn()
+      .mockResolvedValue([{ messageId: 'msgN', parentMessageId: 'msgRoot', files: [] }]);
+
+    await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        conversationId: 'conv-1',
+        parentMessageId: 'msgN',
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+        codeEnvAvailable: true,
+      },
+      { ...db, getMessages, getCodeGeneratedFiles, getUserCodeFiles },
+    );
+
+    expect(getCodeGeneratedFiles).toHaveBeenCalledWith('conv-1', []);
+    /* `getUserCodeFiles` is gated on a non-empty array at the call site,
+     * so it shouldn't be invoked at all. `getCodeGeneratedFiles`'s own
+     * empty-guard is exercised by data-schemas tests. */
+    expect(getUserCodeFiles).not.toHaveBeenCalled();
   });
 });

@@ -30,6 +30,7 @@ export default function ToolCall({
   attachments,
   auth,
   tool_call_id,
+  hideAttachments = false,
 }: {
   initialProgress: number;
   isLast?: boolean;
@@ -41,6 +42,7 @@ export default function ToolCall({
   auth?: string;
   expires_at?: number;
   tool_call_id?: string;
+  hideAttachments?: boolean;
 }) {
   const localize = useLocalize();
   const { activeElicitation, hasActiveElicitation, respondToElicitation } =
@@ -261,7 +263,9 @@ export default function ToolCall({
           </p>
         </div>
       )}
-      {attachments && attachments.length > 0 && <AttachmentGroup attachments={attachments} />}
+      {!hideAttachments && attachments && attachments.length > 0 && (
+        <AttachmentGroup attachments={attachments} />
+      )}
       {hasActiveElicitation && activeElicitation && (
         <div className="mt-4 space-y-4">
           <ElicitationForm

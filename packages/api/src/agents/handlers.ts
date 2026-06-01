@@ -10,13 +10,14 @@ import type {
   ToolExecuteBatchRequest,
 } from '@librechat/agents';
 import { Types } from 'mongoose';
+import type { CodeEnvRef } from 'librechat-data-provider';
 import type { StructuredToolInterface } from '@librechat/agents/langchain/tools';
 import type { SkillFileRecord } from './skillFiles';
 import type { ServerRequest } from '~/types';
+import { logAxiosError, runOutsideTracing } from '~/utils';
 import { buildSkillPrimeMessage } from './skills';
 import { cleanCodeToolOutput } from './cleanup';
 import { primeSkillFiles } from './skillFiles';
-import { runOutsideTracing } from '~/utils';
 
 export interface ToolEndCallbackData {
   output: {
@@ -67,6 +68,11 @@ export interface ToolExecuteOptions {
     body: string;
     name: string;
     _id: Types.ObjectId;
+    /** Monotonic counter on the skill record. Threaded into
+     *  `codeEnvRef.version` so codeapi's sessionKey scopes the cache
+     *  per-revision; bumping the version on edit invalidates the
+     *  prior cache entry. */
+    version: number;
     fileCount: number;
     /**
      * Set when the skill author opted out of model invocation. The handler
@@ -83,22 +89,30 @@ export interface ToolExecuteOptions {
     getDownloadStream?: (req: ServerRequest, filepath: string) => Promise<NodeJS.ReadableStream>;
     [key: string]: unknown;
   };
-  /** Batch uploads files to the code execution environment */
+  /** Batch uploads files to the code execution environment. `kind`/`id`/
+   *  `version?` carry the resource identity codeapi uses to derive the
+   *  sessionKey for the batch's storage bucket. */
   batchUploadCodeEnvFiles?: (params: {
     req: ServerRequest;
     files: Array<{ stream: NodeJS.ReadableStream; filename: string }>;
-    entity_id?: string;
-  }) => Promise<{ session_id: string; files: Array<{ fileId: string; filename: string }> }>;
+    kind: 'skill' | 'agent' | 'user';
+    id: string;
+    version?: number;
+    read_only?: boolean;
+  }) => Promise<{
+    storage_session_id: string;
+    files: Array<{ fileId: string; filename: string }>;
+  }>;
   /** Checks if a code env file is still active. Returns lastModified or null. */
-  getSessionInfo?: (fileIdentifier: string) => Promise<string | null>;
+  getSessionInfo?: (ref: CodeEnvRef, req?: ServerRequest) => Promise<string | null>;
   /** 23-hour freshness check */
   checkIfActive?: (dateString: string) => boolean;
-  /** Persists codeEnvIdentifiers on skill files after upload */
+  /** Persists `codeEnvRef` on skill files after upload */
   updateSkillFileCodeEnvIds?: (
     updates: Array<{
       skillId: Types.ObjectId | string;
       relativePath: string;
-      codeEnvIdentifier: string;
+      codeEnvRef: CodeEnvRef;
     }>,
   ) => Promise<void>;
   /** Loads a skill file by path (for read_file tool) */
@@ -133,14 +147,202 @@ export interface ToolExecuteOptions {
     file_path: string;
     session_id?: string;
     files?: Array<{ id: string; name: string; session_id?: string }>;
+    req?: ServerRequest;
   }) => Promise<{ content: string } | null>;
 }
 
 const MAX_READABLE_BYTES = 262_144;
 const MAX_BINARY_BYTES = 5 * 1024 * 1024;
 const MAX_CACHE_BYTES = 512 * 1024;
+const MAX_TOOL_ERROR_MESSAGE_CHARS = 12_000;
+const MAX_TOOL_ERROR_STACK_CHARS = 4_000;
 
 const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+type ToolInputSchemaKind = {
+  object: boolean;
+  string: boolean;
+};
+
+function truncateMiddle(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+
+  const indicator = `\n\n... [truncated: ${value.length} chars exceeded ${maxChars} limit] ...\n\n`;
+  const available = maxChars - indicator.length;
+  if (available <= 0) {
+    return value.slice(0, maxChars);
+  }
+
+  const headSize = Math.ceil(available * 0.7);
+  const tailSize = available - headSize;
+  return value.slice(0, headSize) + indicator + value.slice(value.length - tailSize);
+}
+
+function stringifyThrownValue(error: unknown): string {
+  try {
+    return String(error);
+  } catch {
+    return '[Thrown value could not be converted to string]';
+  }
+}
+
+function getThrownValueMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (error != null && typeof error === 'object') {
+    try {
+      const message = (error as { message?: unknown }).message;
+      if (typeof message === 'string') {
+        return message;
+      }
+      if (message != null) {
+        return stringifyThrownValue(message);
+      }
+    } catch {
+      // Fall through to whole-value stringification.
+    }
+  }
+
+  return stringifyThrownValue(error);
+}
+
+function getSafeToolError(error: unknown): {
+  message: string;
+  logContext: Record<string, unknown>;
+} {
+  const rawMessage = getThrownValueMessage(error);
+  const message = truncateMiddle(rawMessage, MAX_TOOL_ERROR_MESSAGE_CHARS);
+  const stack = error instanceof Error && error.stack ? error.stack : undefined;
+
+  return {
+    message,
+    logContext: {
+      name: error instanceof Error ? error.name : typeof error,
+      message,
+      messageLength: rawMessage.length,
+      messageTruncated: message.length !== rawMessage.length,
+      stack: stack ? truncateMiddle(stack, MAX_TOOL_ERROR_STACK_CHARS) : undefined,
+    },
+  };
+}
+
+function mergeSchemaKind(target: ToolInputSchemaKind, source: ToolInputSchemaKind): void {
+  target.object ||= source.object;
+  target.string ||= source.string;
+}
+
+function detectToolInputSchemaKind(schema: unknown): ToolInputSchemaKind {
+  const kind: ToolInputSchemaKind = { object: false, string: false };
+
+  if (!schema || typeof schema !== 'object') {
+    return kind;
+  }
+
+  const jsonSchemaType = (schema as { type?: unknown }).type;
+  if (jsonSchemaType === 'object') {
+    kind.object = true;
+  } else if (jsonSchemaType === 'string') {
+    kind.string = true;
+  } else if (Array.isArray(jsonSchemaType)) {
+    kind.object = jsonSchemaType.includes('object');
+    kind.string = jsonSchemaType.includes('string');
+  }
+
+  for (const compositeKey of ['anyOf', 'oneOf', 'allOf'] as const) {
+    const options = (schema as Record<typeof compositeKey, unknown>)[compositeKey];
+    if (Array.isArray(options)) {
+      for (const option of options) {
+        mergeSchemaKind(kind, detectToolInputSchemaKind(option));
+      }
+    }
+  }
+
+  const zodDef = (schema as { _def?: unknown })._def;
+  if (!zodDef || typeof zodDef !== 'object') {
+    return kind;
+  }
+
+  const zodType = (zodDef as { type?: unknown; typeName?: unknown }).type;
+  const zodTypeName = (zodDef as { type?: unknown; typeName?: unknown }).typeName;
+
+  if (zodType === 'object' || zodTypeName === 'ZodObject') {
+    kind.object = true;
+  } else if (zodType === 'string' || zodTypeName === 'ZodString') {
+    kind.string = true;
+  }
+
+  const innerSchema =
+    (zodDef as { innerType?: unknown; schema?: unknown }).innerType ??
+    (zodDef as { schema?: unknown }).schema;
+  if (innerSchema) {
+    mergeSchemaKind(kind, detectToolInputSchemaKind(innerSchema));
+  }
+
+  const zodOptions = (zodDef as { options?: unknown }).options;
+  if (Array.isArray(zodOptions)) {
+    for (const option of zodOptions) {
+      mergeSchemaKind(kind, detectToolInputSchemaKind(option));
+    }
+  }
+
+  return kind;
+}
+
+function getToolInputSchemaKind(tool: StructuredToolInterface): ToolInputSchemaKind {
+  const constructorName = (tool as { constructor?: { name?: string } }).constructor?.name;
+  if (constructorName === 'DynamicTool') {
+    return { object: false, string: true };
+  }
+
+  return detectToolInputSchemaKind((tool as { schema?: unknown }).schema);
+}
+
+function normalizeToolInvokeArgs(args: unknown, tool: StructuredToolInterface): unknown {
+  const schemaKind = getToolInputSchemaKind(tool);
+
+  if (typeof args !== 'string') {
+    if (!schemaKind.string || schemaKind.object) {
+      return args;
+    }
+
+    const inputValue = (args as { input?: unknown })?.input;
+    return typeof inputValue === 'string' ? args : JSON.stringify(args);
+  }
+
+  if (!schemaKind.object || schemaKind.string) {
+    return args;
+  }
+
+  const trimmed = args.trim();
+  if (!trimmed.startsWith('{')) {
+    return args;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {
+    return args;
+  }
+
+  return args;
+}
+
+function getValueShape(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  return typeof value;
+}
 
 function addLineNumbers(content: string): string {
   const lines = content.split('\n');
@@ -318,6 +520,7 @@ async function handleSandboxFileFallback(
   tc: ToolCallRequest,
   filePath: string,
   options: ToolExecuteOptions,
+  req?: ServerRequest,
 ): Promise<ToolExecuteResult> {
   const ext = lowercaseExtension(filePath);
   if (BINARY_EXTENSIONS_NEVER_READABLE.has(ext)) {
@@ -347,6 +550,7 @@ async function handleSandboxFileFallback(
       file_path: filePath,
       session_id: ctx?.session_id,
       files: ctx?.files,
+      ...(req ? { req } : {}),
     });
     if (!result || result.content == null) {
       return {
@@ -436,7 +640,7 @@ async function handleReadFileCall(
    */
   if (args.file_path.startsWith('/mnt/data/')) {
     if (codeEnvAvailable) {
-      return handleSandboxFileFallback(tc, args.file_path, options);
+      return handleSandboxFileFallback(tc, args.file_path, options, req);
     }
     return {
       toolCallId: tc.id,
@@ -449,7 +653,7 @@ async function handleReadFileCall(
   const slashIdx = args.file_path.indexOf('/');
   if (slashIdx < 1) {
     if (codeEnvAvailable) {
-      return handleSandboxFileFallback(tc, args.file_path, options);
+      return handleSandboxFileFallback(tc, args.file_path, options, req);
     }
     return {
       toolCallId: tc.id,
@@ -469,7 +673,7 @@ async function handleReadFileCall(
      * dead-ending with a skill-centric error message.
      */
     if (codeEnvAvailable) {
-      return handleSandboxFileFallback(tc, args.file_path, options);
+      return handleSandboxFileFallback(tc, args.file_path, options, req);
     }
     return {
       toolCallId: tc.id,
@@ -488,7 +692,7 @@ async function handleReadFileCall(
    */
   if (!skillsEffectivelyEnabled) {
     if (codeEnvAvailable) {
-      return handleSandboxFileFallback(tc, args.file_path, options);
+      return handleSandboxFileFallback(tc, args.file_path, options, req);
     }
     return {
       toolCallId: tc.id,
@@ -530,7 +734,7 @@ async function handleReadFileCall(
   const activeSkillNames = mergedConfigurable?.activeSkillNames as Set<string> | undefined;
   if (activeSkillNames && !activeSkillNames.has(skillName) && !isPrimedThisTurn) {
     if (codeEnvAvailable) {
-      return handleSandboxFileFallback(tc, args.file_path, options);
+      return handleSandboxFileFallback(tc, args.file_path, options, req);
     }
     return {
       toolCallId: tc.id,
@@ -736,10 +940,10 @@ async function handleReadFileCall(
       if (file.isBinary == null && updateSkillFileContent) {
         updateSkillFileContent(skill._id, relativePath, { isBinary: true }).catch(
           (err: unknown) => {
-            logger.warn(
-              '[handleReadFileCall] cache write failed:',
-              err instanceof Error ? err.message : err,
-            );
+            logAxiosError({
+              message: '[handleReadFileCall] cache write failed',
+              error: err,
+            });
           },
         );
       }
@@ -776,10 +980,10 @@ async function handleReadFileCall(
     if (file.content == null && updateSkillFileContent && buffer.length <= MAX_CACHE_BYTES) {
       updateSkillFileContent(skill._id, relativePath, { content: text, isBinary: false }).catch(
         (err: unknown) => {
-          logger.warn(
-            '[handleReadFileCall] cache write failed:',
-            err instanceof Error ? err.message : err,
-          );
+          logAxiosError({
+            message: '[handleReadFileCall] cache write failed',
+            error: err,
+          });
         },
       );
     }
@@ -888,7 +1092,19 @@ async function handleSkillToolCall(
 
   const contentText = `Skill "${args.skillName}" loaded. Follow the instructions below.`;
   let artifact:
-    | { session_id: string; files: Array<{ id: string; session_id: string; name: string }> }
+    | {
+        session_id: string;
+        files: Array<{
+          id: string;
+          /** Resource id (skill `_id`). codeapi requires this distinct
+           *  from the storage `id` to scope sessionKey by resource. */
+          resource_id: string;
+          name: string;
+          storage_session_id: string;
+          kind?: 'skill' | 'agent' | 'user';
+          version?: number;
+        }>;
+      }
     | undefined;
 
   // Prime skill files to code env — only when the `execute_code` capability
@@ -916,7 +1132,26 @@ async function handleSkillToolCall(
         updateSkillFileCodeEnvIds,
       });
       if (primeResult) {
-        artifact = primeResult;
+        /* `session_id` at the top of the artifact is the (representative)
+         * execution session — ToolNode reads it for CodeSessionContext
+         * continuity. Per-file storage lives on each file's
+         * `storage_session_id`. Skill files carry `kind: 'skill'` and
+         * the skill's version so codeapi's sessionKey scopes the
+         * cache per-revision. */
+        artifact = {
+          session_id: primeResult.storage_session_id,
+          files: primeResult.files.map((f) => ({
+            id: f.id,
+            /* `resource_id` (skill `_id`) is what codeapi feeds into
+             * `<tenant>:skill:<id>:v:<version>` — without it the next
+             * /exec authorizer sees `resource_id: undefined` and 400s. */
+            resource_id: f.resource_id,
+            name: f.name,
+            storage_session_id: f.storage_session_id,
+            kind: 'skill',
+            version: skill.version,
+          })),
+        };
       }
     } catch (error) {
       logger.error(
@@ -1015,10 +1250,75 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                     toolCallConfig.session_id = tc.codeSessionContext.session_id;
                     if (tc.codeSessionContext.files && tc.codeSessionContext.files.length > 0) {
                       toolCallConfig._injected_files = tc.codeSessionContext.files;
+                      /* Last LC-controlled point before the wire. Mirrors
+                       * codeapi's validator context so the two log sides
+                       * correlate on a single grep. */
+                      const refs = tc.codeSessionContext.files as Array<{
+                        id?: unknown;
+                        resource_id?: unknown;
+                        storage_session_id?: unknown;
+                        kind?: unknown;
+                        version?: unknown;
+                        name?: unknown;
+                      }>;
+                      const summary = refs.map((f) => ({
+                        kind: f.kind,
+                        hasResourceId: typeof f.resource_id === 'string' && !!f.resource_id,
+                        hasStorageSessionId:
+                          typeof f.storage_session_id === 'string' && !!f.storage_session_id,
+                        hasVersion: typeof f.version === 'number',
+                      }));
+                      let missingResourceId = 0;
+                      let missingStorageSessionId = 0;
+                      let missingVersion = 0;
+                      const kindCounts: Record<string, number> = {};
+                      for (const s of summary) {
+                        if (!s.hasResourceId) missingResourceId++;
+                        if (!s.hasStorageSessionId) missingStorageSessionId++;
+                        if (!s.hasVersion) missingVersion++;
+                        const k = typeof s.kind === 'string' ? s.kind : 'unknown';
+                        kindCounts[k] = (kindCounts[k] ?? 0) + 1;
+                      }
+                      logger.debug(
+                        `[code-env:inject] tool=${tc.name} files=${refs.length} ` +
+                          `missingResourceId=${missingResourceId} ` +
+                          `missingStorageSessionId=${missingStorageSessionId} ` +
+                          `missingVersion=${missingVersion} ` +
+                          `kinds=${JSON.stringify(kindCounts)}`,
+                      );
+                      if (missingResourceId > 0) {
+                        logger.warn(
+                          `[code-env:inject] ${missingResourceId}/${refs.length} files missing resource_id ` +
+                            `for tool=${tc.name} — codeapi will reject with 400`,
+                          { summary },
+                        );
+                      }
+                    } else {
+                      /* Empty `_injected_files` on a code-execution tool
+                       * call. Almost always means the seeding chain
+                       * (primeCodeFiles → initialSessions →
+                       * CodeSessionContext) dropped the file upstream.
+                       * `session_id` is still emitted for continuity, but
+                       * concrete file refs must arrive through
+                       * `_injected_files`; agents no longer falls back to
+                       * `/files/<sid>`. Pair with `[primeCodeFiles]`
+                       * traces below to locate the layer that lost the ref. */
+                      logger.warn(
+                        `[code-env:inject] tool=${tc.name} _injected_files=0 — sandbox will see no input files`,
+                        {
+                          tool: tc.name,
+                          session_id: tc.codeSessionContext.session_id,
+                          codeSessionContextHasFiles: tc.codeSessionContext.files !== undefined,
+                          codeSessionContextFileCount: tc.codeSessionContext.files?.length ?? 0,
+                        },
+                      );
                     }
                   }
 
-                  if (tc.name === Constants.PROGRAMMATIC_TOOL_CALLING) {
+                  if (
+                    tc.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING ||
+                    tc.name === Constants.PROGRAMMATIC_TOOL_CALLING
+                  ) {
                     const toolRegistry = mergedConfigurable?.toolRegistry as
                       | LCToolRegistry
                       | undefined;
@@ -1029,6 +1329,7 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                       const toolDefs: LCTool[] = Array.from(toolRegistry.values()).filter(
                         (t) =>
                           t.name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
+                          t.name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING &&
                           t.name !== Constants.TOOL_SEARCH,
                       );
                       toolCallConfig.toolDefs = toolDefs;
@@ -1036,7 +1337,7 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                     }
                   }
 
-                  const result = await tool.invoke(tc.args, {
+                  const result = await tool.invoke(normalizeToolInvokeArgs(tc.args, tool), {
                     toolCall: toolCallConfig,
                     configurable: mergedConfigurable,
                     metadata,
@@ -1081,13 +1382,17 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                     status: 'success' as const,
                   };
                 } catch (toolError) {
-                  const error = toolError as Error;
-                  logger.error(`[ON_TOOL_EXECUTE] Tool ${tc.name} error:`, error);
+                  const { message, logContext } = getSafeToolError(toolError);
+                  logger.error(`[ON_TOOL_EXECUTE] Tool ${tc.name} error`, {
+                    ...logContext,
+                    toolCallArgsShape: getValueShape(tc.args),
+                    toolInputSchemaKind: getToolInputSchemaKind(tool),
+                  });
                   return {
                     toolCallId: tc.id,
                     status: 'error' as const,
                     content: '',
-                    errorMessage: error.message,
+                    errorMessage: message,
                   };
                 }
               }),

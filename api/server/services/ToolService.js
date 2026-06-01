@@ -7,7 +7,7 @@ const {
   createToolSearch,
   createBashExecutionTool,
   Constants: AgentConstants,
-  createProgrammaticToolCallingTool,
+  createBashProgrammaticToolCallingTool,
 } = require('@librechat/agents');
 const {
   sendEvent,
@@ -20,7 +20,9 @@ const {
   buildImageToolContext,
   buildOAuthToolCallName,
   buildToolClassification,
+  getMissingCustomUserVars,
   buildWebSearchDynamicContext,
+  getCodeApiAuthHeaders,
 } = require('@librechat/api');
 const {
   Time,
@@ -61,12 +63,12 @@ const { primeFiles: primeCodeFiles } = require('~/server/services/Files/Code/pro
 const { manifestToolMap, toolkits } = require('~/app/clients/tools/manifest');
 const { createOnSearchResults } = require('~/server/services/Tools/search');
 const { reinitMCPServer } = require('~/server/services/Tools/mcp');
-const { resolveConfigServers } = require('~/server/services/MCP');
+const { createMCPPermissionContext, resolveConfigServers } = require('~/server/services/MCP');
 const { recordUsage } = require('~/server/services/Threads');
 const { loadTools } = require('~/app/clients/tools/util');
 const { redactMessage } = require('~/config/parsers');
 const { findPluginAuthsByKeys } = require('~/models');
-const { getFlowStateManager } = require('~/config');
+const { getFlowStateManager, getMCPServersRegistry } = require('~/config');
 const { getLogStores } = require('~/cache');
 
 const domainSeparatorRegex = new RegExp(actionDomainSeparator, 'g');
@@ -545,6 +547,13 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   const areToolsEnabled = checkCapability(AgentCapabilities.tools);
   const actionsEnabled = checkCapability(AgentCapabilities.actions);
   const deferredToolsEnabled = checkCapability(AgentCapabilities.deferred_tools);
+  const programmaticToolsEnabled = enabledCapabilities.has(AgentCapabilities.programmatic_tools);
+  const codeExecutionEnabled =
+    agent.tools?.includes(Tools.execute_code) === true &&
+    enabledCapabilities.has(AgentCapabilities.execute_code);
+  const hasMCPTools = agent.tools?.some((tool) => tool?.includes(Constants.mcp_delimiter));
+  const mcpPermissionContext = createMCPPermissionContext(req);
+  const canUseMCP = hasMCPTools ? await mcpPermissionContext.canUseServers(req.user) : true;
 
   const filteredTools = agent.tools?.filter((tool) => {
     if (tool === Tools.file_search) {
@@ -559,6 +568,9 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
     if (isActionTool(tool)) {
       return actionsEnabled;
     }
+    if (tool?.includes(Constants.mcp_delimiter)) {
+      return areToolsEnabled && canUseMCP;
+    }
     if (!areToolsEnabled) {
       return false;
     }
@@ -571,9 +583,9 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
 
   /** @type {Record<string, Record<string, string>>} */
   let userMCPAuthMap;
-  if (agent.tools?.some((t) => t.includes(Constants.mcp_delimiter))) {
+  if (filteredTools?.some((t) => t.includes(Constants.mcp_delimiter))) {
     userMCPAuthMap = await getUserMCPAuthMap({
-      tools: agent.tools,
+      tools: filteredTools,
       userId: req.user.id,
       findPluginAuthsByKeys,
     });
@@ -633,6 +645,38 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
   };
 
   const getOrFetchMCPServerTools = async (userId, serverName) => {
+    let serverConfig;
+    try {
+      serverConfig =
+        configServers?.[serverName] ??
+        (await getMCPServersRegistry().getServerConfig(serverName, userId, configServers));
+    } catch (err) {
+      logger.warn(
+        `[Tool Definitions] MCP registry unavailable while resolving '${serverName}': ${
+          err?.message ?? err
+        }. Skipping MCP tool exposure for this lookup.`,
+      );
+      return null;
+    }
+
+    if (!serverConfig) {
+      logger.warn(
+        `[Tool Definitions] Skipping MCP server '${serverName}': no server config found (server may have been removed).`,
+      );
+      return null;
+    }
+
+    const customUserVars = userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
+    const missingUserVars = getMissingCustomUserVars(serverConfig, customUserVars);
+    if (missingUserVars.length > 0) {
+      logger.warn(
+        `[Tool Definitions] Skipping MCP server '${serverName}': required user-provided variable(s) not set: ${missingUserVars.join(
+          ', ',
+        )}. Tools will not be exposed until the user configures them.`,
+      );
+      return null;
+    }
+
     const cached = await getMCPServerTools(userId, serverName);
     if (cached) {
       return cached;
@@ -720,6 +764,8 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
       tools: filteredTools,
       toolOptions: agent.tool_options,
       deferredToolsEnabled,
+      programmaticToolsEnabled,
+      codeExecutionEnabled,
     },
     {
       isBuiltInTool,
@@ -774,6 +820,8 @@ async function loadToolDefinitionsWrapper({ req, res, agent, streamId = null, to
           tools: filteredTools,
           toolOptions: agent.tool_options,
           deferredToolsEnabled,
+          programmaticToolsEnabled,
+          codeExecutionEnabled,
         },
         {
           isBuiltInTool,
@@ -941,6 +989,9 @@ async function loadAgentTools({
   };
   const areToolsEnabled = checkCapability(AgentCapabilities.tools);
   const actionsEnabled = checkCapability(AgentCapabilities.actions);
+  const hasMCPTools = agent.tools?.some((tool) => tool?.includes(Constants.mcp_delimiter));
+  const mcpPermissionContext = createMCPPermissionContext(req);
+  const canUseMCP = hasMCPTools ? await mcpPermissionContext.canUseServers(req.user) : true;
 
   let includesWebSearch = false;
   const _agentTools = agent.tools?.filter((tool) => {
@@ -953,6 +1004,8 @@ async function loadAgentTools({
       return includesWebSearch;
     } else if (isActionTool(tool)) {
       return actionsEnabled;
+    } else if (tool?.includes(Constants.mcp_delimiter)) {
+      return areToolsEnabled && canUseMCP;
     } else if (!areToolsEnabled) {
       return false;
     }
@@ -970,9 +1023,9 @@ async function loadAgentTools({
 
   /** @type {Record<string, Record<string, string>>} */
   let userMCPAuthMap;
-  if (agent.tools?.some((t) => t.includes(Constants.mcp_delimiter))) {
+  if (_agentTools?.some((t) => t.includes(Constants.mcp_delimiter))) {
     userMCPAuthMap = await getUserMCPAuthMap({
-      tools: agent.tools,
+      tools: _agentTools,
       userId: req.user.id,
       findPluginAuthsByKeys,
     });
@@ -993,6 +1046,7 @@ async function loadAgentTools({
       processFileURL,
       uploadImageBuffer,
       returnMetadata: true,
+      mcpPermissionContext,
       [Tools.web_search]: webSearchCallbacks,
     },
     webSearch: appConfig.webSearch,
@@ -1002,6 +1056,10 @@ async function loadAgentTools({
 
   /** Build tool registry from MCP tools and create PTC/tool search tools if configured */
   const deferredToolsEnabled = checkCapability(AgentCapabilities.deferred_tools);
+  const programmaticToolsEnabled = enabledCapabilities.has(AgentCapabilities.programmatic_tools);
+  const codeExecutionEnabled =
+    agent.tools?.includes(Tools.execute_code) === true &&
+    enabledCapabilities.has(AgentCapabilities.execute_code);
   const { toolRegistry, toolDefinitions, additionalTools, hasDeferredTools } =
     await buildToolClassification({
       loadedTools,
@@ -1009,6 +1067,9 @@ async function loadAgentTools({
       agentId: agent.id,
       agentToolOptions: agent.tool_options,
       deferredToolsEnabled,
+      programmaticToolsEnabled,
+      codeExecutionEnabled,
+      authHeaders: () => getCodeApiAuthHeaders(req),
     });
 
   const agentTools = [];
@@ -1254,13 +1315,26 @@ async function loadToolsForExecution({
   const allLoadedTools = [];
   const configurable = { userMCPAuthMap };
 
+  const isToolSearch = toolNames.includes(AgentConstants.TOOL_SEARCH);
+  const ptcToolNames = [
+    AgentConstants.BASH_PROGRAMMATIC_TOOL_CALLING,
+    AgentConstants.PROGRAMMATIC_TOOL_CALLING,
+  ].filter((name) => toolNames.includes(name));
+  const isPTCRequested = ptcToolNames.length > 0;
+
+  let enabledCapabilities;
+  if (actionsEnabled === undefined || isPTCRequested) {
+    enabledCapabilities = await resolveAgentCapabilities(req, appConfig, agent?.id);
+  }
   if (actionsEnabled === undefined) {
-    const enabledCapabilities = await resolveAgentCapabilities(req, appConfig, agent?.id);
     actionsEnabled = enabledCapabilities.has(AgentCapabilities.actions);
   }
 
-  const isToolSearch = toolNames.includes(AgentConstants.TOOL_SEARCH);
-  const isPTC = toolNames.includes(AgentConstants.PROGRAMMATIC_TOOL_CALLING);
+  const isPTC =
+    isPTCRequested &&
+    enabledCapabilities.has(AgentCapabilities.programmatic_tools) &&
+    enabledCapabilities.has(AgentCapabilities.execute_code) &&
+    agent?.tools?.includes(Tools.execute_code) === true;
 
   logger.debug(
     `[loadToolsForExecution] isToolSearch: ${isToolSearch}, toolRegistry: ${toolRegistry?.size ?? 'undefined'}`,
@@ -1279,11 +1353,16 @@ async function loadToolsForExecution({
     configurable.toolRegistry = toolRegistry;
     try {
       /**
-       * PTC auth is handled by the agents library / sandbox service
-       * directly; LibreChat no longer threads a per-run credential.
+       * LibreChat threads per-request Code API auth through the agents
+       * library so PTC calls share the same managed auth context.
        */
-      const ptcTool = createProgrammaticToolCallingTool({});
-      allLoadedTools.push(ptcTool);
+      for (const name of ptcToolNames) {
+        const ptcTool = createBashProgrammaticToolCallingTool({
+          authHeaders: () => getCodeApiAuthHeaders(req),
+        });
+        ptcTool.name = name;
+        allLoadedTools.push(ptcTool);
+      }
     } catch (error) {
       logger.error('[loadToolsForExecution] Error creating PTC tool:', error);
     }
@@ -1292,7 +1371,9 @@ async function loadToolsForExecution({
   const isBashTool = toolNames.includes(AgentConstants.BASH_TOOL);
   if (isBashTool) {
     try {
-      const bashTool = createBashExecutionTool({});
+      const bashTool = createBashExecutionTool({
+        authHeaders: () => getCodeApiAuthHeaders(req),
+      });
       allLoadedTools.push(bashTool);
     } catch (error) {
       logger.error('[loadToolsForExecution] Failed to create bash_tool', error);
@@ -1302,6 +1383,7 @@ async function loadToolsForExecution({
   const specialToolNames = new Set([
     AgentConstants.TOOL_SEARCH,
     AgentConstants.PROGRAMMATIC_TOOL_CALLING,
+    AgentConstants.BASH_PROGRAMMATIC_TOOL_CALLING,
     AgentConstants.BASH_TOOL,
     AgentConstants.SKILL_TOOL,
     AgentConstants.READ_FILE,
@@ -1375,7 +1457,11 @@ async function loadToolsForExecution({
   if (isPTC && allLoadedTools.length > 0) {
     const ptcToolMap = new Map();
     for (const tool of allLoadedTools) {
-      if (tool.name && tool.name !== AgentConstants.PROGRAMMATIC_TOOL_CALLING) {
+      if (
+        tool.name &&
+        tool.name !== AgentConstants.PROGRAMMATIC_TOOL_CALLING &&
+        tool.name !== AgentConstants.BASH_PROGRAMMATIC_TOOL_CALLING
+      ) {
         ptcToolMap.set(tool.name, tool);
       }
     }

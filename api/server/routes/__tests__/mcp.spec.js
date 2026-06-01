@@ -25,6 +25,7 @@ const mockRegistryInstance = {
   getAllowedDomains: jest.fn().mockReturnValue(null),
   getAllowedAddresses: jest.fn().mockReturnValue(null),
 };
+let mockMCPUseAllowed = true;
 
 jest.mock('@librechat/api', () => {
   const actual = jest.requireActual('@librechat/api');
@@ -46,7 +47,15 @@ jest.mock('@librechat/api', () => {
       deleteUserTokens: jest.fn(),
     },
     getUserMCPAuthMap: jest.fn(),
-    generateCheckAccess: jest.fn(() => (req, res, next) => next()),
+    generateCheckAccess: jest.fn(({ permissionType, permissions }) => (req, res, next) => {
+      const { PermissionTypes, Permissions } = require('librechat-data-provider');
+      const isMCPUseCheck =
+        permissionType === PermissionTypes.MCP_SERVERS && permissions.includes(Permissions.USE);
+      if (isMCPUseCheck && !mockMCPUseAllowed) {
+        return res.status(403).json({ message: 'Forbidden: Insufficient permissions' });
+      }
+      return next();
+    }),
     MCPServersRegistry: {
       getInstance: () => mockRegistryInstance,
     },
@@ -108,9 +117,11 @@ jest.mock('~/server/services/Config/mcp', () => ({
 }));
 
 const mockResolveAllMcpConfigs = jest.fn().mockResolvedValue({});
+const mockResolveMcpConfigNames = jest.fn().mockResolvedValue([]);
 jest.mock('~/server/services/MCP', () => ({
   getMCPSetupData: jest.fn(),
   resolveConfigServers: jest.fn().mockResolvedValue({}),
+  resolveMcpConfigNames: (...args) => mockResolveMcpConfigNames(...args),
   resolveAllMcpConfigs: (...args) => mockResolveAllMcpConfigs(...args),
   getServerConnectionStatus: jest.fn(),
 }));
@@ -171,6 +182,9 @@ describe('MCP Routes', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockResolveAllMcpConfigs.mockResolvedValue({});
+    mockResolveMcpConfigNames.mockResolvedValue([]);
+    mockMCPUseAllowed = true;
   });
 
   describe('GET /:serverName/oauth/initiate', () => {
@@ -1953,6 +1967,16 @@ describe('MCP Routes', () => {
   });
 
   describe('GET /tools', () => {
+    it('should deny MCP tools when user lacks MCP server use permission', async () => {
+      mockMCPUseAllowed = false;
+
+      const response = await request(app).get('/api/mcp/tools');
+
+      expect(response.status).toBe(403);
+      expect(response.body).toEqual({ message: 'Forbidden: Insufficient permissions' });
+      expect(mockResolveAllMcpConfigs).not.toHaveBeenCalled();
+    });
+
     it('should continue returning MCP tools when one server cache lookup fails', async () => {
       const { Constants } = require('librechat-data-provider');
       const { logger } = require('@librechat/data-schemas');
@@ -2155,6 +2179,35 @@ describe('MCP Routes', () => {
         }),
         'DB',
         'test-user-id',
+        [],
+      );
+    });
+
+    it('should reserve config-managed server names when creating MCP server', async () => {
+      const validConfig = {
+        type: 'sse',
+        url: 'https://mcp-server.example.com/sse',
+        title: 'Test SSE Server',
+      };
+
+      mockResolveMcpConfigNames.mockResolvedValueOnce(['config_slack']);
+      mockRegistryInstance.addServer.mockResolvedValue({
+        serverName: 'test-sse-server',
+        config: validConfig,
+      });
+
+      const response = await request(app).post('/api/mcp/servers').send({ config: validConfig });
+
+      expect(response.status).toBe(201);
+      expect(mockRegistryInstance.addServer).toHaveBeenCalledWith(
+        'temp_server_name',
+        expect.objectContaining({
+          type: 'sse',
+          url: 'https://mcp-server.example.com/sse',
+        }),
+        'DB',
+        'test-user-id',
+        ['config_slack'],
       );
     });
 
@@ -2285,6 +2338,22 @@ describe('MCP Routes', () => {
 
       expect(response.status).toBe(500);
       expect(response.body).toEqual({ message: 'Database connection failed' });
+    });
+
+    it('should fail closed when config-managed names cannot be resolved', async () => {
+      const validConfig = {
+        type: 'sse',
+        url: 'https://mcp-server.example.com/sse',
+        title: 'Test Server',
+      };
+
+      mockResolveMcpConfigNames.mockRejectedValueOnce(new Error('Config lookup failed'));
+
+      const response = await request(app).post('/api/mcp/servers').send({ config: validConfig });
+
+      expect(response.status).toBe(500);
+      expect(response.body).toEqual({ message: 'Config lookup failed' });
+      expect(mockRegistryInstance.addServer).not.toHaveBeenCalled();
     });
   });
 

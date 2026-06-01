@@ -707,7 +707,7 @@ class BaseClient {
   async loadHistory(conversationId, parentMessageId = null) {
     logger.debug('[BaseClient] Loading history:', { conversationId, parentMessageId });
 
-    const messages = (await db.getMessages({ conversationId })) ?? [];
+    const messages = (await db.getMessages({ conversationId, user: this.user })) ?? [];
 
     if (messages.length === 0) {
       return [];
@@ -1234,7 +1234,11 @@ class BaseClient {
         allFiles.push(file);
         continue;
       }
-      if (file.embedded === true || file.metadata?.fileIdentifier != null) {
+      if (
+        file.embedded === true ||
+        file.metadata?.codeEnvRef != null ||
+        file.metadata?.fileIdentifier != null
+      ) {
         allFiles.push(file);
         continue;
       }
