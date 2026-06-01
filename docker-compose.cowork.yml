@@ -46,6 +46,10 @@ services:
       - "80:80"
       - "443:443"
       - "8443:8443"   # HTTPS bundler proxy (sandpack)
+      - "8444:8444"   # HTTPS Hermes dashboard (sidecar)
+      - "127.0.0.1:8933:8933"   # playwright-mcp proxy (Host-header rewrite)
+      - "8445:8445"             # HTTPS Open Notebook UI (sidecar)
+      - "8446:8446"             # HTTPS Open Notebook REST API (sidecar)
     depends_on:
       - sandpack-bundler
       - librecowork
@@ -58,6 +62,18 @@ services:
       - type: bind
         source: ./nginx/bundler-tls.conf
         target: /etc/nginx/conf.d/bundler-tls.conf
+      - type: bind
+        source: /Users/erik/proj/cowork/hermes/nginx/hermes-dashboard.conf
+        target: /etc/nginx/conf.d/hermes-dashboard.conf
+        read_only: true
+      - type: bind
+        source: /Users/erik/proj/cowork/OpenNotebook/nginx/opennotebook.conf
+        target: /etc/nginx/conf.d/opennotebook.conf
+        read_only: true
+      - type: bind
+        source: ./nginx/playwright-proxy.conf
+        target: /etc/nginx/conf.d/playwright-proxy.conf
+        read_only: true
       - type: bind
         source: /etc/letsencrypt
         target: /etc/letsencrypt
@@ -89,17 +105,8 @@ services:
         source: ./librechat.yaml
         target: /app/librechat.yaml
       - type: bind
-        source: /Users/erik/proj/rag
-        target: /Users/erik/proj/rag
-      - type: bind
-        source: /Users/erik/proj/cowork
-        target: /Users/erik/proj/cowork
-      - type: bind
-        source: /Users/erik/proj/CV
-        target: /Users/erik/proj/CV
-      - type: bind
-        source: /Users/erik/proj/Work
-        target: /Users/erik/proj/Work
+        source: /Users/erik/proj
+        target: /Users/erik/proj
       - type: bind
         source: /Users/erik/proj/cowork/uploads
         target: /app/uploads
@@ -109,9 +116,6 @@ services:
       - type: bind
         source: /Users/erik/proj/cowork/certs
         target: /app/certs
-      - type: bind
-        source: /Users/erik/proj/cowork-data/memory
-        target: /Users/erik/proj/cowork-data/memory
     environment:
       - HOST=0.0.0.0
       - PORT=3080
@@ -143,9 +147,7 @@ services:
     ports:
       - '8961:8960'
     volumes:
-      - /Users/erik/proj/cowork:/Users/erik/proj/cowork
-      - /Users/erik/proj/Work:/Users/erik/proj/Work
-      - /Users/erik/proj/CV:/Users/erik/proj/CV
+      - /Users/erik/proj:/Users/erik/proj
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 8960)); s.close()"]
@@ -153,6 +155,115 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+
+  # ── Playwright MCP ────────────────────────────────────────────────────────
+  # Microsoft's official @playwright/mcp server. Gives agents headless Chromium
+  # automation via ~34 MCP tools (navigate, click, fill, screenshot, a11y tree…).
+  # Uses the browser's accessibility tree — no vision model required.
+  # Exposed on host port 8931 so both LibreChat and LibreCowork can reach it
+  # via host.docker.internal:8931.
+  # LibreChat wiring: mcpServers.playwright_mcp in both librechat.yaml files.
+  playwright_mcp:
+    image: mcr.microsoft.com/playwright/mcp
+    container_name: playwright-mcp
+    init: true
+    pull_policy: always
+    entrypoint: ["node", "/app/cli.js"]
+    command: ["--headless", "--browser", "chromium", "--no-sandbox", "--port", "8931", "--host", "0.0.0.0"]
+    ports:
+      - "127.0.0.1:8931:8931"
+    networks:
+      - cowork_default
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('net').createConnection(8931,'localhost').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Code Interpreter ──────────────────────────────────────────────────────
+  # martvaha/code-interpreter: LibreChat-compatible sandboxed code execution.
+  # Runs Python (and R) in isolated Docker containers spawned via the Docker socket.
+  # LibreChat wiring: LIBRECHAT_CODE_API_KEY + LIBRECHAT_CODE_BASEURL in .env
+  # Data dirs on host:
+  #   ~/proj/cowork/mcp/code-interpreter/config  — sqlite DB + temp files
+  #   ~/proj/cowork/mcp/code-interpreter/uploads — user-uploaded files (auto-cleaned after 24h)
+  # HOST_PATH must be the *host* path so spawned execution containers can mount it.
+  code-interpreter:
+    build:
+      context: /Users/erik/proj/cowork/mcp/code-interpreter
+      dockerfile: Dockerfile
+      platforms:
+        - linux/arm64
+    image: code-interpreter:local
+    container_name: code-interpreter
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - PORT=8000
+      - HOST_PATH=/Users/erik/proj/cowork/mcp/code-interpreter
+      - HOST_CONFIG_PATH=/Users/erik/proj/cowork/mcp/code-interpreter/config
+      - HOST_FILE_UPLOAD_PATH=/Users/erik/proj/cowork/mcp/code-interpreter/uploads
+      - CONTAINER_MEMORY_LIMIT_MB=1024
+      - SANDBOX_MAX_EXECUTION_TIME=120
+      - DOCKER_NETWORK_ENABLED=false
+      # Read-only mount of the entire project tree at its real path.
+      # No path translation — /Users/erik/proj/... works verbatim inside the container.
+      - PROJ_PATH=/Users/erik/proj
+      # Comma-separated read-write paths, mounted at their real host paths.
+      # First entry becomes the container working directory.
+      # To grant write access to a specific dir: add it here and `docker compose up -d`.
+      # No image rebuild required.
+      - RW_PATHS=/Users/erik/proj/tmp
+    ports:
+      - "127.0.0.1:8100:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - /Users/erik/proj/cowork/mcp/code-interpreter/config:/app/config
+      - /Users/erik/proj/cowork/mcp/code-interpreter/uploads:/app/uploads
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - cowork_default
+
+  # ── Scraper Service ───────────────────────────────────────────────────────
+  scraper:
+    build:
+      context: /Users/erik/proj/cowork/scraper
+    container_name: scraper
+    environment:
+      - JINA_API_KEY=${JINA_API_KEY:-}
+    ports:
+      - "127.0.0.1:3002:3002"
+    networks:
+      - cowork_default
+      - librechat_default
+
+  # ── Byparr Service ────────────────────────────────────────────────────────
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: byparr
+    environment:
+      - LOG_LEVEL=INFO
+    networks:
+      - cowork_default
+    # TODO: Check ARM64 manifest availability for this image (if not available, remove or comment out)
+
+  # ── Crawl4AI Service ──────────────────────────────────────────────────────
+  crawl4ai:
+    image: unclecode/crawl4ai:latest
+    container_name: crawl4ai
+    shm_size: 1g
+    environment:
+      - CRAWL4AI_API_TOKEN=local-token
+    networks:
+      - cowork_default
+    # TODO: Check ARM64 manifest availability for this image (if not available, remove or comment out)
 
 networks:
   # Join the LibreChat stack's auto-created network so 'mongodb' and 'meilisearch'

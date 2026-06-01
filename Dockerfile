@@ -1,4 +1,4 @@
-# v0.8.5-rc1
+# v0.8.5
 
 # Base node image
 FROM node:20-alpine AS node
@@ -6,6 +6,7 @@ FROM node:20-alpine AS node
 RUN apk upgrade --no-cache
 RUN apk add --no-cache jemalloc
 RUN apk add --no-cache python3 py3-pip uv
+RUN apk add --no-cache git curl
 
 # Set environment variable to use jemalloc
 ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
