@@ -10,11 +10,9 @@ import {
 } from 'librechat-data-provider';
 import type { TAttachment } from 'librechat-data-provider';
 import { useLocalize, useProgress, useExpandCollapse } from '~/hooks';
-import { useElicitation } from '~/hooks/Chat/useElicitation';
 import { ToolIcon, getToolIconType, isError } from './ToolOutput';
 import { useMCPIconMap } from '~/hooks/MCP';
 import { AttachmentGroup } from './Parts';
-import ElicitationForm from './ElicitationForm';
 import ToolCallInfo from './ToolCallInfo';
 import ProgressText from './ProgressText';
 import { logger } from '~/utils';
@@ -29,8 +27,8 @@ export default function ToolCall({
   output,
   attachments,
   auth,
-  tool_call_id,
   hideAttachments = false,
+  onExpand,
 }: {
   initialProgress: number;
   isLast?: boolean;
@@ -40,13 +38,10 @@ export default function ToolCall({
   output?: string | null;
   attachments?: TAttachment[];
   auth?: string;
-  expires_at?: number;
-  tool_call_id?: string;
   hideAttachments?: boolean;
+  onExpand?: () => void;
 }) {
   const localize = useLocalize();
-  const { activeElicitation, hasActiveElicitation, respondToElicitation } =
-    useElicitation(tool_call_id);
   const autoExpand = useRecoilValue(store.autoExpandTools);
   const hasOutput = (output?.length ?? 0) > 0;
   const [showInfo, setShowInfo] = useState(() => autoExpand && hasOutput);
@@ -170,6 +165,16 @@ export default function ToolCall({
   const progress = useProgress(initialProgress);
   const showCancelled = cancelled || (errorState && !output);
 
+  const handleToggleInfo = useCallback(() => {
+    setShowInfo((prev) => {
+      const next = !prev;
+      if (next) {
+        onExpand?.();
+      }
+      return next;
+    });
+  }, [onExpand]);
+
   const subtitle = useMemo(() => {
     if (isMCPToolCall && mcpServerName) {
       return localize('com_ui_via_server', { 0: mcpServerName });
@@ -212,7 +217,7 @@ export default function ToolCall({
       <div className="relative my-1.5 flex h-5 shrink-0 items-center gap-2.5">
         <ProgressText
           progress={progress}
-          onClick={() => setShowInfo((prev) => !prev)}
+          onClick={handleToggleInfo}
           inProgressText={
             function_name
               ? localize('com_assistants_running_var', { 0: function_name })
@@ -265,20 +270,6 @@ export default function ToolCall({
       )}
       {!hideAttachments && attachments && attachments.length > 0 && (
         <AttachmentGroup attachments={attachments} />
-      )}
-      {hasActiveElicitation && activeElicitation && (
-        <div className="mt-4 space-y-4">
-          <ElicitationForm
-            key={activeElicitation.id}
-            request={activeElicitation.request}
-            serverName={activeElicitation.serverName}
-            onAccept={(data) =>
-              respondToElicitation(activeElicitation.id, { action: 'accept', content: data })
-            }
-            onDecline={() => respondToElicitation(activeElicitation.id, { action: 'decline' })}
-            onCancel={() => respondToElicitation(activeElicitation.id, { action: 'cancel' })}
-          />
-        </div>
       )}
     </>
   );

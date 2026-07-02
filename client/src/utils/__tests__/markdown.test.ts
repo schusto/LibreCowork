@@ -119,6 +119,7 @@ describe('markdown artifacts', () => {
       const files = getMarkdownFiles(markdown);
 
       expect(files['index.html']).toContain('<!DOCTYPE html>');
+      expect(files['index.html']).toContain('marked.min.js');
       expect(files['index.html']).toContain('marked.parse');
       expect(files['index.html']).toContain('# Test');
     });
@@ -242,17 +243,34 @@ describe('markdown artifacts', () => {
   });
 
   describe('static HTML structure', () => {
-    it('should generate a complete HTML document with marked.js inlined', () => {
+    it('should generate a complete HTML document with marked.js', () => {
       const files = getMarkdownFiles('# Test');
       const html = files['index.html'];
 
       expect(html).toContain('<!DOCTYPE html>');
       expect(html).toContain('<html lang="en">');
       expect(html).toContain('<title>Markdown Preview</title>');
-      // marked is inlined — no external CDN src attribute
-      expect(html).not.toContain('src="https://');
+      expect(html).toContain('marked.min.js');
       expect(html).toContain('marked.use(');
       expect(html).toContain('marked.parse(');
+    });
+
+    it('should pin the CDN script to an exact version with SRI', () => {
+      const files = getMarkdownFiles('# Test');
+      const html = files['index.html'];
+
+      expect(html).toMatch(/marked@\d+\.\d+\.\d+/);
+      expect(html).toContain('integrity="sha384-');
+      expect(html).toContain('crossorigin="anonymous"');
+    });
+
+    it('should show an error message when marked fails to load', () => {
+      const files = getMarkdownFiles('# Test');
+      const html = files['index.html'];
+
+      expect(html).toContain("typeof marked === 'undefined'");
+      expect(html).toContain('failed to load');
+      expect(html).toContain('style="color:#e53e3e;padding:1rem"');
     });
 
     it('should strip raw HTML blocks via renderer override', () => {

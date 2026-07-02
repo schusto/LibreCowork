@@ -1,12 +1,11 @@
-# v0.8.6
+# v0.8.7
 
 # Base node image
-FROM node:20-alpine AS node
+FROM node:24.16.0-alpine AS node
 
 RUN apk upgrade --no-cache
 RUN apk add --no-cache jemalloc
 RUN apk add --no-cache python3 py3-pip uv
-RUN apk add --no-cache git curl
 
 # Set environment variable to use jemalloc
 ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
@@ -16,7 +15,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.9.5-python3.12-alpine /usr/local/bin/uv /usr/
 RUN uv --version
 
 # Set configurable max-old-space-size with default
-ARG NODE_MAX_OLD_SPACE_SIZE=4096
+ARG NODE_MAX_OLD_SPACE_SIZE=6144
 ARG NPM_CI_TIMEOUT_SECONDS=1500
 ARG NPM_CI_ATTEMPTS=2
 
@@ -31,13 +30,12 @@ COPY --chown=node:node client/package.json ./client/package.json
 COPY --chown=node:node packages/data-provider/package.json ./packages/data-provider/package.json
 COPY --chown=node:node packages/data-schemas/package.json ./packages/data-schemas/package.json
 COPY --chown=node:node packages/api/package.json ./packages/api/package.json
-COPY --chown=node:node packages/client/package.json ./packages/client/package.json
 
 RUN \
     # Allow mounting of these files, which have no default
     touch .env ; \
     # Create directories for the volumes to inherit the correct permissions
-    mkdir -p /app/client/public/images /app/logs /app/uploads ; \
+    mkdir -p /app/client/public/images /app/logs /app/uploads /app/skill ; \
     npm config set fetch-retry-maxtimeout 600000 ; \
     npm config set fetch-retries 5 ; \
     npm config set fetch-retry-mintimeout 15000 ; \
@@ -58,7 +56,7 @@ COPY --chown=node:node . .
 RUN \
     # Export NODE_OPTIONS so the memory limit is inherited by every npm
     # subprocess — including the nested `vite build` inside client/ — not
-    # just the outer npm run frontend process.  Use && so a failed build
+    # just the outer npm run frontend process. Use && so a failed build
     # aborts the image immediately instead of producing a broken container.
     export NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE}" && \
     npm run frontend && \
