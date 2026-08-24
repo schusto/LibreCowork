@@ -45,6 +45,41 @@
  *      since a Coder agent doing rapid file edits naturally trips
  *      `toolDeduped`-based detection more often than a Writer agent.
  *
+ *   3. Stall-recovery continuation probe (shouldFireStallProbe /
+ *      isDoneMessage / tryReserveStallProbeSlot / resetAutoContinueCounter) —
+ *      catches the opposite failure mode from (2): the agent goes IDLE with
+ *      NO further tool call, mid-task, instead of repeating one. Observed
+ *      live with the local qwen3.6-35b model: it narrates an intended next
+ *      action ("now executing Test 2...") and then simply stops generating,
+ *      no error anywhere. `trackAndDetectStuckPattern` cannot catch this —
+ *      it fires on `toolDeduped > 0`, i.e. repetition, not silence. See
+ *      docs/37_stall_recovery_handover.md and
+ *      docs/39_stall_recovery_implementation_report.md for the full design
+ *      history and the reasoning trail (in particular why this ended up as
+ *      a same-Run continuation re-entry rather than a separate isolated
+ *      classifier call — docs/39 §2).
+ *
+ *      Unlike components 1 and 2, this one has no logic to run BEFORE the
+ *      model's turn — it fires AFTER `run.processStream()` returns
+ *      naturally (no HITL interrupt, no hook halt) from
+ *      `api/server/controllers/agents/client.js`'s `chatCompletion`. The
+ *      caller (`AgentClient.maybeProbeStallRecovery`) inspects
+ *      `run.getRunMessages()` via `shouldFireStallProbe()`: if this run
+ *      produced at least one tool call before ending on a plain-text final
+ *      message, that's the exact shape of the observed stall. It then
+ *      re-enters the SAME `Run`/`Graph` (not a new one) with one cheap
+ *      nudge message asking the model to either say the single word `DONE`
+ *      or continue for real — `isDoneMessage()` checks the reply.
+ *      `tryReserveStallProbeSlot()` gates each attempt against a
+ *      per-conversation cap (CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS)
+ *      stored in the same `harness_supervisor_state` document as the other
+ *      two components' state, so a conversation that keeps stalling is
+ *      auto-continued a bounded number of times (mirroring Erik's own
+ *      manual "regenerate 2-3 times" recovery habit) and then left alone.
+ *      `resetAutoContinueCounter()` resets that count once per real
+ *      user-initiated turn (called from `buildMessages`, NOT from inside
+ *      the probe itself, so internal probe rounds don't reset their own cap).
+ *
  * Both functions fail open: on timeout, network error, Mongo error, or
  * missing config, they return null and the turn proceeds exactly as it does
  * today. Neither writes to Qdrant; both read/write a small per-conversation
@@ -98,6 +133,26 @@
  *                                             silenced (default: 6)
  *   CWK_SUPERVISOR_STATE_TTL_MS                TTL (ms) for the per-conversation state document; also the MongoDB TTL
  *                                             index's expireAfterSeconds (default: 21600000 — 6h)
+ *   CWK_SUPERVISOR_STALL_PROBE_ENABLED        Master on/off switch for the stall-recovery probe specifically
+ *                                             (default: true — still gated by CWK_SUPERVISOR_ENABLED above)
+ *   CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS  Max auto-continue probe rounds per conversation before giving up
+ *                                             and leaving the turn as-is (default: 2). Resets on the next real
+ *                                             user-initiated turn, not on every internal probe round.
+ *   CWK_SUPERVISOR_STALL_PROBE_MESSAGE        The nudge text sent as the probe's HumanMessage (default: see
+ *                                             STALL_PROBE_MESSAGE below)
+ *   CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS  Only fire the probe when the run's final message text is at
+ *                                             or under this length (default: 400). Added after live testing
+ *                                             (docs/39_stall_recovery_implementation_report.md §5) showed the
+ *                                             original trigger — any tool call this run + plain-text end — fires
+ *                                             on EVERY normal tool-using turn's legitimate conclusion, not just
+ *                                             genuine stalls: a real finished answer (a summary, a table) is
+ *                                             structurally identical to "narrated intent, then went idle" from
+ *                                             the message shape alone, and never matches the literal "DONE" reply
+ *                                             either, so it was exhausting the full auto-continue cap on every
+ *                                             successful multi-tool-call turn. The actual observed stall pattern
+ *                                             (docs/37 §0) is SHORT trailing narration ("now executing Test
+ *                                             2..."), not a full closing answer — this is a blunt length signal,
+ *                                             not the keyword/semantic detection docs/37 §4 already ruled out.
  *
  *   EMBED_URL, QDRANT_URL, QDRANT_COLL_WORK_GRAPH, QDRANT_COLL_CHATS —
  *   intentionally reuse the exact same env var names consolidate.sh already
@@ -131,6 +186,21 @@ const TOPIC_SHIFT_MAX_STALE_TURNS =
 
 const STATE_TTL_MS = parseInt(
   process.env.CWK_SUPERVISOR_STATE_TTL_MS ?? String(6 * 60 * 60 * 1000),
+  10,
+);
+
+const STALL_PROBE_ENABLED =
+  (process.env.CWK_SUPERVISOR_STALL_PROBE_ENABLED ?? 'true').toLowerCase() !== 'false';
+const STALL_PROBE_MAX_CONTINUATIONS = parseInt(
+  process.env.CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS ?? '2',
+  10,
+);
+const STALL_PROBE_MESSAGE =
+  process.env.CWK_SUPERVISOR_STALL_PROBE_MESSAGE ??
+  'If there is nothing further to do, reply with exactly the single word ' +
+    'DONE and nothing else. Otherwise, continue now — call the next tool.';
+const STALL_PROBE_MAX_FINAL_TEXT_CHARS = parseInt(
+  process.env.CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS ?? '400',
   10,
 );
 
@@ -468,7 +538,124 @@ async function trackAndDetectStuckPattern({ conversationId, stats, agent }) {
   );
 }
 
+// ── Component 3: stall-recovery continuation probe ──────────────────────────
+
+const DONE_REPLY_RE = /^\s*done\.?\s*$/i;
+
+function getMessageType(message) {
+  if (!message) return undefined;
+  if (typeof message._getType === 'function') return message._getType();
+  return message.type;
+}
+
+function extractMessageText(message) {
+  const content = message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((part) => part && (part.type === 'text' || typeof part.text === 'string'))
+      .map((part) => part.text || '')
+      .join('');
+  }
+  return '';
+}
+
+/**
+ * Continuation candidate check, applied to the messages a single
+ * `run.processStream()` call just produced (`run.getRunMessages()` —
+ * scoped to that one call, not the whole conversation; see the module
+ * docstring's Component 3 section). True only when this run made at least
+ * one real tool call (a ToolMessage is present), ended on a plain-text
+ * AIMessage with no further tool_calls, AND that final message is SHORT
+ * (at or under CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS).
+ *
+ * The length gate exists because "tool call, then plain-text end" alone
+ * cannot distinguish a genuine stall (short narrated intent, then idle)
+ * from a normal, complete answer (a real summary/table after the tool
+ * calls) — both have the identical message shape, and a complete answer
+ * essentially never matches isDoneMessage()'s literal "DONE" either, so
+ * without this gate every successful multi-tool-call turn would exhaust
+ * the full auto-continue cap. See CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS
+ * in the module docstring for the live-testing evidence behind this.
+ *
+ * @param {Array<{_getType?: () => string, type?: string, tool_calls?: unknown[], content?: unknown}>} runMessages
+ * @returns {boolean}
+ */
+function shouldFireStallProbe(runMessages) {
+  if (!Array.isArray(runMessages) || runMessages.length === 0) return false;
+  const hadToolCall = runMessages.some((m) => getMessageType(m) === 'tool');
+  if (!hadToolCall) return false;
+  const last = runMessages[runMessages.length - 1];
+  if (getMessageType(last) !== 'ai') return false;
+  const toolCalls = last?.tool_calls;
+  if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
+  return extractMessageText(last).trim().length <= STALL_PROBE_MAX_FINAL_TEXT_CHARS;
+}
+
+/**
+ * True when `message` is the probe's reply AND it resolved to "nothing
+ * further to do" — a plain-text AIMessage (no tool_calls) whose text is,
+ * loosely, just the word "DONE". Any other AI reply (including one that
+ * makes a new tool call, per shouldFireStallProbe's own logic on the next
+ * round) counts as a real continuation, not a DONE resolution.
+ *
+ * @param {{_getType?: () => string, type?: string, tool_calls?: unknown[], content?: unknown}} [message]
+ * @returns {boolean}
+ */
+function isDoneMessage(message) {
+  if (getMessageType(message) !== 'ai') return false;
+  const toolCalls = message?.tool_calls;
+  if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
+  return DONE_REPLY_RE.test(extractMessageText(message).trim());
+}
+
+/**
+ * Atomically-enough (single Node process, sequential within one request)
+ * reserve one stall-probe attempt for `conversationId`: reads the current
+ * `autoContinueCount`, and if under CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS,
+ * increments and persists it and returns true. Returns false when the cap is
+ * reached, the feature is disabled, or state read/write fails — fails CLOSED
+ * (declines to probe) rather than open, since probing spends extra model/tool
+ * calls, unlike components 1 and 2 which fail open by skipping a no-op context
+ * injection.
+ *
+ * @param {string} [conversationId]
+ * @returns {Promise<boolean>}
+ */
+async function tryReserveStallProbeSlot(conversationId) {
+  if (!SUPERVISOR_ENABLED || !STALL_PROBE_ENABLED || !conversationId) return false;
+  try {
+    const state = await loadSupervisorState(conversationId);
+    const count = state?.autoContinueCount || 0;
+    if (count >= STALL_PROBE_MAX_CONTINUATIONS) return false;
+    await saveSupervisorState(conversationId, { autoContinueCount: count + 1 });
+    return true;
+  } catch (e) {
+    logger.warn(`[harnessSupervisor] stall-probe reserve failed, declining to probe: ${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * Resets the per-conversation auto-continue counter. Call once per real
+ * user-initiated turn (from `buildMessages`, alongside the other two
+ * components) — NOT from inside the probe loop itself, or every internal
+ * probe round would reset its own cap and the loop could never stop.
+ *
+ * @param {string} [conversationId]
+ * @returns {Promise<void>}
+ */
+async function resetAutoContinueCounter(conversationId) {
+  if (!conversationId) return;
+  await saveSupervisorState(conversationId, { autoContinueCount: 0 });
+}
+
 module.exports = {
   getProactiveMemoryContext,
   trackAndDetectStuckPattern,
+  shouldFireStallProbe,
+  isDoneMessage,
+  tryReserveStallProbeSlot,
+  resetAutoContinueCounter,
+  STALL_PROBE_MESSAGE,
 };
