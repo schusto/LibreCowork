@@ -3,12 +3,25 @@ import { Providers, createTokenCounter, projectAgentContextUsage } from '@librec
 import type { TContextProjectionRequest, TContextUsageEvent } from 'librechat-data-provider';
 import type { BaseMessage } from '@langchain/core/messages';
 import { QUOTE_MAX_COUNT, mergeQuotedText } from '~/utils/quotes';
+import { CONTEXT_REDUCTION_ENABLED, applyContextReductionCore } from '~/utils/contextReduction';
+import type { ReducibleMessage } from '~/utils/contextReduction';
+import { countFormattedMessageTokens } from '~/agents/client';
+import type { FormattedMessageContentPart } from '~/agents/client';
 
 const MAX_PROJECTION_MESSAGES = 512;
 const MAX_PROJECTION_BRANCH_MESSAGES = 256;
 const MAX_PROJECTION_BRANCH_TEXT_BYTES = 512 * 1024;
 const PROJECTION_GRAPH_SELECT = 'messageId parentMessageId metadata.summaryUsedTokens';
-const PROJECTION_BODY_SELECT = 'messageId parentMessageId tokenCount isCreatedByUser text quotes';
+/**
+ * [cowork] `content` is included so the gauge can run the same deterministic
+ * context reduction (`applyContextReductionCore`) the live path applies —
+ * without it, this endpoint only ever sees `text` and reconstructs plain
+ * HumanMessage/AIMessage turns, so a branch with heavy tool_call output would
+ * project a token count far higher than what `buildMessages` actually sends.
+ * See docs/18_context_reduction.md.
+ */
+const PROJECTION_BODY_SELECT =
+  'messageId parentMessageId tokenCount isCreatedByUser text quotes content';
 
 interface ProjectionMessage {
   messageId: string;
@@ -19,6 +32,14 @@ interface ProjectionMessage {
   /** Quoted excerpts merged into the model-facing text by the live path; must be
    *  included here so the context gauge counts the same prompt the model sees. */
   quotes?: string[];
+  /**
+   * [cowork] Raw content-part array as stored by the agents pipeline (think /
+   * tool_call / text parts) — the same shape `formatMessage` produces on the
+   * live path. Absent for plain text-only turns. Used only for the context
+   * reduction + recount pass below; the LangChain messages built for
+   * `projectAgentContextUsage` still use the flattened `text`.
+   */
+  content?: FormattedMessageContentPart[] | string;
   /** Compaction marker written by the live path (`agents/usage.ts`); its
    *  presence means the next call sends the summary + tail, not this raw chain. */
   metadata?: { summaryUsedTokens?: number };
@@ -228,8 +249,12 @@ async function getBranchMessages(
  * the agents SDK what the next call's context would be, WITHOUT invoking the
  * model. Provider/model/window come from the (client-resolved) request — no
  * agent or model-spec config is loaded here, so there is no cross-user config
- * exposure. Reuses LibreChat's already-calibrated per-message `tokenCount`s (no
- * re-tokenizing). Returns null when there is no resolvable context window.
+ * exposure. Reuses LibreChat's already-calibrated per-message `tokenCount` for
+ * any message [cowork] `applyContextReductionCore` leaves untouched (no
+ * re-tokenizing); messages the reducer strips/truncates/dedupes are recounted
+ * from the reduced content so the projection matches what the live path would
+ * actually send — see docs/18_context_reduction.md. Returns null when there is
+ * no resolvable context window.
  * NOTE: this first cut targets message-windowing accuracy — instruction and
  * tool-schema tokens (agent instructions, `promptPrefix`, model-spec presets,
  * tool schemas) are NOT yet included; a follow-up will reuse the full
@@ -285,7 +310,17 @@ export async function resolveContextProjection(
   const tokenCounter = await createTokenCounter(encoding);
 
   const messages: BaseMessage[] = [];
-  const indexTokenCountMap: Record<string, number> = {};
+  /** [cowork] Parallel array of `{ role, content }` objects mirroring what the
+   *  live path's `formatMessage` produces, fed through the same
+   *  `applyContextReductionCore` the live path uses so this projection
+   *  reflects deduped/truncated tool output and stripped thinking blocks
+   *  instead of the full original conversation. See docs/18_context_reduction.md. */
+  const reducibleMessages: ReducibleMessage[] = [];
+  /** Per-message flags carried alongside `reducibleMessages` (same index) —
+   *  kept out of the `ReducibleMessage` shape itself since they're gauge-only
+   *  bookkeeping, not part of what the reducer or `countFormattedMessageTokens`
+   *  operate on. */
+  const hasQuotesByIndex: boolean[] = [];
   for (let i = 0; i < bodyBranch.length; i++) {
     const message = bodyBranch[i];
     /** Mirror the live path: prepend quoted excerpts into the user text the model
@@ -301,15 +336,51 @@ export async function resolveContextProjection(
     const lcMessage =
       message.isCreatedByUser === true ? new HumanMessage(text) : new AIMessage(text);
     messages.push(lcMessage);
-    /** Recount messages with no stored count (imported / pre-feature) rather
-     *  than charging 0 — a real 0 and "unknown" must not collapse, or the
-     *  snapshot-less histories this endpoint targets would under-report. Also
-     *  recount quoted messages: a text-only Save edit leaves a stale text-only
-     *  `tokenCount` that omits the quote block, so trust the merged recount. */
+    hasQuotesByIndex.push(hasQuotes);
+
+    /**
+     * [cowork] Quoted turns use the merged text (quotes are folded into `text`
+     * via `getProjectionText`/`mergeQuotedText`, not represented as a
+     * structured content part here) as a single text-part fallback. Otherwise
+     * prefer the raw stored `content` array (think/tool_call/text parts) when
+     * present — that's what actually determines what the live path sends —
+     * falling back to the flattened `text` for plain turns that never had a
+     * structured `content` field.
+     */
+    const contentForReduction: FormattedMessageContentPart[] | string =
+      !hasQuotes && Array.isArray(message.content) && message.content.length > 0
+        ? message.content
+        : [{ type: 'text', text }];
+    reducibleMessages.push({
+      role: message.isCreatedByUser === true ? 'user' : 'assistant',
+      content: contentForReduction,
+    });
+  }
+
+  const reducedMessages = CONTEXT_REDUCTION_ENABLED
+    ? applyContextReductionCore(reducibleMessages).messages
+    : reducibleMessages;
+
+  const indexTokenCountMap: Record<string, number> = {};
+  for (let i = 0; i < reducedMessages.length; i++) {
+    const message = bodyBranch[i];
+    const hasQuotes = hasQuotesByIndex[i];
+    /** Untouched by the reducer — the exact same object reference survives
+     *  `applyContextReductionCore` (see its docstring) — so the stored
+     *  canonical count is still accurate and can be reused instead of paying
+     *  for a re-tokenization pass. Recount messages with no stored count
+     *  (imported / pre-feature) rather than charging 0 — a real 0 and
+     *  "unknown" must not collapse, or the snapshot-less histories this
+     *  endpoint targets would under-report. Also always recount quoted
+     *  messages: a text-only Save edit leaves a stale text-only `tokenCount`
+     *  that omits the quote block, so trust the merged recount. Anything the
+     *  reducer actually stripped/truncated/deduped must be recounted from the
+     *  reduced content — that's the whole point of this pass. */
+    const wasReduced = reducedMessages[i] !== reducibleMessages[i];
     indexTokenCountMap[String(i)] =
-      !hasQuotes && message.tokenCount != null && message.tokenCount > 0
+      !hasQuotes && !wasReduced && message.tokenCount != null && message.tokenCount > 0
         ? message.tokenCount
-        : tokenCounter(lcMessage);
+        : countFormattedMessageTokens(reducedMessages[i] as Record<string, unknown>, encoding);
   }
 
   return projectAgentContextUsage({

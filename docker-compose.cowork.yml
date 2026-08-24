@@ -86,6 +86,7 @@ services:
 
   librecowork:
     container_name: LibreCowork
+    image: librecowork:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -107,6 +108,12 @@ services:
       - type: bind
         source: /Users/erik/proj
         target: /Users/erik/proj
+#      - type: bind
+#        source: /Volumes/Multimedia/Musik
+#        target: /Volumes/Multimedia/Musik
+      - type: bind
+        source: /Users/erik/proj/cowork/mcp/desktop-commander/config.json
+        target: /root/.desktop-commander/config.json
       - type: bind
         source: /Users/erik/proj/cowork/uploads
         target: /app/uploads
@@ -215,7 +222,7 @@ services:
       # First entry becomes the container working directory.
       # To grant write access to a specific dir: add it here and `docker compose up -d`.
       # No image rebuild required.
-      - RW_PATHS=/Users/erik/proj/tmp
+      - RW_PATHS=/Users/erik/proj/cowork-data/books
     ports:
       - "127.0.0.1:8100:8000"
     healthcheck:
@@ -228,6 +235,7 @@ services:
       - /Users/erik/proj/cowork/mcp/code-interpreter/config:/app/config
       - /Users/erik/proj/cowork/mcp/code-interpreter/uploads:/app/uploads
       - /var/run/docker.sock:/var/run/docker.sock
+#      - /Volumes/Multimedia/Musik:/Volumes/Multimedia/Musik
     networks:
       - cowork_default
 

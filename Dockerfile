@@ -4,6 +4,8 @@
 FROM node:24.16.0-alpine AS node
 
 RUN apk upgrade --no-cache
+# Git — required by desktop-commander agents for version control operations
+RUN apk add --no-cache git
 RUN apk add --no-cache jemalloc
 RUN apk add --no-cache python3 py3-pip uv
 
@@ -23,6 +25,8 @@ RUN mkdir -p /app && chown node:node /app
 WORKDIR /app
 
 USER node
+
+RUN mkdir -p /home/node && git config --global user.name "Erik Schumann" && git config --global user.email "erik@schumann.se"
 
 COPY --chown=node:node package.json package-lock.json ./
 COPY --chown=node:node api/package.json ./api/package.json

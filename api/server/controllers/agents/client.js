@@ -387,6 +387,15 @@ class AgentClient extends BaseClient {
 
     /** @type {Record<number, number>} */
     const indexTokenCountMap = {};
+    /**
+     * [cowork] Per-message prompt token count computed from the PRE-reduction
+     * `formattedMessage`. Used as a cache below: `applyContextReduction` only
+     * replaces the array entries it actually strips/truncates/dedupes, so a
+     * message untouched by reduction can reuse this value instead of paying for
+     * a second tokenization pass. Indexed the same as `orderedMessages`/`payload`.
+     * @type {number[]}
+     */
+    const preReductionPromptTokenCounts = [];
     /** @type {Record<string, number>} */
     const tokenCountMap = {};
     const memoryPayload = [];
@@ -473,8 +482,16 @@ class AgentClient extends BaseClient {
           : 0;
 
       orderedMessages[i].tokenCount = normalizedCanonicalTokenCount;
-      indexTokenCountMap[i] = normalizedPromptTokenCount;
-      promptTokenTotal += normalizedPromptTokenCount;
+      /**
+       * [cowork] NOT written into `indexTokenCountMap`/`promptTokenTotal` here —
+       * only cached for reuse. The authoritative values are computed below from
+       * `payload` (the array AFTER `applyContextReduction` runs) so the SDK's
+       * summarization trigger and context-budget pruner see what is actually
+       * sent to the model, not the size of the original, unreduced conversation.
+       * See the recompute block after `applyContextReduction` and
+       * docs/18_context_reduction.md.
+       */
+      preReductionPromptTokenCounts[i] = normalizedPromptTokenCount;
 
       if (message.messageId) {
         tokenCountMap[message.messageId] = normalizedCanonicalTokenCount;
@@ -537,6 +554,42 @@ class AgentClient extends BaseClient {
       orderedMessages,
       this.options?.conversationId,
     );
+
+    /**
+     * [cowork] Recompute per-message token counts from the REDUCED `payload`,
+     * not the pre-reduction `formattedMessages`. `indexTokenCountMap` is handed
+     * straight to the agents SDK (`formatAgentMessages` in @librechat/agents),
+     * which treats it as authoritative — it does not recount tokens from message
+     * content itself, it only reads `indexTokenCountMap[i]` per original message
+     * index and splits that number across the sub-messages the entry expands
+     * into. Left uncorrected, the SDK's token_ratio summarization trigger and its
+     * context-budget pruner would see the size of the ORIGINAL conversation —
+     * full, untruncated/undeduped tool output — even though
+     * `applyContextReduction` above has already shrunk what is actually sent to
+     * the model. That mismatch is why summarization was firing at ~90% of a 256k
+     * budget (144k+ estimated tokens) while LM Studio was only receiving ~30k
+     * tokens. See docs/18_context_reduction.md.
+     *
+     * `applyContextReduction` only replaces the entries it actually strips,
+     * truncates, or dedupes — untouched messages keep the exact same object
+     * reference as in `formattedMessages` (see contextReduction.js). Reference
+     * equality lets us skip re-tokenizing the (usually large) majority of a long
+     * conversation that reduction left alone, reusing the count already computed
+     * above instead of paying for a second full-conversation tokenization pass
+     * on every request.
+     */
+    promptTokenTotal = 0;
+    for (let i = 0; i < payload.length; i++) {
+      const wasReduced = payload[i] !== formattedMessages[i];
+      const reducedTokenCount = wasReduced
+        ? countFormattedMessageTokens(payload[i], encoding)
+        : preReductionPromptTokenCounts[i];
+      const normalizedReducedTokenCount =
+        Number.isFinite(reducedTokenCount) && reducedTokenCount > 0 ? reducedTokenCount : 0;
+      indexTokenCountMap[i] = normalizedReducedTokenCount;
+      promptTokenTotal += normalizedReducedTokenCount;
+    }
+
     this.memoryPayload = hasFileContext ? memoryPayload : null;
     messages = orderedMessages;
     promptTokens = promptTokenTotal;
