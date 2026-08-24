@@ -924,6 +924,22 @@ Please follow these instructions when using tools from the respective MCP server
           }
         }
 
+        const connectionIsActive = await connection.isConnected();
+        const connectionCheckError = connectionIsActive
+          ? undefined
+          : connection.getLastConnectionCheckError();
+
+        if (
+          !connectionIsActive &&
+          (!userId || !connection.isOAuthAuthenticationError(connectionCheckError))
+        ) {
+          /** May happen if getUserConnection failed silently or app connection dropped */
+          throw new McpError(
+            ErrorCode.InternalError,
+            `${logPrefix} Connection is not active. Cannot execute tool ${toolName}.`,
+          );
+        }
+
         this.setupConnectionElicitationHandler(connection, serverName, userId);
         if (toolCallId) {
           connection.setCurrentToolCallId(toolCallId);
