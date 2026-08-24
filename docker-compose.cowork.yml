@@ -141,6 +141,24 @@ services:
       - CWK_WEB_TRUNCATE_CHARS=1000   # max chars per web result outside the keep window
       # - CWK_DUMP_CONTEXT=1            # dump raw formattedMessages to ~/proj/cowork/uploads/cwk-context-dumps/ (one file per request)
       # - CWK_DUMP_DIR=/app/uploads/cwk-context-dumps  # default — maps to ~/proj/cowork/uploads/cwk-context-dumps/ on host
+      # [cowork] Harness supervisor — proactive memory/work-graph injection + stuck-pattern nudge. See docs/31_harness_memory_supervisor.md.
+      - CWK_SUPERVISOR_ENABLED=true
+      - CWK_SUPERVISOR_MIN_MESSAGE_CHARS=15
+      - CWK_SUPERVISOR_WORK_GRAPH_LIMIT=2
+      - CWK_SUPERVISOR_WORK_GRAPH_THRESHOLD=0.3
+      - CWK_SUPERVISOR_CHATS_LIMIT=2
+      - CWK_SUPERVISOR_CHATS_THRESHOLD=0.25
+      - CWK_SUPERVISOR_TIMEOUT_MS=2000
+      - CWK_SUPERVISOR_STUCK_TURNS=3          # global default; per-agent overrides below
+      # - CWK_SUPERVISOR_STUCK_TURNS_BY_AGENT={"agent_xxxxxxxx":2}  # JSON, agent id (suffix-stripped) -> turns
+      - CWK_SUPERVISOR_TOPIC_SHIFT_ENABLED=true
+      - CWK_SUPERVISOR_TOPIC_SHIFT_THRESHOLD=0.92
+      - CWK_SUPERVISOR_TOPIC_SHIFT_EMA_ALPHA=0.5
+      - CWK_SUPERVISOR_TOPIC_SHIFT_MAX_STALE_TURNS=6
+      - CWK_SUPERVISOR_STATE_TTL_MS=21600000  # 6h
+      # EMBED_URL / QDRANT_URL / QDRANT_COLL_WORK_GRAPH / QDRANT_COLL_CHATS reuse
+      # the same names+defaults as mcp/memory/consolidate.sh and mcp/memory/lib/config.js —
+      # left unset here so both processes fall back to the same defaults.
     env_file:
       - /Users/erik/proj/cowork/LibreChat/.env
     extra_hosts:

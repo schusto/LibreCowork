@@ -100,8 +100,25 @@ const DUMP_DIR = process.env.CWK_DUMP_DIR ?? '/app/uploads/cwk-context-dumps';
  * @returns {object[]} Reduced message array.
  */
 function applyContextReduction(formattedMessages, orderedMessages, conversationId) {
-  if (!CONTEXT_REDUCTION_ENABLED) return formattedMessages;
-  if (!formattedMessages || formattedMessages.length === 0) return formattedMessages;
+  return applyContextReductionWithStats(formattedMessages, orderedMessages, conversationId).messages;
+}
+
+/**
+ * [cowork] Same algorithm as applyContextReduction, but also returns the
+ * `stats` object applyContextReductionCore already computes (thinkStripped,
+ * toolDeduped, toolTruncated, savedChars) instead of discarding it after the
+ * log line. Added for harnessSupervisor.js's stuck-pattern detector, which
+ * needs toolDeduped per request. See docs/31_harness_memory_supervisor.md.
+ *
+ * @returns {{messages: object[], stats: object|null}} stats is null when
+ *   reduction was skipped entirely (disabled, or empty input) — callers must
+ *   handle that case, not assume stats is always populated.
+ */
+function applyContextReductionWithStats(formattedMessages, orderedMessages, conversationId) {
+  if (!CONTEXT_REDUCTION_ENABLED) return { messages: formattedMessages, stats: null };
+  if (!formattedMessages || formattedMessages.length === 0) {
+    return { messages: formattedMessages, stats: null };
+  }
 
   // ── Debug dump ──────────────────────────────────────────────────────────────
   if (DUMP_CONTEXT) {
@@ -131,7 +148,7 @@ function applyContextReduction(formattedMessages, orderedMessages, conversationI
     );
   }
 
-  return messages;
+  return { messages, stats };
 }
 
-module.exports = { applyContextReduction };
+module.exports = { applyContextReduction, applyContextReductionWithStats };

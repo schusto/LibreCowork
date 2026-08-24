@@ -1,7 +1,9 @@
 require('events').EventEmitter.defaultMaxListeners = 100;
 const { logger } = require('@librechat/data-schemas');
 // [cowork] Deterministic context reduction (thinking strip + tool dedup/truncation)
-const { applyContextReduction } = require('~/server/utils/contextReduction');
+const { applyContextReductionWithStats } = require('~/server/utils/contextReduction');
+// [cowork] Harness supervisor — proactive memory/work-graph injection + stuck-pattern nudge
+const { getProactiveMemoryContext, trackAndDetectStuckPattern } = require('~/server/utils/harnessSupervisor');
 const { getBufferString, HumanMessage } = require('@librechat/agents/langchain/messages');
 const {
   createRun,
@@ -1528,11 +1530,14 @@ class AgentClient extends BaseClient {
     // [cowork] Apply deterministic context reduction before sending to the backend.
     // Strips old thinking blocks and truncates/deduplicates old tool results.
     // No DB writes, no async, no LLM — pure transform. See docs/18_context_reduction.md.
-    payload = applyContextReduction(
+    // WithStats variant also surfaces `stats.toolDeduped` for the harness
+    // supervisor's stuck-pattern detector below. See docs/31_harness_memory_supervisor.md.
+    const { messages: reducedPayload, stats: reductionStats } = applyContextReductionWithStats(
       formattedMessages,
       orderedMessages,
-      this.options?.conversationId,
+      this.conversationId,
     );
+    payload = reducedPayload;
 
     /**
      * [cowork] Recompute per-message token counts from the REDUCED `payload`,
@@ -1627,6 +1632,32 @@ class AgentClient extends BaseClient {
     if (this.augmentedPrompt) {
       sharedRunContextParts.push(this.augmentedPrompt);
     }
+
+    /**
+     * [cowork] Harness supervisor — proactive work-graph/chat injection plus a
+     * stuck-pattern nudge, both independent of whether the model chooses to call
+     * search_work_graph / search_memory itself. Fails open. Global/shared: pushed
+     * into sharedRunContextParts (visible to every agent in this run), not routed
+     * through getAgentPartitionMemories/getMemoryAgentId below — that mechanism is
+     * upstream's own per-agent memory partitioning and is orthogonal to this.
+     * See docs/31_harness_memory_supervisor.md, docs/36_harness_supervisor_implementation_report.md.
+     */
+    const latestUserText = orderedMessages[orderedMessages.length - 1]?.text;
+    const [proactiveContext, stuckNudge] = await Promise.all([
+      getProactiveMemoryContext({
+        userMessage: latestUserText,
+        conversationId: this.conversationId,
+        userId: this.options?.req?.user?.id,
+        agent: this.options?.agent,
+      }),
+      trackAndDetectStuckPattern({
+        conversationId: this.conversationId,
+        stats: reductionStats,
+        agent: this.options?.agent,
+      }),
+    ]);
+    if (proactiveContext) sharedRunContextParts.push(proactiveContext);
+    if (stuckNudge) sharedRunContextParts.push(stuckNudge);
 
     /** Memory context (user preferences/memories). Keyed context (with memory
      *  keys + token metadata) is reserved for agents that can call
