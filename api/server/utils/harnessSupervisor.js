@@ -70,10 +70,14 @@
  *      final. `shouldFireStallProbe()` and `isDoneMessage()` both then key
  *      off the SAME tag — present → done, absent → continuation candidate —
  *      applied consistently to the original response and every probe
- *      round, rather than two different checks. A short-final-text
- *      fallback (CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS) backs the
- *      tag up for when tag-following itself lapses (the same instruction-
- *      following reliability the whole feature exists because of).
+ *      round, rather than two different checks. DONE_TAG absence is the
+ *      SOLE signal — an earlier length-based fallback ("only fire if the
+ *      final text was also short") was tried and removed after live
+ *      testing showed it silently suppressed the probe on a genuinely
+ *      incomplete response that just happened to be moderately long (see
+ *      docs/39_stall_recovery_implementation_report.md §10 for the
+ *      incident and shouldFireStallProbe()'s own docstring for the
+ *      reasoning behind removing it rather than tuning the threshold).
  *
  *      The rest fires AFTER `run.processStream()` returns naturally (no
  *      HITL interrupt, no hook halt) from
@@ -167,14 +171,14 @@
  *   CWK_SUPERVISOR_STALL_PROBE_MESSAGE        The nudge text sent as the probe's HumanMessage when the tag was
  *                                             absent (default: see STALL_PROBE_MESSAGE below — reinforces the
  *                                             same tag convention rather than a separate literal-"DONE" ask)
- *   CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS  Fallback signal, only consulted when CWK_SUPERVISOR_STALL_PROBE_DONE_TAG
- *                                             is absent: only fire the probe when the run's final message text
- *                                             is at or under this length (default: 400). Backs the tag up for
- *                                             when tag-following itself lapses — the actual observed stall
- *                                             pattern (docs/37 §0) is SHORT trailing narration ("now executing
- *                                             Test 2..."), not a full closing answer that simply forgot to tag
- *                                             itself. A blunt length signal, not the keyword/semantic detection
- *                                             docs/37 §4 already ruled out.
+ *
+ *   (No length-based fallback exists — DONE_TAG absence is the sole trigger
+ *   signal. A CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS fallback was
+ *   tried and REMOVED: live testing showed it silently suppressed the probe
+ *   on a genuinely incomplete 537-character response, since length alone
+ *   cannot distinguish "complete" from "incomplete but substantial." See
+ *   docs/39_stall_recovery_implementation_report.md §10 and
+ *   shouldFireStallProbe()'s docstring.)
  *
  *   EMBED_URL, QDRANT_URL, QDRANT_COLL_WORK_GRAPH, QDRANT_COLL_CHATS —
  *   intentionally reuse the exact same env var names consolidate.sh already
@@ -233,10 +237,6 @@ const STALL_PROBE_MESSAGE =
   `If the work is done and no instructions are missing just print ${DONE_TAG}, ` +
     'otherwise continue your tasks and achieve your goal. When you are fully ' +
     `done add ${DONE_TAG} at the end.`;
-const STALL_PROBE_MAX_FINAL_TEXT_CHARS = parseInt(
-  process.env.CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS ?? '400',
-  10,
-);
 
 const EMBED_URL  = process.env.EMBED_URL  || 'http://host.docker.internal:9000/v1/embeddings';
 const QDRANT_URL = process.env.QDRANT_URL || 'http://host.docker.internal:6333';
@@ -609,22 +609,28 @@ function containsDoneTag(text) {
  * docstring's Component 3 section). True only when this run made at least
  * one real tool call (a ToolMessage is present), ended on a plain-text
  * AIMessage with no further tool_calls, AND that final message does not
- * carry the DONE_TAG completion marker.
+ * carry the DONE_TAG completion marker — DONE_TAG absence is now the sole
+ * and authoritative signal, no length-based override.
  *
- * Primary signal: DONE_TAG absence — the model is instructed every turn
- * (getStallProbeTagInstruction()) to append DONE_TAG when genuinely
- * finished, so its absence is a direct signal, not a proxy.
- *
- * Fallback signal (only reached when the tag is absent): the final message
- * is SHORT (at or under CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS).
- * This exists because tag-following depends on the same model reliability
- * that's already known to be shaky — a long, clearly-complete answer that
- * simply forgot the tag should still be treated as done rather than
- * probed, whereas the actual observed stall pattern (docs/37 §0) is SHORT
- * trailing narration ("now executing Test 2..."). This is the same length
- * gate the pre-tag version of this function used as its only signal (see
- * docs/39_stall_recovery_implementation_report.md §3); it's now a backstop
- * behind the tag rather than the primary mechanism.
+ * A length-based fallback (fire only if the final text was also short) was
+ * tried and then REMOVED after live testing found it caused the opposite
+ * failure from the one it was meant to prevent: a genuinely INCOMPLETE
+ * response (cut off mid-task, no closing summary) that happened to be
+ * moderately long — 537 characters in the observed case, comfortably over
+ * a 400-character threshold that was meant to catch only short narrated-
+ * intent stalls — got silently treated as complete and never probed at
+ * all, with no log trace to explain why (see
+ * docs/39_stall_recovery_implementation_report.md §10 for the full
+ * incident). A length threshold cannot reliably distinguish "genuinely
+ * complete" from "genuinely incomplete but substantial" — both land in the
+ * same few-hundred-to-few-thousand character range — so it was actively
+ * undermining the tag, which is supposed to be the authoritative signal.
+ * The residual risk this removal reopens (a genuinely complete, long
+ * answer that simply forgot the tag triggers one unnecessary probe round)
+ * is bounded by the auto-continue cap and self-corrects on the very next
+ * round, since the probe message reinforces the same tag instruction — a
+ * strictly smaller and more visible failure than the silent one this
+ * caused.
  *
  * @param {Array<{_getType?: () => string, type?: string, tool_calls?: unknown[], content?: unknown}>} runMessages
  * @returns {boolean}
@@ -637,9 +643,7 @@ function shouldFireStallProbe(runMessages) {
   if (getMessageType(last) !== 'ai') return false;
   const toolCalls = last?.tool_calls;
   if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
-  const text = extractMessageText(last);
-  if (containsDoneTag(text)) return false;
-  return text.trim().length <= STALL_PROBE_MAX_FINAL_TEXT_CHARS;
+  return !containsDoneTag(extractMessageText(last));
 }
 
 /**

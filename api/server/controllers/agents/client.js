@@ -2620,7 +2620,17 @@ class AgentClient extends BaseClient {
       const newRunMessages = run.getRunMessages() ?? [];
       history = [...history, ...newRunMessages];
 
-      if (!shouldFireStallProbe(newRunMessages)) {
+      const willFire = shouldFireStallProbe(newRunMessages);
+      /** Debug-level so it doesn't add INFO-log noise in normal operation,
+       *  but logs the decision either way — firing was previously the only
+       *  logged outcome, which made a real incident (docs/39 §10: the probe
+       *  silently declining to fire on a genuinely incomplete response)
+       *  needing a direct Mongo query to diagnose instead of a log grep. */
+      logger.debug(
+        `[AgentClient] conv=${convLabel} stall-recovery check (round ${round + 1}): ` +
+          `willFire=${willFire} newMessages=${newRunMessages.length}`,
+      );
+      if (!willFire) {
         return;
       }
 
