@@ -2600,9 +2600,27 @@ class AgentClient extends BaseClient {
     // error) — guards only against a bug turning this into an infinite loop.
     const MAX_ROUNDS_SAFETY = 5;
 
+    /**
+     * Running reconstruction of the full conversation-so-far. Without a
+     * checkpointer, LangGraph state does not persist across separate
+     * `processStream()` calls (see docs/39 §1), so every round must be fed
+     * the COMPLETE history explicitly — not just the round that just
+     * finished. `run.getRunMessages()` only ever returns the messages
+     * produced by the MOST RECENTLY completed round (the SDK resets its
+     * boundary at the start of every `processStream()` call), so this must
+     * be accumulated across iterations, not reconstructed fresh from
+     * `initialMessages` each time — reconstructing fresh each round was a
+     * real bug found live (docs/39 §9): round 2+ would silently drop
+     * everything from earlier rounds, leaving the model to continue with no
+     * memory of tool results it had already produced.
+     */
+    let history = initialMessages;
+
     for (let round = 0; round < MAX_ROUNDS_SAFETY; round++) {
-      const runMessages = run.getRunMessages() ?? [];
-      if (!shouldFireStallProbe(runMessages)) {
+      const newRunMessages = run.getRunMessages() ?? [];
+      history = [...history, ...newRunMessages];
+
+      if (!shouldFireStallProbe(newRunMessages)) {
         return;
       }
 
@@ -2616,11 +2634,11 @@ class AgentClient extends BaseClient {
       );
 
       const probeMessage = new HumanMessage(STALL_PROBE_MESSAGE);
-      const priorMessages = [...initialMessages, ...runMessages];
+      history = [...history, probeMessage];
 
       try {
         await run.processStream(
-          { messages: [...priorMessages, probeMessage] },
+          { messages: history },
           config,
           { callbacks: { [Callback.TOOL_ERROR]: logToolError }, keepContent: true },
         );
@@ -2647,6 +2665,8 @@ class AgentClient extends BaseClient {
       }
       // Not DONE: the SDK's own loop is now standing as the natural
       // continuation of this turn — loop once more in case it stalls again.
+      // `history` gets this round's new messages appended at the top of
+      // the next iteration, same as every prior round.
     }
   }
 
