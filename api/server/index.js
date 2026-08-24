@@ -1,3 +1,5 @@
+require('../config/credentials');
+
 const telemetry = require('./telemetry');
 const fs = require('fs');
 const path = require('path');
@@ -21,12 +23,27 @@ const {
   GenerationJobManager,
   QUERY_DEVTOOLS_HEADER,
   createStreamServices,
+  agentStartupIngressMiddleware,
+  agentStartupTelemetryMiddleware,
   initializeFileStorage,
   initializeDeploymentSkills,
+  initializeDeploymentPlugins,
+  getDeploymentPluginSkills,
+  getDeploymentPluginHookCapabilities,
+  registerDeploymentPluginHooks,
+  hasDeploymentPluginHooks,
+  setPluginHookSource,
+  loadToolApprovalHooks,
   maybeInjectQueryDevtoolsBootstrap,
   preAuthTenantMiddleware,
+  requestContextMiddleware,
+  registerShutdownTask,
+  configureServerTimeouts,
   setupGracefulShutdown,
   updateInterfacePermissions,
+  configureMessageFilterRegexValidator,
+  configureFileConfigRegexEngine,
+  waitForKeyvRedisClient,
 } = require('@librechat/api');
 const { connectDb, indexSync } = require('~/db');
 const {
@@ -38,9 +55,9 @@ const {
 const initializeOAuthReconnectManager = require('./services/initializeOAuthReconnectManager');
 const { capabilityContextMiddleware } = require('./middleware/roles/capabilities');
 const createValidateImageRequest = require('./middleware/validateImageRequest');
-const { startExpiredFileSweep } = require('./services/Files/process');
 const { initializeGitHubSkillSync } = require('./services/Skills/sync');
 const { jwtLogin, ldapLogin, passportLogin } = require('~/strategies');
+const { startExpiredFileSweep } = require('./services/Files/process');
 const { checkMigrations } = require('./services/start/migration');
 const optionalJwtAuth = require('./middleware/optionalJwtAuth');
 const initializeMCPs = require('./services/initializeMCPs');
@@ -50,6 +67,12 @@ const { getAppConfig } = require('./services/Config');
 const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const routes = require('./routes');
+
+/** Route admin file-config MIME patterns through a linear-time engine (ReDoS-safe) on upload. */
+configureFileConfigRegexEngine();
+
+/** Reject messageFilter PII patterns the RE2 runtime engine cannot compile, at config load. */
+configureMessageFilterRegexValidator();
 
 const { PORT, HOST, ALLOW_SOCIAL_LOGIN, DISABLE_COMPRESSION, TRUST_PROXY } = process.env ?? {};
 
@@ -83,9 +106,23 @@ const configureGenerationStreams = () => {
     cleanupOnComplete: !isEnabled(process.env.STREAM_KEEP_COMPLETED_JOBS),
   });
   GenerationJobManager.initialize();
+  // Stop active generations and close their SSE streams while the HTTP server drains.
+  registerShutdownTask(
+    'generation job manager prepare',
+    () => GenerationJobManager.prepareForShutdown(),
+    {
+      phase: 'pre-drain',
+      priority: 100,
+    },
+  );
+  // Tear down stream resources before shared caches and telemetry exporters shut down.
+  registerShutdownTask('generation job manager', () => GenerationJobManager.destroy(), {
+    priority: 100,
+  });
 };
 
 const startServer = async () => {
+  await waitForKeyvRedisClient();
   const { metricsMiddleware, metricsRouter } = createMetrics();
   if (!process.env.METRICS_SECRET) {
     logger.warn('[metrics] METRICS_SECRET is not set - /metrics will return 401 for all requests');
@@ -121,9 +158,35 @@ const startServer = async () => {
   });
   const appConfig = await getAppConfig({ baseOnly: true });
   initializeFileStorage(appConfig);
-  await initializeDeploymentSkills({ projectRoot: path.resolve(__dirname, '../..') });
+  const projectRoot = path.resolve(__dirname, '../..');
+  // Plugin hooks execute only when the operator opts in via DEPLOYMENT_PLUGIN_HOOKS;
+  // without it, declared hook documents load as parsed-but-inert with a warning.
+  await initializeDeploymentPlugins({
+    projectRoot,
+    hookCapabilities: getDeploymentPluginHookCapabilities(),
+  });
+  // Hand the run seam its plugin-hook source without a packages/api-internal
+  // agents -> plugins import (see agents/hooks/source.ts).
+  setPluginHookSource({
+    hasHooks: hasDeploymentPluginHooks,
+    register: registerDeploymentPluginHooks,
+  });
+  await initializeDeploymentSkills({
+    projectRoot,
+    additionalSkills: getDeploymentPluginSkills(),
+  });
   initializeGitHubSkillSync(appConfig);
   startExpiredFileSweep({ appConfig, loadAppConfig: getAppConfig });
+  // Register any programmatic tool-approval policy hooks declared in
+  // `endpoints.agents.toolApproval.hooks`. Honor the `enabled` kill switch: when tool
+  // approval is off we pass no hooks, so a disabled endpoint imports/runs nothing (and any
+  // previously loaded batch is unregistered). Hooks are read from the BASE config only —
+  // they register once, process-wide; per-user/tenant differences belong inside the hook
+  // (via its context), not in per-override module lists.
+  const toolApproval = appConfig?.endpoints?.agents?.toolApproval;
+  await loadToolApprovalHooks(toolApproval?.enabled ? toolApproval.hooks : undefined, {
+    basePath: path.resolve(__dirname, '../..'),
+  });
   await runAsSystem(async () => {
     await performStartupChecks(appConfig);
     await updateInterfacePermissions({ appConfig, getRoleByName, updateAccessPermissions });
@@ -172,6 +235,8 @@ const startServer = async () => {
   });
 
   /* Middleware */
+  app.use(requestContextMiddleware);
+  app.use('/api/agents/chat', agentStartupIngressMiddleware);
   app.use(metricsMiddleware);
   app.use(noIndex);
   app.use(express.json({ limit: '3mb' }));
@@ -209,6 +274,7 @@ const startServer = async () => {
   if (telemetry.enabled) {
     app.use(telemetry.telemetryMiddleware);
   }
+  app.use('/api/agents/chat', agentStartupTelemetryMiddleware);
 
   if (!ALLOW_SOCIAL_LOGIN) {
     console.warn('Social logins are disabled. Set ALLOW_SOCIAL_LOGIN=true to enable them.');
@@ -238,6 +304,7 @@ const startServer = async () => {
   app.use('/api/auth', preAuthTenantMiddleware, routes.auth);
   app.use('/api/admin', routes.adminAuth);
   app.use('/api/admin/config', routes.adminConfig);
+  app.use('/api/admin/langfuse', routes.adminLangfuse);
   app.use('/api/admin/grants', routes.adminGrants);
   app.use('/api/admin/groups', routes.adminGroups);
   app.use('/api/admin/roles', routes.adminRoles);
@@ -275,8 +342,6 @@ const startServer = async () => {
   app.use('/api/mcp', routes.mcp);
   app.use('/api/rum', routes.rum);
 
-  app.use('/metrics', metricsRouter);
-
   /** Prefill progress — proxies to mlx-proxy so the browser avoids mixed-content */
   app.get('/api/prefill_status', async (req, res) => {
     try {
@@ -298,6 +363,8 @@ const startServer = async () => {
       res.json({ todos: [], updated_at: null });
     }
   });
+
+  app.use('/metrics', metricsRouter);
 
   /** 404 for unmatched API routes */
   app.use('/api', apiNotFound);
@@ -333,7 +400,12 @@ const startServer = async () => {
   // connection completely silent until the first token arrives; undici fires
   // headersTimeout and closes the socket with a SocketError('terminated').
   // Disabling both timeouts via the global dispatcher lets prefills run as long
-  // as they need.
+  // as they need.  connect.timeout keeps a fast-fail for unreachable backends.
+  // node:undici is the built-in undici instance that backs globalThis.fetch
+  // (and therefore OpenAI SDK v5's HTTP client).  The npm `undici` package is a
+  // separate module instance — patching it does nothing to the built-in fetch.
+  // headersTimeout / bodyTimeout both default to 300 000 ms; either fires during
+  // long LM Studio prefills and kills the socket with SocketError('terminated').
   (() => {
     let setGlobalDispatcher, Agent;
     try {
@@ -354,7 +426,6 @@ const startServer = async () => {
       console.warn('[server] setGlobalDispatcher failed:', e.message);
     }
   })();
-
   server.listen(port, host, async (err) => {
     if (err) {
       logger.error('Failed to start server:', err);
@@ -395,6 +466,14 @@ const startServer = async () => {
       logger.error('Post-listen initialization failed:', initErr);
       process.exit(1);
     }
+  });
+
+  configureServerTimeouts(server);
+  logger.info('HTTP server timeout configuration', {
+    keepAliveTimeout: server.keepAliveTimeout,
+    keepAliveTimeoutBuffer: server.keepAliveTimeoutBuffer,
+    headersTimeout: server.headersTimeout,
+    requestTimeout: server.requestTimeout,
   });
 
   setupGracefulShutdown(server);

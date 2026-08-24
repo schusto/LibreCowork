@@ -27,6 +27,7 @@ import {
   logger,
   setDraft,
   scrollToEnd,
+  requestChatFocus,
   getAllContentText,
   upsertConvoInAllQueries,
   updateConvoInAllQueries,
@@ -309,7 +310,14 @@ export default function useEventHandlers({
       queryClient.invalidateQueries({ queryKey: [key], refetchType: 'all' });
     }
   }, [queryClient]);
-  const { stepHandler, clearStepMaps, resetSubagentAtoms, syncStepMessage } = useStepHandler({
+  const {
+    stepHandler,
+    clearStepMaps,
+    resetSubagentAtoms,
+    syncStepMessage,
+    cancelPendingDeltaFlush,
+    flushPendingDeltas,
+  } = useStepHandler({
     setMessages,
     getMessages,
     announcePolite,
@@ -442,14 +450,23 @@ export default function useEventHandlers({
     (data: TSyncData, submission: EventSubmission) => {
       const { conversationId, thread_id, responseMessage, requestMessage } = data;
       const { initialResponse, messages: _messages, userMessage } = submission;
-      const messages = _messages.filter((msg) => msg.messageId !== userMessage.messageId);
+      /** Swap the optimistic user row for the server-stamped one IN PLACE.
+       *  Filtering it out and re-appending at the tail would order any of its
+       *  already-present children (abandoned responses from preempted
+       *  attempts) before their parent, and the message tree hoists such rows
+       *  into phantom root branches — a folded thread. */
+      const userIndex = _messages.findIndex((msg) => msg.messageId === userMessage.messageId);
+      const messages =
+        userIndex >= 0
+          ? _messages.map((msg, i) => (i === userIndex ? requestMessage : msg))
+          : [..._messages, requestMessage];
 
       const nextResponseMessage = {
         ...initialResponse,
         ...responseMessage,
       };
 
-      setMessages([...messages, requestMessage, nextResponseMessage]);
+      setMessages([...messages, nextResponseMessage]);
 
       announcePolite({
         message: 'start',
@@ -751,7 +768,8 @@ export default function useEventHandlers({
           setDraft({ id: currentConvoId, value: requestMessage?.text });
           restorePendingQuotes(currentConvoId, requestMessage?.quotes);
           if (isNewChat) {
-            navigate(`/c/${Constants.NEW_CONVO}`, { replace: true, state: { focusChat: true } });
+            requestChatFocus();
+            navigate(`/c/${Constants.NEW_CONVO}`, { replace: true });
           }
           return;
         }
@@ -849,6 +867,20 @@ export default function useEventHandlers({
               specName: submission.conversation?.spec,
               startupConfig: queryClient.getQueryData<TStartupConfig>(startupConfigKey(true)),
             });
+          }
+
+          // Propagate server-authoritative title to the sidebar list.
+          // createdHandler already moved the convo to top at turn start; by
+          // finalHandler the server has run regen_title (or any other title
+          // source) and the title in `conversation` is the true DB value.
+          // Without this call the allConversations cache stays on the old
+          // title until the next full refetch.
+          if (conversation.conversationId && conversation.title) {
+            updateConvoInAllQueries(
+              queryClient,
+              conversation.conversationId,
+              (c) => ({ ...c, title: conversation.title as string }),
+            );
           }
 
           if (conversation.chatProjectId) {
@@ -1117,6 +1149,8 @@ export default function useEventHandlers({
     createdHandler,
     titleHandler,
     syncStepMessage,
+    cancelPendingDeltaFlush,
+    flushPendingDeltas,
     attachmentHandler,
     abortConversation,
     resetContentHandler,

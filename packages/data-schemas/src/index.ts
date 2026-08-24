@@ -22,13 +22,24 @@ export {
   validateRelativePath,
   inferSkillFileCategory,
   validateSkillFrontmatter,
+  getCanonicalSkillFrontmatterKey,
+  normalizeSkillFrontmatterKeys,
   validateSkillDescription,
   deriveStructuredFrontmatterFields,
   AUDIT_SCHEMA_VERSION,
   MAX_AUDIT_EXPORT_ROWS,
   MAX_AUDIT_LOG_LIMIT,
   MAX_AUDIT_VERIFY_ROWS,
+  MAX_TOOL_FAVORITES,
+  MCPAuthorityProofError,
+  MAX_MCP_AUTHORITY_TARGETS,
+  createMCPAuthorityBootRevision,
+  createMCPAuthorityConfigSourceRevision,
+  createMCPAuthorityCredentialRevision,
+  createMCPAuthorityDatabaseSourceRevision,
+  digestMCPAuthorityValue,
 } from './methods';
+export { FAVORITE_ITEM_TYPES } from './types/favorite';
 export type * from './types';
 export type * from './methods';
 export {
@@ -48,9 +59,17 @@ export {
   getTenantId,
   getUserId,
   getRequestId,
+  getRequestMethod,
+  getRequestPath,
   runAsSystem,
   scopedCacheKey,
   SYSTEM_TENANT_ID,
 } from './config/tenantContext';
 export type { TenantContext } from './config/tenantContext';
-export { dropSupersededTenantIndexes, dropSupersededPromptGroupIndexes } from './migrations';
+export {
+  MCPServerNameMigrationError,
+  createMCPAuthorityLookupIndexes,
+  dropSupersededTenantIndexes,
+  dropSupersededPromptGroupIndexes,
+  backfillMCPServerNormalizedNames,
+} from './migrations';

@@ -1,3 +1,5 @@
+import { Button } from '@librechat/client';
+import { ExternalLink } from 'lucide-react';
 import type { TokenUsageView } from '~/hooks/Chat/useTokenUsage';
 import type { CurrencyConfig } from '~/utils';
 import { groupToolTokens, formatTokens, formatCost } from '~/utils';
@@ -30,9 +32,15 @@ interface BreakdownProps {
   view: TokenUsageView;
   showCost: boolean;
   currency?: CurrencyConfig;
+  langfuseSessionUrl?: string;
 }
 
-export default function Breakdown({ view, showCost, currency }: BreakdownProps) {
+export default function Breakdown({
+  view,
+  showCost,
+  currency,
+  langfuseSessionUrl,
+}: BreakdownProps) {
   const localize = useLocalize();
   const { usedTokens, maxTokens, percent, snapshot, snapshotActive, branchUsage, hasUsage } = view;
   /** Show the all-branches total only when it (a) exceeds the active branch —
@@ -145,11 +153,29 @@ export default function Breakdown({ view, showCost, currency }: BreakdownProps) 
                 max={maxTokens}
               />
             )}
-            <Row label={localize('com_ui_input')} value={view.branchTotals.input} />
-            <Row
-              label={localize('com_ui_output')}
-              value={view.branchTotals.output + view.liveTokens}
-            />
+            {view.messagesPruned ? (
+              /** Over-window: the per-category split no longer describes what's
+               *  sent, so show the pruned message total (incl. in-flight). */
+              <Row
+                label={localize('com_ui_context_messages')}
+                value={view.messageTokens + view.liveTokens}
+                max={maxTokens}
+              />
+            ) : (
+              <>
+                <Row label={localize('com_ui_input')} value={view.branchTotals.input} />
+                <Row
+                  label={localize('com_ui_output')}
+                  value={view.branchTotals.output + view.liveTokens}
+                />
+                {view.estimatedTokens > 0 && (
+                  <Row label={localize('com_ui_context_estimated')} value={view.estimatedTokens} />
+                )}
+              </>
+            )}
+            {view.overheadTokens > 0 && (
+              <Row label={localize('com_ui_context_system')} value={view.overheadTokens} />
+            )}
             {maxTokens == null && (
               <p className="text-xs text-text-secondary">{localize('com_ui_context_unknown')}</p>
             )}
@@ -195,6 +221,18 @@ export default function Breakdown({ view, showCost, currency }: BreakdownProps) 
               </div>
             )}
           </div>
+        </>
+      )}
+
+      {langfuseSessionUrl && (
+        <>
+          <div className="border-t border-border-light" role="separator" />
+          <Button asChild variant="link" className="h-auto w-full justify-between gap-2 p-0">
+            <a href={langfuseSessionUrl} target="_blank" rel="noopener noreferrer">
+              <span>{localize('com_ui_langfuse_view_session')}</span>
+              <ExternalLink className="size-4 shrink-0" aria-hidden="true" />
+            </a>
+          </Button>
         </>
       )}
     </div>

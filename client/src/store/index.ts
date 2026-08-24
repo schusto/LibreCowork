@@ -15,8 +15,12 @@ import misc from './misc';
 export * from './agents';
 export * from './mcp';
 export * from './favorites';
+export * from './elicitation';
+export * from './mlxStatus';
 export * from './subagents';
+export * from './sandbox';
 export * from './usage';
+export * from './steer';
 
 export default {
   ...artifacts,

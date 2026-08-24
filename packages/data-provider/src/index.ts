@@ -22,6 +22,7 @@ export * from './roles';
 export * from './types';
 export * from './types/agents';
 export * from './types/assistants';
+export * from './types/elicitation';
 export * from './types/files';
 export * from './types/mcpServers';
 export * from './types/mutations';
@@ -45,6 +46,7 @@ export {
 } from './api-endpoints';
 export { default as request } from './request';
 export { dataService };
+export { respondToElicitation } from './data-service';
 import * as dataService from './data-service';
 /* general helpers */
 export * from './utils';
