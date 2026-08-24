@@ -31,9 +31,9 @@ const TODO_CLEAR_PREFIX_CP = 'todo_clear';
 /** Return the args of the last todo_update/todo_clear tool call in content, or null. */
 function getLatestTodoArgs(
   content: Array<TMessageContentParts | undefined> | undefined,
-): string | null {
+): string | Record<string, unknown> | null {
   if (!content) return null;
-  let lastArgs: string | null = null;
+  let lastArgs: string | Record<string, unknown> | null = null;
   for (const part of content) {
     if (!part) continue;
     const toolCall = part[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined;
@@ -561,6 +561,8 @@ const ContentParts = memo(function ContentParts({
 
   // Latest todo_update/todo_clear args for the pinned TaskList widget
   const latestTodoArgs = getLatestTodoArgs(content);
+  // Only render the sticky footer container when it would actually contain something
+  const showStickyWidgets = latestTodoArgs !== null || (isLatestMessage && effectiveIsSubmitting);
 
   // Parallel content: use dedicated renderer with columns (TMessageContentParts includes ContentMetadata)
   const hasParallelContent = safeContent.some((part) => part?.groupId != null);
