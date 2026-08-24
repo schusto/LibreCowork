@@ -45,32 +45,45 @@
  *      since a Coder agent doing rapid file edits naturally trips
  *      `toolDeduped`-based detection more often than a Writer agent.
  *
- *   3. Stall-recovery continuation probe (shouldFireStallProbe /
- *      isDoneMessage / tryReserveStallProbeSlot / resetAutoContinueCounter) —
- *      catches the opposite failure mode from (2): the agent goes IDLE with
- *      NO further tool call, mid-task, instead of repeating one. Observed
- *      live with the local qwen3.6-35b model: it narrates an intended next
- *      action ("now executing Test 2...") and then simply stops generating,
- *      no error anywhere. `trackAndDetectStuckPattern` cannot catch this —
- *      it fires on `toolDeduped > 0`, i.e. repetition, not silence. See
+ *   3. Stall-recovery continuation probe (getStallProbeTagInstruction /
+ *      shouldFireStallProbe / isDoneMessage / tryReserveStallProbeSlot /
+ *      resetAutoContinueCounter) — catches the opposite failure mode from
+ *      (2): the agent goes IDLE with NO further tool call, mid-task,
+ *      instead of repeating one. Observed live with the local qwen3.6-35b
+ *      model: it narrates an intended next action ("now executing Test
+ *      2...") and then simply stops generating, no error anywhere.
+ *      `trackAndDetectStuckPattern` cannot catch this — it fires on
+ *      `toolDeduped > 0`, i.e. repetition, not silence. See
  *      docs/37_stall_recovery_handover.md and
  *      docs/39_stall_recovery_implementation_report.md for the full design
  *      history and the reasoning trail (in particular why this ended up as
  *      a same-Run continuation re-entry rather than a separate isolated
- *      classifier call — docs/39 §2).
+ *      classifier call — docs/39 §2 — and a real over-triggering flaw
+ *      found only through live testing — docs/39 §3).
  *
- *      Unlike components 1 and 2, this one has no logic to run BEFORE the
- *      model's turn — it fires AFTER `run.processStream()` returns
- *      naturally (no HITL interrupt, no hook halt) from
+ *      Detection is anchored on an explicit completion marker
+ *      (`DONE_TAG`, default `<---DONE--->`) rather than trying to infer
+ *      completion from message shape alone: `getStallProbeTagInstruction()`
+ *      is pushed into `sharedRunContextParts` every turn (like components 1
+ *      and 2, this one DOES run before the model's turn for this part),
+ *      asking the model to append the tag whenever a response is genuinely
+ *      final. `shouldFireStallProbe()` and `isDoneMessage()` both then key
+ *      off the SAME tag — present → done, absent → continuation candidate —
+ *      applied consistently to the original response and every probe
+ *      round, rather than two different checks. A short-final-text
+ *      fallback (CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS) backs the
+ *      tag up for when tag-following itself lapses (the same instruction-
+ *      following reliability the whole feature exists because of).
+ *
+ *      The rest fires AFTER `run.processStream()` returns naturally (no
+ *      HITL interrupt, no hook halt) from
  *      `api/server/controllers/agents/client.js`'s `chatCompletion`. The
  *      caller (`AgentClient.maybeProbeStallRecovery`) inspects
- *      `run.getRunMessages()` via `shouldFireStallProbe()`: if this run
- *      produced at least one tool call before ending on a plain-text final
- *      message, that's the exact shape of the observed stall. It then
+ *      `run.getRunMessages()` via `shouldFireStallProbe()`; when true, it
  *      re-enters the SAME `Run`/`Graph` (not a new one) with one cheap
- *      nudge message asking the model to either say the single word `DONE`
- *      or continue for real — `isDoneMessage()` checks the reply.
- *      `tryReserveStallProbeSlot()` gates each attempt against a
+ *      nudge message (`STALL_PROBE_MESSAGE`) asking the model to either
+ *      print the tag or continue for real — `isDoneMessage()` checks the
+ *      reply. `tryReserveStallProbeSlot()` gates each attempt against a
  *      per-conversation cap (CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS)
  *      stored in the same `harness_supervisor_state` document as the other
  *      two components' state, so a conversation that keeps stalling is
@@ -138,21 +151,30 @@
  *   CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS  Max auto-continue probe rounds per conversation before giving up
  *                                             and leaving the turn as-is (default: 2). Resets on the next real
  *                                             user-initiated turn, not on every internal probe round.
- *   CWK_SUPERVISOR_STALL_PROBE_MESSAGE        The nudge text sent as the probe's HumanMessage (default: see
- *                                             STALL_PROBE_MESSAGE below)
- *   CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS  Only fire the probe when the run's final message text is at
- *                                             or under this length (default: 400). Added after live testing
- *                                             (docs/39_stall_recovery_implementation_report.md §5) showed the
- *                                             original trigger — any tool call this run + plain-text end — fires
- *                                             on EVERY normal tool-using turn's legitimate conclusion, not just
- *                                             genuine stalls: a real finished answer (a summary, a table) is
+ *   CWK_SUPERVISOR_STALL_PROBE_DONE_TAG       The explicit completion marker the model is asked, every turn, to
+ *                                             append to a genuinely final response (default: `<---DONE--->`).
+ *                                             Presence/absence of this exact tag is the PRIMARY stall signal —
+ *                                             see getStallProbeTagInstruction() / shouldFireStallProbe() /
+ *                                             isDoneMessage() — checked consistently on the original response
+ *                                             and every probe round. Added after live testing
+ *                                             (docs/39_stall_recovery_implementation_report.md §3, §7) showed the
+ *                                             earlier message-shape-only trigger (any tool call this run +
+ *                                             plain-text end) fires on EVERY normal tool-using turn's legitimate
+ *                                             conclusion, not just genuine stalls — a real finished answer is
  *                                             structurally identical to "narrated intent, then went idle" from
- *                                             the message shape alone, and never matches the literal "DONE" reply
- *                                             either, so it was exhausting the full auto-continue cap on every
- *                                             successful multi-tool-call turn. The actual observed stall pattern
- *                                             (docs/37 §0) is SHORT trailing narration ("now executing Test
- *                                             2..."), not a full closing answer — this is a blunt length signal,
- *                                             not the keyword/semantic detection docs/37 §4 already ruled out.
+ *                                             the message shape alone. An explicit marker the model is
+ *                                             instructed to emit is a direct signal instead of an inferred one.
+ *   CWK_SUPERVISOR_STALL_PROBE_MESSAGE        The nudge text sent as the probe's HumanMessage when the tag was
+ *                                             absent (default: see STALL_PROBE_MESSAGE below — reinforces the
+ *                                             same tag convention rather than a separate literal-"DONE" ask)
+ *   CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS  Fallback signal, only consulted when CWK_SUPERVISOR_STALL_PROBE_DONE_TAG
+ *                                             is absent: only fire the probe when the run's final message text
+ *                                             is at or under this length (default: 400). Backs the tag up for
+ *                                             when tag-following itself lapses — the actual observed stall
+ *                                             pattern (docs/37 §0) is SHORT trailing narration ("now executing
+ *                                             Test 2..."), not a full closing answer that simply forgot to tag
+ *                                             itself. A blunt length signal, not the keyword/semantic detection
+ *                                             docs/37 §4 already ruled out.
  *
  *   EMBED_URL, QDRANT_URL, QDRANT_COLL_WORK_GRAPH, QDRANT_COLL_CHATS —
  *   intentionally reuse the exact same env var names consolidate.sh already
@@ -195,10 +217,22 @@ const STALL_PROBE_MAX_CONTINUATIONS = parseInt(
   process.env.CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS ?? '2',
   10,
 );
+/**
+ * Explicit completion marker the model is asked (via getStallProbeTagInstruction(),
+ * injected into sharedRunContextParts every turn) to append when a response is
+ * genuinely final. Its PRESENCE/ABSENCE is the primary stall signal — see
+ * shouldFireStallProbe() and isDoneMessage() — replacing the earlier pass's
+ * literal-"DONE"-reply / final-text-length heuristics with one direct signal
+ * checked consistently on the original response and every probe round.
+ * Chosen to be distinctive (unlikely to appear in normal prose) and cheap to
+ * scan for with a plain substring check.
+ */
+const DONE_TAG = process.env.CWK_SUPERVISOR_STALL_PROBE_DONE_TAG ?? '<---DONE--->';
 const STALL_PROBE_MESSAGE =
   process.env.CWK_SUPERVISOR_STALL_PROBE_MESSAGE ??
-  'If there is nothing further to do, reply with exactly the single word ' +
-    'DONE and nothing else. Otherwise, continue now — call the next tool.';
+  `If the work is done and no instructions are missing just print ${DONE_TAG}, ` +
+    'otherwise continue your tasks and achieve your goal. When you are fully ' +
+    `done add ${DONE_TAG} at the end.`;
 const STALL_PROBE_MAX_FINAL_TEXT_CHARS = parseInt(
   process.env.CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS ?? '400',
   10,
@@ -540,8 +574,6 @@ async function trackAndDetectStuckPattern({ conversationId, stats, agent }) {
 
 // ── Component 3: stall-recovery continuation probe ──────────────────────────
 
-const DONE_REPLY_RE = /^\s*done\.?\s*$/i;
-
 function getMessageType(message) {
   if (!message) return undefined;
   if (typeof message._getType === 'function') return message._getType();
@@ -561,22 +593,38 @@ function extractMessageText(message) {
 }
 
 /**
+ * True when `text` contains the DONE_TAG completion marker the model was
+ * asked (via getStallProbeTagInstruction()) to append to a genuinely final
+ * response. A plain substring check — the tag is distinctive enough not to
+ * need anchoring to start/end.
+ */
+function containsDoneTag(text) {
+  return typeof text === 'string' && text.includes(DONE_TAG);
+}
+
+/**
  * Continuation candidate check, applied to the messages a single
  * `run.processStream()` call just produced (`run.getRunMessages()` —
  * scoped to that one call, not the whole conversation; see the module
  * docstring's Component 3 section). True only when this run made at least
  * one real tool call (a ToolMessage is present), ended on a plain-text
- * AIMessage with no further tool_calls, AND that final message is SHORT
- * (at or under CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS).
+ * AIMessage with no further tool_calls, AND that final message does not
+ * carry the DONE_TAG completion marker.
  *
- * The length gate exists because "tool call, then plain-text end" alone
- * cannot distinguish a genuine stall (short narrated intent, then idle)
- * from a normal, complete answer (a real summary/table after the tool
- * calls) — both have the identical message shape, and a complete answer
- * essentially never matches isDoneMessage()'s literal "DONE" either, so
- * without this gate every successful multi-tool-call turn would exhaust
- * the full auto-continue cap. See CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS
- * in the module docstring for the live-testing evidence behind this.
+ * Primary signal: DONE_TAG absence — the model is instructed every turn
+ * (getStallProbeTagInstruction()) to append DONE_TAG when genuinely
+ * finished, so its absence is a direct signal, not a proxy.
+ *
+ * Fallback signal (only reached when the tag is absent): the final message
+ * is SHORT (at or under CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS).
+ * This exists because tag-following depends on the same model reliability
+ * that's already known to be shaky — a long, clearly-complete answer that
+ * simply forgot the tag should still be treated as done rather than
+ * probed, whereas the actual observed stall pattern (docs/37 §0) is SHORT
+ * trailing narration ("now executing Test 2..."). This is the same length
+ * gate the pre-tag version of this function used as its only signal (see
+ * docs/39_stall_recovery_implementation_report.md §3); it's now a backstop
+ * behind the tag rather than the primary mechanism.
  *
  * @param {Array<{_getType?: () => string, type?: string, tool_calls?: unknown[], content?: unknown}>} runMessages
  * @returns {boolean}
@@ -589,15 +637,20 @@ function shouldFireStallProbe(runMessages) {
   if (getMessageType(last) !== 'ai') return false;
   const toolCalls = last?.tool_calls;
   if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
-  return extractMessageText(last).trim().length <= STALL_PROBE_MAX_FINAL_TEXT_CHARS;
+  const text = extractMessageText(last);
+  if (containsDoneTag(text)) return false;
+  return text.trim().length <= STALL_PROBE_MAX_FINAL_TEXT_CHARS;
 }
 
 /**
  * True when `message` is the probe's reply AND it resolved to "nothing
- * further to do" — a plain-text AIMessage (no tool_calls) whose text is,
- * loosely, just the word "DONE". Any other AI reply (including one that
- * makes a new tool call, per shouldFireStallProbe's own logic on the next
- * round) counts as a real continuation, not a DONE resolution.
+ * further to do" — a plain-text AIMessage (no tool_calls) that carries the
+ * DONE_TAG completion marker. Same tag, same check as shouldFireStallProbe
+ * uses on the original response — one consistent signal applied uniformly
+ * to every round, not a separate literal-"DONE" match. Any other AI reply
+ * (including one that makes a new tool call, per shouldFireStallProbe's own
+ * logic on the next round) counts as a real continuation, not a DONE
+ * resolution.
  *
  * @param {{_getType?: () => string, type?: string, tool_calls?: unknown[], content?: unknown}} [message]
  * @returns {boolean}
@@ -606,7 +659,7 @@ function isDoneMessage(message) {
   if (getMessageType(message) !== 'ai') return false;
   const toolCalls = message?.tool_calls;
   if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
-  return DONE_REPLY_RE.test(extractMessageText(message).trim());
+  return containsDoneTag(extractMessageText(message));
 }
 
 /**
@@ -650,6 +703,32 @@ async function resetAutoContinueCounter(conversationId) {
   await saveSupervisorState(conversationId, { autoContinueCount: 0 });
 }
 
+/**
+ * Context block establishing the DONE_TAG completion-marker convention,
+ * pushed into `sharedRunContextParts` every turn alongside the other two
+ * components (see `buildMessages` in client.js) — NOT into the agent's
+ * persistent stored system prompt, so it only applies while the harness
+ * supervisor / stall-probe feature is enabled and carries no effect on any
+ * other agent or conversation. Establishing the convention here, in the
+ * FIRST round's own context, costs nothing extra: `shouldFireStallProbe`
+ * and `isDoneMessage` both read this same tag on every subsequent round, so
+ * detection is one consistent check applied uniformly, not a separate
+ * mechanism for "was the original response done" vs "was the probe's reply
+ * done".
+ *
+ * @returns {string|null} null when the feature is disabled.
+ */
+function getStallProbeTagInstruction() {
+  if (!SUPERVISOR_ENABLED || !STALL_PROBE_ENABLED) return null;
+  return (
+    '# Harness note — completion signal\n\n' +
+    'When you have fully completed the current request and there is ' +
+    `nothing further to do, end your response with the exact tag ${DONE_TAG} ` +
+    'on its own line. If more work remains, do not include this tag — just ' +
+    'continue working.'
+  );
+}
+
 module.exports = {
   getProactiveMemoryContext,
   trackAndDetectStuckPattern,
@@ -657,5 +736,7 @@ module.exports = {
   isDoneMessage,
   tryReserveStallProbeSlot,
   resetAutoContinueCounter,
+  getStallProbeTagInstruction,
   STALL_PROBE_MESSAGE,
+  DONE_TAG,
 };

@@ -10,6 +10,7 @@ const {
   isDoneMessage,
   tryReserveStallProbeSlot,
   resetAutoContinueCounter,
+  getStallProbeTagInstruction,
   STALL_PROBE_MESSAGE,
 } = require('~/server/utils/harnessSupervisor');
 const { getBufferString, HumanMessage } = require('@librechat/agents/langchain/messages');
@@ -1670,6 +1671,11 @@ class AgentClient extends BaseClient {
     ]);
     if (proactiveContext) sharedRunContextParts.push(proactiveContext);
     if (stuckNudge) sharedRunContextParts.push(stuckNudge);
+    // [cowork] Stall-recovery: establish the DONE_TAG completion-marker
+    // convention every turn (synchronous, no I/O) — see
+    // getStallProbeTagInstruction and maybeProbeStallRecovery.
+    const stallProbeTagInstruction = getStallProbeTagInstruction();
+    if (stallProbeTagInstruction) sharedRunContextParts.push(stallProbeTagInstruction);
 
     /** Memory context (user preferences/memories). Keyed context (with memory
      *  keys + token metadata) is reserved for agents that can call
@@ -2566,11 +2572,12 @@ class AgentClient extends BaseClient {
    *
    * Known limitation (see docs/39): because the probe reuses the live
    * stream rather than a separate invisible classifier call, a probe that
-   * resolves to "DONE" is not fully invisible — the literal word "DONE" can
-   * briefly reach the client as trailing content before the turn finalizes.
-   * Judged an acceptable, explicitly-documented trade-off for this pass
-   * rather than building a second, provider-agnostic isolated-completion
-   * path purely to suppress it.
+   * resolves to done is not fully invisible — the DONE_TAG completion
+   * marker (see harnessSupervisor.js's getStallProbeTagInstruction /
+   * isDoneMessage) can briefly reach the client as trailing content before
+   * the turn finalizes. Judged an acceptable, explicitly-documented
+   * trade-off for this pass rather than building a second, provider-
+   * agnostic isolated-completion path purely to suppress it.
    *
    * @param {AgentRun} run
    * @param {Partial<GraphRunnableConfig>} config
