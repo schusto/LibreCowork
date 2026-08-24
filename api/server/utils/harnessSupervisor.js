@@ -217,6 +217,21 @@ const STATE_TTL_MS = parseInt(
 
 const STALL_PROBE_ENABLED =
   (process.env.CWK_SUPERVISOR_STALL_PROBE_ENABLED ?? 'true').toLowerCase() !== 'false';
+/**
+ * Separate, narrower switch from STALL_PROBE_ENABLED above. Detection (the
+ * DONE_TAG instruction, shouldFireStallProbe, and the debug-level "willFire"
+ * log in AgentClient.maybeProbeStallRecovery) stays fully active regardless
+ * of this flag — only the actual re-entry into `run.processStream()` is
+ * gated. Defaults to DISABLED: live testing confirmed re-entering the same
+ * Run/Graph a second time corrupts message ordering and silently drops
+ * content from the live view until a reload (see
+ * docs/40_stall_recovery_architecture_handover.md for the full incident and
+ * the investigated alternatives). Detection remains on so the debug log
+ * still shows how often a real stall would have fired, informing whatever
+ * continuation mechanism replaces the re-entry approach.
+ */
+const STALL_PROBE_REENTRY_ENABLED =
+  (process.env.CWK_SUPERVISOR_STALL_PROBE_REENTRY_ENABLED ?? 'false').toLowerCase() === 'true';
 const STALL_PROBE_MAX_CONTINUATIONS = parseInt(
   process.env.CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS ?? '2',
   10,
@@ -680,7 +695,9 @@ function isDoneMessage(message) {
  * @returns {Promise<boolean>}
  */
 async function tryReserveStallProbeSlot(conversationId) {
-  if (!SUPERVISOR_ENABLED || !STALL_PROBE_ENABLED || !conversationId) return false;
+  if (!SUPERVISOR_ENABLED || !STALL_PROBE_ENABLED || !STALL_PROBE_REENTRY_ENABLED || !conversationId) {
+    return false;
+  }
   try {
     const state = await loadSupervisorState(conversationId);
     const count = state?.autoContinueCount || 0;
@@ -743,4 +760,5 @@ module.exports = {
   getStallProbeTagInstruction,
   STALL_PROBE_MESSAGE,
   DONE_TAG,
+  STALL_PROBE_REENTRY_ENABLED,
 };

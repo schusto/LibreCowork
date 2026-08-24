@@ -12,6 +12,7 @@ const {
   resetAutoContinueCounter,
   getStallProbeTagInstruction,
   STALL_PROBE_MESSAGE,
+  STALL_PROBE_REENTRY_ENABLED,
 } = require('~/server/utils/harnessSupervisor');
 const { getBufferString, HumanMessage } = require('@librechat/agents/langchain/messages');
 const {
@@ -2631,6 +2632,19 @@ class AgentClient extends BaseClient {
           `willFire=${willFire} newMessages=${newRunMessages.length}`,
       );
       if (!willFire) {
+        return;
+      }
+      if (!STALL_PROBE_REENTRY_ENABLED) {
+        /** INFO-level (not debug): a genuine stall was detected but re-entry
+         *  is disabled by default pending an architectural redesign (see
+         *  docs/40_stall_recovery_architecture_handover.md) — the
+         *  processStream() re-entry mechanism was confirmed to corrupt
+         *  message ordering and suppress live delivery. This line is the
+         *  telemetry that informs how often the redesign actually matters. */
+        logger.info(
+          `[AgentClient] conv=${convLabel} stall detected but re-entry is disabled ` +
+            `(CWK_SUPERVISOR_STALL_PROBE_REENTRY_ENABLED=false) — see docs/40`,
+        );
         return;
       }
 
