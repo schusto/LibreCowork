@@ -58,6 +58,16 @@ RUN \
 
 COPY --chown=node:node . .
 
+# [cowork] Apply local dependency patches. Must run AFTER the source copy
+# above: `patches/` does not exist in the image at `npm ci` time (only the
+# package.json files are copied before install), so a `postinstall` hook could
+# never see it. Applied with `git apply` — git is already installed, `patch`
+# is not, and this avoids a devDependency plus a lockfile change. No `|| true`:
+# a patch that stops applying (e.g. after a dependency bump) must fail the
+# build loudly rather than silently dropping the behaviour it adds.
+# See patches/README.md and docs/41_stall_recovery_stop_hook_report.md.
+RUN for p in patches/*.patch; do [ -e "$p" ] || continue; echo "Applying $p" && git apply -p1 "$p"; done
+
 RUN \
     # Export NODE_OPTIONS so the memory limit is inherited by every npm
     # subprocess — including the nested `vite build` inside client/ — not

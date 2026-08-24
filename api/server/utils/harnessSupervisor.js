@@ -45,9 +45,10 @@
  *      since a Coder agent doing rapid file edits naturally trips
  *      `toolDeduped`-based detection more often than a Writer agent.
  *
- *   3. Stall-recovery continuation probe (getStallProbeTagInstruction /
- *      shouldFireStallProbe / isDoneMessage / tryReserveStallProbeSlot /
- *      resetAutoContinueCounter) — catches the opposite failure mode from
+ *   3. Stall-recovery continuation (getStallProbeTagInstruction /
+ *      shouldFireStallProbe / createStallRecoveryStopHook /
+ *      tryReserveStallProbeSlot / resetAutoContinueCounter) — catches the
+ *      opposite failure mode from
  *      (2): the agent goes IDLE with NO further tool call, mid-task,
  *      instead of repeating one. Observed live with the local qwen3.6-35b
  *      model: it narrates an intended next action ("now executing Test
@@ -56,10 +57,12 @@
  *      `toolDeduped > 0`, i.e. repetition, not silence. See
  *      docs/37_stall_recovery_handover.md and
  *      docs/39_stall_recovery_implementation_report.md for the full design
- *      history and the reasoning trail (in particular why this ended up as
- *      a same-Run continuation re-entry rather than a separate isolated
- *      classifier call — docs/39 §2 — and a real over-triggering flaw
- *      found only through live testing — docs/39 §3).
+ *      history and the reasoning trail (in particular why this continues
+ *      the same run rather than making a separate isolated classifier call
+ *      — docs/39 §2 — and a real over-triggering flaw found only through
+ *      live testing — docs/39 §3), and
+ *      docs/41_stall_recovery_stop_hook_report.md for the mechanism that
+ *      actually delivers the continuation.
  *
  *      Detection is anchored on an explicit completion marker
  *      (`DONE_TAG`, default `<---DONE--->`) rather than trying to infer
@@ -67,10 +70,13 @@
  *      is pushed into `sharedRunContextParts` every turn (like components 1
  *      and 2, this one DOES run before the model's turn for this part),
  *      asking the model to append the tag whenever a response is genuinely
- *      final. `shouldFireStallProbe()` and `isDoneMessage()` both then key
- *      off the SAME tag — present → done, absent → continuation candidate —
- *      applied consistently to the original response and every probe
- *      round, rather than two different checks. DONE_TAG absence is the
+ *      final. `shouldFireStallProbe()` then keys off that tag — present →
+ *      done, absent → continuation candidate — applied consistently to the
+ *      original response and every continuation round by the same
+ *      predicate. (`isDoneMessage()` applied the identical test to the
+ *      probe's reply back when the two rounds were checked separately; it
+ *      is kept and still unit-tested, but the live path no longer needs it
+ *      — one predicate now covers every round.) DONE_TAG absence is the
  *      SOLE signal — an earlier length-based fallback ("only fire if the
  *      final text was also short") was tried and removed after live
  *      testing showed it silently suppressed the probe on a genuinely
@@ -79,15 +85,19 @@
  *      incident and shouldFireStallProbe()'s own docstring for the
  *      reasoning behind removing it rather than tuning the threshold).
  *
- *      The rest fires AFTER `run.processStream()` returns naturally (no
- *      HITL interrupt, no hook halt) from
- *      `api/server/controllers/agents/client.js`'s `chatCompletion`. The
- *      caller (`AgentClient.maybeProbeStallRecovery`) inspects
- *      `run.getRunMessages()` via `shouldFireStallProbe()`; when true, it
- *      re-enters the SAME `Run`/`Graph` (not a new one) with one cheap
- *      nudge message (`STALL_PROBE_MESSAGE`) asking the model to either
- *      print the tag or continue for real — `isDoneMessage()` checks the
- *      reply. `tryReserveStallProbeSlot()` gates each attempt against a
+ *      The continuation itself runs as a `Stop` hook
+ *      (`createStallRecoveryStopHook()`), registered on the run by
+ *      `createRun` and dispatched by the SDK at natural completion (no HITL
+ *      interrupt, no hook halt). The hook inspects the run's messages via
+ *      `shouldFireStallProbe()`; when true it returns
+ *      `{ decision: 'block', reason: STALL_PROBE_MESSAGE }`, which makes the
+ *      SDK re-enter the stream IN PLACE — inside the same `processStream()`
+ *      call — with that nudge appended, asking the model to either print the
+ *      tag or continue for real. Because nothing resets between rounds, the
+ *      continuation streams to the client exactly like an ordinary extra
+ *      model turn. An earlier design called `processStream()` a second time
+ *      from the host instead; that could not render correctly and is
+ *      dissected in docs/41 §2. `tryReserveStallProbeSlot()` gates each attempt against a
  *      per-conversation cap (CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS)
  *      stored in the same `harness_supervisor_state` document as the other
  *      two components' state, so a conversation that keeps stalling is
@@ -95,7 +105,7 @@
  *      manual "regenerate 2-3 times" recovery habit) and then left alone.
  *      `resetAutoContinueCounter()` resets that count once per real
  *      user-initiated turn (called from `buildMessages`, NOT from inside
- *      the probe itself, so internal probe rounds don't reset their own cap).
+ *      the hook itself, so continuation rounds don't reset their own cap).
  *
  * Both functions fail open: on timeout, network error, Mongo error, or
  * missing config, they return null and the turn proceeds exactly as it does
@@ -158,9 +168,9 @@
  *   CWK_SUPERVISOR_STALL_PROBE_DONE_TAG       The explicit completion marker the model is asked, every turn, to
  *                                             append to a genuinely final response (default: `<---DONE--->`).
  *                                             Presence/absence of this exact tag is the PRIMARY stall signal —
- *                                             see getStallProbeTagInstruction() / shouldFireStallProbe() /
- *                                             isDoneMessage() — checked consistently on the original response
- *                                             and every probe round. Added after live testing
+ *                                             see getStallProbeTagInstruction() / shouldFireStallProbe() —
+ *                                             checked consistently on the original response
+ *                                             and every continuation round. Added after live testing
  *                                             (docs/39_stall_recovery_implementation_report.md §3, §7) showed the
  *                                             earlier message-shape-only trigger (any tool call this run +
  *                                             plain-text end) fires on EVERY normal tool-using turn's legitimate
@@ -168,9 +178,12 @@
  *                                             structurally identical to "narrated intent, then went idle" from
  *                                             the message shape alone. An explicit marker the model is
  *                                             instructed to emit is a direct signal instead of an inferred one.
- *   CWK_SUPERVISOR_STALL_PROBE_MESSAGE        The nudge text sent as the probe's HumanMessage when the tag was
+ *   CWK_SUPERVISOR_STALL_PROBE_MESSAGE        The nudge text appended as a message when the tag was
  *                                             absent (default: see STALL_PROBE_MESSAGE below — reinforces the
  *                                             same tag convention rather than a separate literal-"DONE" ask)
+ *   CWK_SUPERVISOR_STALL_PROBE_REENTRY_ENABLED  Whether to register the `Stop` hook that actually performs the
+ *                                             continuation (default: false). See STALL_PROBE_REENTRY_ENABLED
+ *                                             below for why it is still opt-in, and docs/41 for the mechanism.
  *
  *   (No length-based fallback exists — DONE_TAG absence is the sole trigger
  *   signal. A CWK_SUPERVISOR_STALL_PROBE_MAX_FINAL_TEXT_CHARS fallback was
@@ -218,17 +231,28 @@ const STATE_TTL_MS = parseInt(
 const STALL_PROBE_ENABLED =
   (process.env.CWK_SUPERVISOR_STALL_PROBE_ENABLED ?? 'true').toLowerCase() !== 'false';
 /**
- * Separate, narrower switch from STALL_PROBE_ENABLED above. Detection (the
- * DONE_TAG instruction, shouldFireStallProbe, and the debug-level "willFire"
- * log in AgentClient.maybeProbeStallRecovery) stays fully active regardless
- * of this flag — only the actual re-entry into `run.processStream()` is
- * gated. Defaults to DISABLED: live testing confirmed re-entering the same
- * Run/Graph a second time corrupts message ordering and silently drops
- * content from the live view until a reload (see
- * docs/40_stall_recovery_architecture_handover.md for the full incident and
- * the investigated alternatives). Detection remains on so the debug log
- * still shows how often a real stall would have fired, informing whatever
- * continuation mechanism replaces the re-entry approach.
+ * Separate, narrower switch from STALL_PROBE_ENABLED above: it gates whether
+ * the `Stop` hook that performs the continuation is registered at all.
+ * Detection-side behaviour (the DONE_TAG instruction pushed into every turn's
+ * context) is governed by STALL_PROBE_ENABLED and stays active regardless.
+ *
+ * Still defaults to DISABLED, but for a different reason than before. The
+ * mechanism it gates has CHANGED: it used to re-enter `run.processStream()`
+ * from the host after the first call returned, which live testing showed
+ * corrupts message ordering and drops content from the live view until a
+ * reload (docs/40). That approach is gone — root-caused (docs/41 §2) to
+ * `Graph.clearHeavyState()` running in `processStream`'s `finally` and wiping
+ * the content bookkeeping and handler registry the second call needed. The
+ * continuation now happens inside the SDK's own stream loop via a `Stop`
+ * hook, which is mechanically verified to append content in the correct
+ * order (docs/41 §3). The default stays `false` only because that has not yet
+ * been confirmed against a LIVE conversation — every prior live run in this
+ * feature's history surfaced a real bug the mechanical tests missed (docs/39
+ * §3, §8, §10). Flip to `true` for that live run.
+ *
+ * Requires the local `@librechat/agents` patch (`patches/`, docs/41 §4). On an
+ * unpatched SDK the hook still runs and logs, but its decision is discarded
+ * and the run finalizes normally — inert, never corrupting.
  */
 const STALL_PROBE_REENTRY_ENABLED =
   (process.env.CWK_SUPERVISOR_STALL_PROBE_REENTRY_ENABLED ?? 'false').toLowerCase() === 'true';
@@ -750,8 +774,74 @@ function getStallProbeTagInstruction() {
   );
 }
 
+/**
+ * Build the `Stop`-hook that drives stall-recovery continuation, or undefined
+ * when the feature is off. Registered on the run's HookRegistry by
+ * `createRun` and dispatched by the SDK at natural run completion; returning
+ * `decision: 'block'` re-enters the stream IN PLACE, inside the same
+ * `processStream()` call, so the continuation streams to the client exactly
+ * like an ordinary extra model turn.
+ *
+ * This replaced an earlier design that called `run.processStream()` a SECOND
+ * time from the host after the first returned. That could never render
+ * correctly: `processStream`'s `finally` calls `Graph.clearHeavyState()`,
+ * which wipes `contentData`/`contentIndexMap` (so the next call's content
+ * indices restart at 0 and collide with content already on screen) and drops
+ * the Graph's `handlerRegistry` (so the continuation never reaches the
+ * client at all). `streamOptions.keepContent` does not help — it only guards
+ * `resetValues()`, which runs long after the damage. See
+ * `docs/41_stall_recovery_stop_hook_report.md` §2.
+ *
+ * The hook is deliberately the ONLY policy site: it reuses
+ * `shouldFireStallProbe()` unchanged and `tryReserveStallProbeSlot()` for the
+ * cap, so detection semantics are identical to every prior pass.
+ *
+ * One scoping difference worth knowing: the SDK hands the hook
+ * `graph.getRunMessages()`, which — because a continuation never resets the
+ * Graph's run boundary — accumulates across rounds rather than being just the
+ * latest round's output. `shouldFireStallProbe` handles that correctly (it
+ * tests the LAST message for plain-text-with-no-DONE_TAG and only asks
+ * whether a tool call happened at all), and it makes the "did this turn use
+ * tools" test span the whole turn instead of one round, which is the more
+ * faithful reading. It also subsumes the old `isDoneMessage()` check on the
+ * probe reply: one predicate now covers every round.
+ *
+ * @param {string} [conversationId]
+ * @returns {((input: {messages?: unknown[], stopHookActive?: boolean}) => Promise<object>)|undefined}
+ */
+function createStallRecoveryStopHook(conversationId) {
+  if (!SUPERVISOR_ENABLED || !STALL_PROBE_ENABLED || !STALL_PROBE_REENTRY_ENABLED || !conversationId) {
+    return undefined;
+  }
+  const convLabel = conversationId.slice(-8);
+  return async function stallRecoveryStopHook(input) {
+    if (!shouldFireStallProbe(input?.messages)) {
+      /** Debug-level either way: a silent non-firing decision was previously
+       *  diagnosable only by querying Mongo directly (docs/39 §10). */
+      logger.debug(
+        `[harnessSupervisor] conv=${convLabel} stall-recovery Stop hook: no continuation needed`,
+      );
+      return {};
+    }
+    /** Cap is authoritative and fails closed; see tryReserveStallProbeSlot. */
+    const reserved = await tryReserveStallProbeSlot(conversationId);
+    if (!reserved) {
+      logger.info(
+        `[harnessSupervisor] conv=${convLabel} stall detected but auto-continue cap reached`,
+      );
+      return {};
+    }
+    logger.info(
+      `[harnessSupervisor] conv=${convLabel} stall detected — blocking Stop to continue ` +
+        `(stopHookActive=${input?.stopHookActive === true})`,
+    );
+    return { decision: 'block', reason: STALL_PROBE_MESSAGE };
+  };
+}
+
 module.exports = {
   getProactiveMemoryContext,
+  createStallRecoveryStopHook,
   trackAndDetectStuckPattern,
   shouldFireStallProbe,
   isDoneMessage,

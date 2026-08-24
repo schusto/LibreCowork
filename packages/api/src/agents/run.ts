@@ -1186,6 +1186,7 @@ export async function createRun({
   steering,
   activityLabel,
   activityPhase,
+  stallRecovery,
   hitlCapable = false,
   toolInputValidationErrors,
   sessionStartSource,
@@ -1267,6 +1268,17 @@ export async function createRun({
   activityLabel?: { hook: HookCallback<'PostToolBatch'> };
   /** Run-wide parent phase collector; registered after child batch labels. */
   activityPhase?: { hook: HookCallback<'PostToolBatch'> };
+  /**
+   * Harness-supervisor stall recovery (Stop). Returning `decision: 'block'`
+   * from this hook makes the SDK re-enter the stream in place instead of
+   * finalizing the run, so a stalled agent continues inside the SAME
+   * `processStream()` call and streams to the client like an ordinary extra
+   * turn. Requires the local `@librechat/agents` patch that acts on the
+   * folded stop decision (`patches/`, see docs/41) — on an unpatched SDK the
+   * hook still runs and logs, but the decision is discarded and the run
+   * finalizes as before, which is a safe no-op.
+   */
+  stallRecovery?: { hook: HookCallback<'Stop'> };
   /**
    * Whether the caller implements the HITL pause/resume lifecycle (inspects
    * `run.getInterrupt()`, persists a pending action, exposes a resume route). Gates the
@@ -1641,6 +1653,13 @@ export async function createRun({
   if (activityPhase != null) {
     hooks = hooks ?? new HookRegistry();
     hooks.register('PostToolBatch', { hooks: [activityPhase.hook] });
+  }
+  /** Stall recovery is a completion-time decision, so it rides `Stop` rather
+   *  than a tool-batch boundary — nothing about it interacts with the label /
+   *  steer ordering above. */
+  if (stallRecovery != null) {
+    hooks = hooks ?? new HookRegistry();
+    hooks.register('Stop', { hooks: [stallRecovery.hook] });
   }
   if (steering != null && isSteeringSupported()) {
     hooks = hooks ?? new HookRegistry();

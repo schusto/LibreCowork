@@ -6,13 +6,9 @@ const { applyContextReductionWithStats } = require('~/server/utils/contextReduct
 const {
   getProactiveMemoryContext,
   trackAndDetectStuckPattern,
-  shouldFireStallProbe,
-  isDoneMessage,
-  tryReserveStallProbeSlot,
+  createStallRecoveryStopHook,
   resetAutoContinueCounter,
   getStallProbeTagInstruction,
-  STALL_PROBE_MESSAGE,
-  STALL_PROBE_REENTRY_ENABLED,
 } = require('~/server/utils/harnessSupervisor');
 const { getBufferString, HumanMessage } = require('@librechat/agents/langchain/messages');
 const {
@@ -1666,15 +1662,15 @@ class AgentClient extends BaseClient {
         agent: this.options?.agent,
       }),
       // [cowork] Stall-recovery: reset the per-conversation auto-continue cap
-      // once per real user-initiated turn — see maybeProbeStallRecovery and
-      // docs/39_stall_recovery_implementation_report.md.
+      // once per real user-initiated turn — see createStallRecoveryStopHook and
+      // docs/41_stall_recovery_stop_hook_report.md.
       resetAutoContinueCounter(this.conversationId),
     ]);
     if (proactiveContext) sharedRunContextParts.push(proactiveContext);
     if (stuckNudge) sharedRunContextParts.push(stuckNudge);
     // [cowork] Stall-recovery: establish the DONE_TAG completion-marker
     // convention every turn (synchronous, no I/O) — see
-    // getStallProbeTagInstruction and maybeProbeStallRecovery.
+    // getStallProbeTagInstruction and createStallRecoveryStopHook.
     const stallProbeTagInstruction = getStallProbeTagInstruction();
     if (stallProbeTagInstruction) sharedRunContextParts.push(stallProbeTagInstruction);
 
@@ -2545,156 +2541,6 @@ class AgentClient extends BaseClient {
   }
 
   /**
-   * Stall-recovery continuation probe. See
-   * `api/server/utils/harnessSupervisor.js`'s Component 3 docstring for the
-   * full design, `docs/37_stall_recovery_handover.md` for the original
-   * problem writeup, and `docs/39_stall_recovery_implementation_report.md`
-   * for the implementation notes and known limitations.
-   *
-   * Called only from `chatCompletion`'s `runAgents`, right after a NATURAL
-   * completion of `run.processStream()` (no HITL interrupt, no hook halt) —
-   * never from `resumeCompletion` (deliberate scope cut: the observed stall
-   * happens on ordinary multi-tool-call turns, not mid-HITL-resume; see
-   * docs/39 for the reasoning).
-   *
-   * On each round: if this run's messages show the "narrated intent, then
-   * went idle" shape (`shouldFireStallProbe`) and a probe slot is still
-   * available for this conversation (`tryReserveStallProbeSlot`, capped by
-   * CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS), re-enters the SAME `run`
-   * object with one more `processStream()` call carrying a cheap
-   * DONE-or-continue nudge. Reuses the SAME live `config`/`customHandlers`
-   * the original call used (they're baked into the `run`/`Graph` at
-   * construction, not swappable per-call), which is what lets a genuine
-   * continuation stream to the client exactly like any other multi-tool-call
-   * round. `keepContent: true` is passed so the Graph's content-position
-   * bookkeeping (`contentData`/`contentIndexMap`) carries over instead of
-   * resetting, so the continuation's streamed content appends after the
-   * original response rather than restarting position indices at zero.
-   *
-   * Known limitation (see docs/39): because the probe reuses the live
-   * stream rather than a separate invisible classifier call, a probe that
-   * resolves to done is not fully invisible — the DONE_TAG completion
-   * marker (see harnessSupervisor.js's getStallProbeTagInstruction /
-   * isDoneMessage) can briefly reach the client as trailing content before
-   * the turn finalizes. Judged an acceptable, explicitly-documented
-   * trade-off for this pass rather than building a second, provider-
-   * agnostic isolated-completion path purely to suppress it.
-   *
-   * @param {AgentRun} run
-   * @param {Partial<GraphRunnableConfig>} config
-   * @param {{ initialMessages: unknown[], activityPhase: unknown, streamId?: string }} ctx
-   */
-  async maybeProbeStallRecovery(run, config, { initialMessages, activityPhase, streamId }) {
-    if (!run || typeof run.getRunMessages !== 'function') {
-      return;
-    }
-    if (typeof run.getInterrupt === 'function' && run.getInterrupt()?.payload) {
-      return;
-    }
-    if (typeof run.getHaltReason === 'function' && run.getHaltReason()) {
-      return;
-    }
-
-    const convLabel = this.conversationId ? this.conversationId.slice(-8) : 'unknown';
-    // Pure safety backstop independent of the Mongo-tracked cap
-    // (tryReserveStallProbeSlot is already authoritative and fails closed on
-    // error) — guards only against a bug turning this into an infinite loop.
-    const MAX_ROUNDS_SAFETY = 5;
-
-    /**
-     * Running reconstruction of the full conversation-so-far. Without a
-     * checkpointer, LangGraph state does not persist across separate
-     * `processStream()` calls (see docs/39 §1), so every round must be fed
-     * the COMPLETE history explicitly — not just the round that just
-     * finished. `run.getRunMessages()` only ever returns the messages
-     * produced by the MOST RECENTLY completed round (the SDK resets its
-     * boundary at the start of every `processStream()` call), so this must
-     * be accumulated across iterations, not reconstructed fresh from
-     * `initialMessages` each time — reconstructing fresh each round was a
-     * real bug found live (docs/39 §9): round 2+ would silently drop
-     * everything from earlier rounds, leaving the model to continue with no
-     * memory of tool results it had already produced.
-     */
-    let history = initialMessages;
-
-    for (let round = 0; round < MAX_ROUNDS_SAFETY; round++) {
-      const newRunMessages = run.getRunMessages() ?? [];
-      history = [...history, ...newRunMessages];
-
-      const willFire = shouldFireStallProbe(newRunMessages);
-      /** Debug-level so it doesn't add INFO-log noise in normal operation,
-       *  but logs the decision either way — firing was previously the only
-       *  logged outcome, which made a real incident (docs/39 §10: the probe
-       *  silently declining to fire on a genuinely incomplete response)
-       *  needing a direct Mongo query to diagnose instead of a log grep. */
-      logger.debug(
-        `[AgentClient] conv=${convLabel} stall-recovery check (round ${round + 1}): ` +
-          `willFire=${willFire} newMessages=${newRunMessages.length}`,
-      );
-      if (!willFire) {
-        return;
-      }
-      if (!STALL_PROBE_REENTRY_ENABLED) {
-        /** INFO-level (not debug): a genuine stall was detected but re-entry
-         *  is disabled by default pending an architectural redesign (see
-         *  docs/40_stall_recovery_architecture_handover.md) — the
-         *  processStream() re-entry mechanism was confirmed to corrupt
-         *  message ordering and suppress live delivery. This line is the
-         *  telemetry that informs how often the redesign actually matters. */
-        logger.info(
-          `[AgentClient] conv=${convLabel} stall detected but re-entry is disabled ` +
-            `(CWK_SUPERVISOR_STALL_PROBE_REENTRY_ENABLED=false) — see docs/40`,
-        );
-        return;
-      }
-
-      const reserved = await tryReserveStallProbeSlot(this.conversationId);
-      if (!reserved) {
-        return;
-      }
-
-      logger.info(
-        `[AgentClient] conv=${convLabel} stall-recovery probe firing (round ${round + 1})`,
-      );
-
-      const probeMessage = new HumanMessage(STALL_PROBE_MESSAGE);
-      history = [...history, probeMessage];
-
-      try {
-        await run.processStream(
-          { messages: history },
-          config,
-          { callbacks: { [Callback.TOOL_ERROR]: logToolError }, keepContent: true },
-        );
-      } catch (err) {
-        logger.warn(`[AgentClient] conv=${convLabel} stall-recovery probe failed: ${err?.message ?? err}`);
-        return;
-      }
-
-      this.completeActivityPhase(run, activityPhase);
-      await this.handleRunInterrupt(run, streamId);
-
-      if (typeof run.getInterrupt === 'function' && run.getInterrupt()?.payload) {
-        return;
-      }
-      if (typeof run.getHaltReason === 'function' && run.getHaltReason()) {
-        return;
-      }
-
-      const probeRunMessages = run.getRunMessages() ?? [];
-      const probeReply = probeRunMessages[probeRunMessages.length - 1];
-      if (isDoneMessage(probeReply)) {
-        logger.info(`[AgentClient] conv=${convLabel} stall-recovery probe resolved DONE`);
-        return;
-      }
-      // Not DONE: the SDK's own loop is now standing as the natural
-      // continuation of this turn — loop once more in case it stalls again.
-      // `history` gets this round's new messages appended at the top of
-      // the next iteration, same as every prior round.
-    }
-  }
-
-  /**
    * Surface any human-in-the-loop interrupt the SDK captured during the most
    * recent `processStream` / `resume`. When the run paused for tool approval (or
    * an ask-user question), mark the job `requires_action`, persist the pending
@@ -3172,6 +3018,11 @@ class AgentClient extends BaseClient {
 
         const activityLabel = this.buildActivityLabelWiring(streamId, abortController.signal);
         const activityPhase = this.buildActivityPhaseWiring(streamId, abortController.signal);
+        /** [cowork] Stall-recovery `Stop` hook; undefined when the feature is
+         *  disabled, which registers no hook at all. Deliberately scoped to
+         *  chatCompletion — `resumeCompletion` stays untouched, same as the
+         *  probe loop this replaced (docs/39 §2). */
+        const stallRecoveryHook = createStallRecoveryStopHook(this.conversationId);
         const offsetHandlers = createSteerIndexOffsetHandlers(
           this.options.eventHandlers,
           this.steerOffsetState,
@@ -3191,6 +3042,14 @@ class AgentClient extends BaseClient {
           steering: this.buildSteerWiring(streamId),
           activityLabel,
           activityPhase,
+          // [cowork] Harness supervisor, component 3: stall recovery. The hook
+          // fires at natural run completion and, when the turn stalled without
+          // the DONE_TAG marker, returns `decision: 'block'` so the SDK
+          // continues the SAME run in place rather than finalizing it.
+          // `undefined` (feature off, or no conversation id) registers nothing.
+          // Replaces the old post-hoc `processStream()` re-entry loop, which
+          // could not render correctly — see docs/41.
+          ...(stallRecoveryHook && { stallRecovery: { hook: stallRecoveryHook } }),
           indexTokenCountMap,
           initialSummary,
           initialSessions,
@@ -3275,16 +3134,6 @@ class AgentClient extends BaseClient {
         // `requires_action` + emit the prompt and leave the turn unfinalized
         // (the resume route continues it). No-op when the run completed.
         await this.handleRunInterrupt(run, streamId);
-
-        // [cowork] Stall-recovery continuation probe — fires only on a
-        // natural completion (handleRunInterrupt above is a no-op in that
-        // case). See maybeProbeStallRecovery and
-        // docs/39_stall_recovery_implementation_report.md.
-        await this.maybeProbeStallRecovery(run, config, {
-          initialMessages,
-          activityPhase,
-          streamId,
-        });
 
         config.signal = null;
       };

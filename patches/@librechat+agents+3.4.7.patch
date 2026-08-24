@@ -1,0 +1,188 @@
+diff --git a/node_modules/@librechat/agents/dist/cjs/run.cjs b/node_modules/@librechat/agents/dist/cjs/run.cjs
+--- a/node_modules/@librechat/agents/dist/cjs/run.cjs
++++ b/node_modules/@librechat/agents/dist/cjs/run.cjs
+@@ -27,6 +27,13 @@
+ let _langchain_langgraph = require("@langchain/langgraph");
+ let _langchain_core_messages = require("@langchain/core/messages");
+ //#region src/run.ts
++/**
++ * cowork: hard upper bound on how many times a `Stop` hook may re-enter the
++ * stream via `decision: 'block'` within a single `processStream()` call. This
++ * is a pure runaway backstop, NOT the policy limit — the registered hook is
++ * expected to enforce its own (much smaller) cap and stop returning `block`.
++ */
++const MAX_STOP_HOOK_CONTINUATIONS = 10;
+ const defaultOmitOptions = new Set([
+ 	"stream",
+ 	"thinking",
+@@ -719,7 +726,21 @@
+ 			* arg to `BaseGraphState`. Cast on the call so the resume path
+ 			* type-checks without widening the wrapper for every caller.
+ 			*/
+-			const stream = graphRunnable.streamEvents(inputs, config, {
++			/**
++			 * cowork: `Stop`-hook-driven continuation loop. When a registered
++			 * `Stop` hook returns `decision: 'block'`, the run does NOT finalize —
++			 * the stream is re-entered in place with the hook's reason appended as
++			 * a nudge message. Because this happens INSIDE `consumeStream`, no
++			 * `resetValues()` and no `clearHeavyState()` has run: the Graph's
++			 * `contentData`/`contentIndexMap` keep appending and the handler
++			 * registry is still live, so the continuation streams to the host
++			 * exactly like an ordinary extra model turn. Re-entering via a second
++			 * `processStream()` call instead corrupts both (see docs/41).
++			 */
++			let continuationInputs = inputs;
++			let continuationRounds = 0;
++			for (;;) {
++			const stream = graphRunnable.streamEvents(continuationInputs, config, {
+ 				raiseError: true,
+ 				/**
+ 				* Prevent EventStreamCallbackHandler from processing custom events.
+@@ -819,7 +840,8 @@
+ 			* misleading). The host fires Stop on the resumed-and-completed
+ 			* run instead.
+ 			*/
+-			if (this._interrupt == null && this._haltedReason == null && this.hookRegistry?.hasHookFor("Stop", this.id) === true) await require_executeHooks.executeHooks({
++			let stopAggregate;
++			if (this._interrupt == null && this._haltedReason == null && this.hookRegistry?.hasHookFor("Stop", this.id) === true) stopAggregate = await require_executeHooks.executeHooks({
+ 				registry: this.hookRegistry,
+ 				input: {
+ 					hook_event_name: "Stop",
+@@ -835,11 +857,41 @@
+ 					* is reserved for the boundary that simply had nothing to inject.
+ 					*/
+ 					stopReason: graph.preemptHaltReason ?? (graph.preemptIncomplete ? "preempt_incomplete" : void 0),
+-					stopHookActive: false
++					/**
++					 * cowork: Claude Code semantics — true once a `Stop` hook has
++					 * already blocked at least once in this run, so a hook can tell a
++					 * first stop from a re-entry and decline to block forever.
++					 */
++					stopHookActive: continuationRounds > 0
+ 				},
+ 				sessionId: this.id
+-			}).catch(() => {});
++			}).catch(() => void 0);
+ 			/**
++			 * cowork: act on the decision the fold logic in `executeHooks` already
++			 * computes. `block` means "do not finalize, keep going": append the
++			 * hook's reason as a nudge and re-enter the stream with the full
++			 * conversation so far. Without a checkpointer LangGraph keeps no state
++			 * between invocations, so the complete message list must be re-supplied
++			 * explicitly — `graph.messages` is the reduced state from the round that
++			 * just finished, which is exactly that.
++			 */
++			if (stopAggregate?.stopDecision === "block" && continuationRounds < MAX_STOP_HOOK_CONTINUATIONS && Array.isArray(graph.messages) && graph.messages.length > 0) {
++				continuationRounds++;
++				continuationInputs = { messages: [...graph.messages, new _langchain_core_messages.HumanMessage({
++					content: stopAggregate.reason ?? "Continue.",
++					/**
++					 * Same convention `runPreStreamHooks` uses for hook-supplied
++					 * context: a user-role message carrying `role: 'system'` metadata,
++					 * because a mid-conversation `SystemMessage` is rejected by the
++					 * Anthropic and Google providers.
++					 */
++					additional_kwargs: { role: "system", source: "hook" }
++				})] };
++				continue;
++			}
++			break;
++			}
++			/**
+ 			* A `PreemptBoundary` hook that returned `preventContinuation` has its
+ 			* registry halt cleared by the graph — that is what stops the halt from
+ 			* cancelling the stream before the sealed turn commits — so the reason
+diff --git a/node_modules/@librechat/agents/dist/esm/run.mjs b/node_modules/@librechat/agents/dist/esm/run.mjs
+--- a/node_modules/@librechat/agents/dist/esm/run.mjs
++++ b/node_modules/@librechat/agents/dist/esm/run.mjs
+@@ -27,6 +27,13 @@
+ import { Command, INTERRUPT, MemorySaver, isInterrupted } from "@langchain/langgraph";
+ import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from "@langchain/core/messages";
+ //#region src/run.ts
++/**
++ * cowork: hard upper bound on how many times a `Stop` hook may re-enter the
++ * stream via `decision: 'block'` within a single `processStream()` call. This
++ * is a pure runaway backstop, NOT the policy limit — the registered hook is
++ * expected to enforce its own (much smaller) cap and stop returning `block`.
++ */
++const MAX_STOP_HOOK_CONTINUATIONS = 10;
+ const defaultOmitOptions = new Set([
+ 	"stream",
+ 	"thinking",
+@@ -719,7 +726,21 @@
+ 			* arg to `BaseGraphState`. Cast on the call so the resume path
+ 			* type-checks without widening the wrapper for every caller.
+ 			*/
+-			const stream = graphRunnable.streamEvents(inputs, config, {
++			/**
++			 * cowork: `Stop`-hook-driven continuation loop. When a registered
++			 * `Stop` hook returns `decision: 'block'`, the run does NOT finalize —
++			 * the stream is re-entered in place with the hook's reason appended as
++			 * a nudge message. Because this happens INSIDE `consumeStream`, no
++			 * `resetValues()` and no `clearHeavyState()` has run: the Graph's
++			 * `contentData`/`contentIndexMap` keep appending and the handler
++			 * registry is still live, so the continuation streams to the host
++			 * exactly like an ordinary extra model turn. Re-entering via a second
++			 * `processStream()` call instead corrupts both (see docs/41).
++			 */
++			let continuationInputs = inputs;
++			let continuationRounds = 0;
++			for (;;) {
++			const stream = graphRunnable.streamEvents(continuationInputs, config, {
+ 				raiseError: true,
+ 				/**
+ 				* Prevent EventStreamCallbackHandler from processing custom events.
+@@ -819,7 +840,8 @@
+ 			* misleading). The host fires Stop on the resumed-and-completed
+ 			* run instead.
+ 			*/
+-			if (this._interrupt == null && this._haltedReason == null && this.hookRegistry?.hasHookFor("Stop", this.id) === true) await executeHooks({
++			let stopAggregate;
++			if (this._interrupt == null && this._haltedReason == null && this.hookRegistry?.hasHookFor("Stop", this.id) === true) stopAggregate = await executeHooks({
+ 				registry: this.hookRegistry,
+ 				input: {
+ 					hook_event_name: "Stop",
+@@ -835,11 +857,41 @@
+ 					* is reserved for the boundary that simply had nothing to inject.
+ 					*/
+ 					stopReason: graph.preemptHaltReason ?? (graph.preemptIncomplete ? "preempt_incomplete" : void 0),
+-					stopHookActive: false
++					/**
++					 * cowork: Claude Code semantics — true once a `Stop` hook has
++					 * already blocked at least once in this run, so a hook can tell a
++					 * first stop from a re-entry and decline to block forever.
++					 */
++					stopHookActive: continuationRounds > 0
+ 				},
+ 				sessionId: this.id
+-			}).catch(() => {});
++			}).catch(() => void 0);
+ 			/**
++			 * cowork: act on the decision the fold logic in `executeHooks` already
++			 * computes. `block` means "do not finalize, keep going": append the
++			 * hook's reason as a nudge and re-enter the stream with the full
++			 * conversation so far. Without a checkpointer LangGraph keeps no state
++			 * between invocations, so the complete message list must be re-supplied
++			 * explicitly — `graph.messages` is the reduced state from the round that
++			 * just finished, which is exactly that.
++			 */
++			if (stopAggregate?.stopDecision === "block" && continuationRounds < MAX_STOP_HOOK_CONTINUATIONS && Array.isArray(graph.messages) && graph.messages.length > 0) {
++				continuationRounds++;
++				continuationInputs = { messages: [...graph.messages, new HumanMessage({
++					content: stopAggregate.reason ?? "Continue.",
++					/**
++					 * Same convention `runPreStreamHooks` uses for hook-supplied
++					 * context: a user-role message carrying `role: 'system'` metadata,
++					 * because a mid-conversation `SystemMessage` is rejected by the
++					 * Anthropic and Google providers.
++					 */
++					additional_kwargs: { role: "system", source: "hook" }
++				})] };
++				continue;
++			}
++			break;
++			}
++			/**
+ 			* A `PreemptBoundary` hook that returned `preventContinuation` has its
+ 			* registry halt cleared by the graph — that is what stops the halt from
+ 			* cancelling the stream before the sealed turn commits — so the reason
