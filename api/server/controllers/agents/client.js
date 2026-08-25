@@ -3022,7 +3022,53 @@ class AgentClient extends BaseClient {
          *  disabled, which registers no hook at all. Deliberately scoped to
          *  chatCompletion — `resumeCompletion` stays untouched, same as the
          *  probe loop this replaced (docs/39 §2). */
-        const stallRecoveryHook = createStallRecoveryStopHook(this.conversationId);
+        const stallRecoveryHook = createStallRecoveryStopHook(this.conversationId, {
+          /**
+           * Draw the "continuing" marker in the chat, using the SAME splice
+           * protocol the activity-label wiring above uses: claim the next
+           * index in `contentParts`, push the part, bump the shared steer
+           * offset so every LATER SDK-emitted index shifts past the part the
+           * Graph doesn't know about, then emit. Skipping the bump is what
+           * would corrupt ordering — the Graph keeps numbering from its own
+           * `contentData`, which has no idea this part exists.
+           *
+           * Safe to do from inside the Stop hook: it runs within
+           * `consumeStream`, after the stalled round's content is complete and
+           * before the continuation's first event, so the marker lands exactly
+           * between them.
+           *
+           * An `activity_label` part rather than streamed text on purpose —
+           * activity labels are UI-only (never model input, never billed), so
+           * the marker cannot come back as context on a later turn.
+           */
+          onContinue: ({ text }) => {
+            const index = this.contentParts.length;
+            const part = {
+              type: ContentTypes.ACTIVITY_LABEL,
+              [ContentTypes.ACTIVITY_LABEL]: text,
+              /** Keeps it out of tool-call grouping so it renders as its own
+               *  line instead of being consumed as a group header — see
+               *  `getBatchActivityLabelPart`. */
+              activity_label_type: 'continuation',
+              status: 'ok',
+            };
+            this.contentParts.push(part);
+            this.steerOffsetState.offset += 1;
+            return GenerationJobManager.emitChunk(
+              streamId,
+              {
+                event: ActivityLabelEvents.ON_ACTIVITY_LABEL,
+                data: {
+                  index,
+                  part,
+                  responseMessageId: this.responseMessageId,
+                  conversationId: this.conversationId,
+                },
+              },
+              { durable: true, expectedCreatedAt: this.jobCreatedAt },
+            );
+          },
+        });
         const offsetHandlers = createSteerIndexOffsetHandlers(
           this.options.eventHandlers,
           this.steerOffsetState,

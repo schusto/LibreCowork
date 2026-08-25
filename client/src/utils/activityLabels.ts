@@ -1,8 +1,18 @@
 import { ContentTypes } from 'librechat-data-provider';
 import type { TMessage, TActivityLabelEvent, TMessageContentParts } from 'librechat-data-provider';
 
-type ActivityLabelPart = Extract<TMessageContentParts, { type: ContentTypes.ACTIVITY_LABEL }> & {
-  activity_label_type?: 'phase';
+/**
+ * `Omit` on `activity_label_type` rather than a plain intersection: intersecting
+ * a widened union with the base declaration RE-NARROWS it (`'phase' &
+ * ('phase' | 'continuation')` is `'phase'`), which silently made the
+ * continuation check dead code. Overriding keeps this alias authoritative for
+ * the fields it augments.
+ */
+export type ActivityLabelPart = Omit<
+  Extract<TMessageContentParts, { type: ContentTypes.ACTIVITY_LABEL }>,
+  'activity_label_type'
+> & {
+  activity_label_type?: 'phase' | 'continuation';
   activity_start_index?: number;
   activity_end_index?: number;
   activity_count?: number;
@@ -100,11 +110,26 @@ export function isPhaseActivityLabel(part: ActivityLabelPart | undefined): boole
   return part?.activity_label_type === 'phase';
 }
 
+/**
+ * [cowork] A harness-supervisor stall-recovery marker, not a generated label.
+ * It describes something the HARNESS did between two model rounds rather than
+ * summarising a batch of tool calls, so it must never be consumed as a group
+ * header — it belongs on its own line, where the restart actually happened.
+ */
+export function isContinuationActivityLabel(part: ActivityLabelPart | undefined): boolean {
+  return part?.activity_label_type === 'continuation';
+}
+
 export function getBatchActivityLabelPart(
   part: TMessageContentParts | undefined,
 ): ActivityLabelPart | undefined {
   const label = getActivityLabelPart(part);
-  return label != null && !isPhaseActivityLabel(label) ? label : undefined;
+  /** Excluding continuation markers here is what routes them down the
+   *  `{ type: 'single' }` path in `groupToolCalls`, and from there to `Part`'s
+   *  standalone-label rendering. */
+  return label != null && !isPhaseActivityLabel(label) && !isContinuationActivityLabel(label)
+    ? label
+    : undefined;
 }
 
 /** Returns the activity-label content part when `part` is one, else undefined. */

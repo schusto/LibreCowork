@@ -1,17 +1,18 @@
 import { ChevronDown, ListTree } from 'lucide-react';
-import { ContentTypes } from 'librechat-data-provider';
-import type { TMessageContentParts } from 'librechat-data-provider';
 import type { ReactNode } from 'react';
 import { getActivityLabelText } from '~/utils/activityLabels';
+import type { ActivityLabelPart } from '~/utils/activityLabels';
 import { EmptyText } from './Parts';
 import Container from './Container';
 import { cn } from '~/utils';
 
-type ActivityPhasePart = Extract<TMessageContentParts, { type: ContentTypes.ACTIVITY_LABEL }> & {
-  activity_label_type?: 'phase';
-  activity_start_index?: number;
-  activity_end_index?: number;
-};
+/**
+ * The shared activity-label shape rather than a narrower local twin. Only phase
+ * labels ever reach this component, but that is guaranteed by the segment
+ * builder (`isPhaseActivityLabel`), not by this prop type — and re-declaring a
+ * `'phase'`-only variant here just made the two types incompatible.
+ */
+type ActivityPhasePart = ActivityLabelPart;
 
 export default function ActivityPhaseGroup({
   labelPart,

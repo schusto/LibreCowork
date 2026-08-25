@@ -99,7 +99,8 @@ export type TActivityLabelEvent = {
     type: ContentTypes.ACTIVITY_LABEL;
     [ContentTypes.ACTIVITY_LABEL]: string;
     /** Missing means a per-batch activity label. */
-    activity_label_type?: 'phase';
+    /** 'continuation' marks a harness stall-recovery restart (cowork). */
+    activity_label_type?: 'phase' | 'continuation';
     tool_call_ids?: string[];
     activity_start_index?: number;
     activity_end_index?: number;

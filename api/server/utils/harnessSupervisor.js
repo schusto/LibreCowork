@@ -307,6 +307,22 @@ const STALL_PROBE_MESSAGE =
     'otherwise continue your tasks and achieve your goal. When you are fully ' +
     `done add ${DONE_TAG} at the end.`;
 
+/**
+ * Text shown in the chat when a continuation fires. Set to an empty string to
+ * suppress the indicator while leaving the continuation itself enabled.
+ *
+ * Rendered as an `activity_label` content part, NOT as text in the response:
+ * `packages/api/src/agents/client.ts` classifies activity labels as "UI-only
+ * progress headers — never model input, never billed output", so the marker
+ * cannot leak back into the model's context on a later turn or be charged as
+ * output tokens. Streaming a raw string into the response instead would do
+ * both. `%d` is replaced with the continuation number — the live run that
+ * motivated this could not tell two restarts from three (docs/41 §10).
+ */
+const STALL_PROBE_INDICATOR =
+  process.env.CWK_SUPERVISOR_STALL_PROBE_INDICATOR ??
+  'Continuing automatically — the response stopped before signalling completion (continuation %d)';
+
 const EMBED_URL  = process.env.EMBED_URL  || 'http://host.docker.internal:9000/v1/embeddings';
 const QDRANT_URL = process.env.QDRANT_URL || 'http://host.docker.internal:6333';
 const QDRANT_COLL_WORK_GRAPH = process.env.QDRANT_COLL_WORK_GRAPH || 'work_graph';
@@ -878,11 +894,15 @@ function getStallProbeTagInstruction() {
  * @param {string} [conversationId]
  * @returns {((input: {messages?: unknown[], stopHookActive?: boolean}) => Promise<object>)|undefined}
  */
-function createStallRecoveryStopHook(conversationId) {
+function createStallRecoveryStopHook(conversationId, { onContinue } = {}) {
   if (!SUPERVISOR_ENABLED || !STALL_PROBE_ENABLED || !STALL_PROBE_REENTRY_ENABLED || !conversationId) {
     return undefined;
   }
   const convLabel = conversationId.slice(-8);
+  /** Per-run counter for the indicator. The hook closure is created once per
+   *  `createRun`, so this counts continuations within THIS turn — which is the
+   *  number worth showing — without a second Mongo read per round. */
+  let continuationNumber = 0;
   return async function stallRecoveryStopHook(input) {
     if (!shouldFireStallProbe(input?.messages)) {
       /** Debug-level either way: a silent non-firing decision was previously
@@ -918,10 +938,28 @@ function createStallRecoveryStopHook(conversationId) {
       );
       return {};
     }
+    continuationNumber += 1;
     logger.info(
       `[harnessSupervisor] conv=${convLabel} stall detected — blocking Stop to continue ` +
-        `(stopHookActive=${input?.stopHookActive === true}, toolCalls=${toolCount})`,
+        `(stopHookActive=${input?.stopHookActive === true}, toolCalls=${toolCount}, ` +
+        `continuation=${continuationNumber})`,
     );
+    /**
+     * Surface the restart in the chat. Best-effort and deliberately never
+     * allowed to block or fail the continuation: an indicator that couldn't be
+     * drawn is a cosmetic loss, whereas throwing here would abort a recovery
+     * that is otherwise ready to run.
+     */
+    if (typeof onContinue === 'function' && STALL_PROBE_INDICATOR) {
+      try {
+        await onContinue({
+          text: STALL_PROBE_INDICATOR.replace('%d', String(continuationNumber)),
+          continuationNumber,
+        });
+      } catch (e) {
+        logger.warn(`[harnessSupervisor] conv=${convLabel} indicator emit failed: ${e.message}`);
+      }
+    }
     return { decision: 'block', reason: STALL_PROBE_MESSAGE };
   };
 }
