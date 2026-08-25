@@ -143,6 +143,7 @@ services:
       # - CWK_DUMP_DIR=/app/uploads/cwk-context-dumps  # default — maps to ~/proj/cowork/uploads/cwk-context-dumps/ on host
       # [cowork] Harness supervisor — proactive memory/work-graph injection + stuck-pattern nudge. See docs/31_harness_memory_supervisor.md.
       - CWK_SUPERVISOR_ENABLED=true
+      - CWK_SUPERVISOR_STALL_PROBE_REENTRY_ENABLED=true
       - CWK_SUPERVISOR_MIN_MESSAGE_CHARS=15
       - CWK_SUPERVISOR_WORK_GRAPH_LIMIT=2
       - CWK_SUPERVISOR_WORK_GRAPH_THRESHOLD=0.3
