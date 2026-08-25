@@ -98,7 +98,9 @@
  *      model turn. An earlier design called `processStream()` a second time
  *      from the host instead; that could not render correctly and is
  *      dissected in docs/41 §2. `tryReserveStallProbeSlot()` gates each attempt against a
- *      per-conversation cap (CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS)
+ *      per-conversation cap on CONSECUTIVE UNPRODUCTIVE rounds
+ *      (CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS), plus an absolute
+ *      per-turn ceiling (CWK_SUPERVISOR_STALL_PROBE_MAX_TOTAL_CONTINUATIONS),
  *      stored in the same `harness_supervisor_state` document as the other
  *      two components' state, so a conversation that keeps stalling is
  *      auto-continued a bounded number of times (mirroring Erik's own
@@ -162,9 +164,20 @@
  *                                             index's expireAfterSeconds (default: 21600000 — 6h)
  *   CWK_SUPERVISOR_STALL_PROBE_ENABLED        Master on/off switch for the stall-recovery probe specifically
  *                                             (default: true — still gated by CWK_SUPERVISOR_ENABLED above)
- *   CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS  Max auto-continue probe rounds per conversation before giving up
- *                                             and leaving the turn as-is (default: 2). Resets on the next real
- *                                             user-initiated turn, not on every internal probe round.
+ *   CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS  Max CONSECUTIVE UNPRODUCTIVE auto-continue rounds before giving
+ *                                             up and leaving the turn as-is (default: 2). "Unproductive" means the
+ *                                             round produced no new tool call; a round that did real work resets
+ *                                             this to zero, so a long task that stalls between genuine steps is
+ *                                             carried to the end while an agent that is truly spinning is cut off
+ *                                             just as fast as a flat cap would. Both counters reset on the next real
+ *                                             user-initiated turn, not on every internal continuation round.
+ *                                             (Was a flat per-turn budget until a live run of the 16-test regression
+ *                                             suite exhausted it three-quarters of the way through a turn that was
+ *                                             still making steady progress — see 41 §10.)
+ *   CWK_SUPERVISOR_STALL_PROBE_MAX_TOTAL_CONTINUATIONS  Absolute per-turn ceiling regardless of progress (default: 8).
+ *                                             Must stay BELOW the MAX_STOP_HOOK_CONTINUATIONS backstop in
+ *                                             patches/@librechat+agents+3.4.7.patch (10), which ends the turn with
+ *                                             no log line at all — raise both together or not at all.
  *   CWK_SUPERVISOR_STALL_PROBE_DONE_TAG       The explicit completion marker the model is asked, every turn, to
  *                                             append to a genuinely final response (default: `<---DONE--->`).
  *                                             Presence/absence of this exact tag is the PRIMARY stall signal —
@@ -258,6 +271,23 @@ const STALL_PROBE_REENTRY_ENABLED =
   (process.env.CWK_SUPERVISOR_STALL_PROBE_REENTRY_ENABLED ?? 'false').toLowerCase() === 'true';
 const STALL_PROBE_MAX_CONTINUATIONS = parseInt(
   process.env.CWK_SUPERVISOR_STALL_PROBE_MAX_CONTINUATIONS ?? '2',
+  10,
+);
+/**
+ * Absolute per-turn ceiling on continuations, regardless of how much progress
+ * the agent is making. STALL_PROBE_MAX_CONTINUATIONS above only bounds
+ * CONSECUTIVE UNPRODUCTIVE rounds, so on its own it would let a model that
+ * stalls after every single tool call continue indefinitely.
+ *
+ * Default 8 is deliberately BELOW the `MAX_STOP_HOOK_CONTINUATIONS = 10`
+ * runaway backstop in `patches/@librechat+agents+3.4.7.patch`. That backstop
+ * just breaks the SDK's loop with no log line, so if it ever became the
+ * binding limit the turn would end silently — precisely the class of failure
+ * docs/39 §10 was written about. Keep this below the patch's value, or raise
+ * both together.
+ */
+const STALL_PROBE_MAX_TOTAL_CONTINUATIONS = parseInt(
+  process.env.CWK_SUPERVISOR_STALL_PROBE_MAX_TOTAL_CONTINUATIONS ?? '8',
   10,
 );
 /**
@@ -718,15 +748,50 @@ function isDoneMessage(message) {
  * @param {string} [conversationId]
  * @returns {Promise<boolean>}
  */
-async function tryReserveStallProbeSlot(conversationId) {
+async function tryReserveStallProbeSlot(conversationId, { toolCount } = {}) {
   if (!SUPERVISOR_ENABLED || !STALL_PROBE_ENABLED || !STALL_PROBE_REENTRY_ENABLED || !conversationId) {
     return false;
   }
   try {
     const state = await loadSupervisorState(conversationId);
-    const count = state?.autoContinueCount || 0;
-    if (count >= STALL_PROBE_MAX_CONTINUATIONS) return false;
-    await saveSupervisorState(conversationId, { autoContinueCount: count + 1 });
+    const unproductive = state?.consecutiveUnproductiveContinuations || 0;
+    const total = state?.totalContinuations || 0;
+    const lastToolCount = state?.lastToolCount || 0;
+
+    /** Absolute ceiling first: it holds no matter how productive the agent is. */
+    if (total >= STALL_PROBE_MAX_TOTAL_CONTINUATIONS) {
+      return false;
+    }
+
+    /**
+     * Progress signal: did the agent actually DO anything since the previous
+     * continuation? Tool calls are the honest measure for this workload — the
+     * observed stall is narrated intent with no tool call ("...then use
+     * edit_block:"), while a round that really ran a test leaves ToolMessages
+     * behind. Raw message count would be useless here: the nudge this feature
+     * injects is itself a message, so the count grows every round by
+     * construction. ToolMessages cannot be inflated that way.
+     *
+     * `toolCount` omitted (older callers, and the pure-function tests) means
+     * "no progress information" and falls back to the flat-cap behaviour.
+     */
+    const madeProgress = typeof toolCount === 'number' && toolCount > lastToolCount;
+    const nextUnproductive = madeProgress ? 0 : unproductive + 1;
+
+    /** Only CONSECUTIVE unproductive rounds count against the main cap, so a
+     *  long task that keeps stalling between real steps is carried to the end,
+     *  while an agent that is genuinely spinning is cut off just as fast as
+     *  before. Mirrors the manual habit this replaced: regenerate a couple of
+     *  times, give up if it isn't moving. */
+    if (!madeProgress && unproductive >= STALL_PROBE_MAX_CONTINUATIONS) {
+      return false;
+    }
+
+    await saveSupervisorState(conversationId, {
+      consecutiveUnproductiveContinuations: nextUnproductive,
+      totalContinuations: total + 1,
+      ...(typeof toolCount === 'number' && { lastToolCount: toolCount }),
+    });
     return true;
   } catch (e) {
     logger.warn(`[harnessSupervisor] stall-probe reserve failed, declining to probe: ${e.message}`);
@@ -745,7 +810,11 @@ async function tryReserveStallProbeSlot(conversationId) {
  */
 async function resetAutoContinueCounter(conversationId) {
   if (!conversationId) return;
-  await saveSupervisorState(conversationId, { autoContinueCount: 0 });
+  await saveSupervisorState(conversationId, {
+    consecutiveUnproductiveContinuations: 0,
+    totalContinuations: 0,
+    lastToolCount: 0,
+  });
 }
 
 /**
@@ -823,17 +892,35 @@ function createStallRecoveryStopHook(conversationId) {
       );
       return {};
     }
+    /**
+     * Progress signal for the cap: how many tool calls this turn has produced
+     * SO FAR. Because a continuation never resets the run boundary, the
+     * messages the SDK hands us accumulate across rounds, so this count only
+     * grows when the agent actually did something — which is exactly what
+     * distinguishes "stalled but making headway between stalls" from
+     * "spinning". See tryReserveStallProbeSlot.
+     */
+    const toolCount = (input?.messages ?? []).filter((m) => getMessageType(m) === 'tool').length;
     /** Cap is authoritative and fails closed; see tryReserveStallProbeSlot. */
-    const reserved = await tryReserveStallProbeSlot(conversationId);
+    const reserved = await tryReserveStallProbeSlot(conversationId, { toolCount });
     if (!reserved) {
+      /** Distinguish the two ways of declining — "it was spinning" and "this
+       *  turn has simply had enough continuations" are different diagnoses,
+       *  and telling them apart from the logs alone was the point of docs/39
+       *  §10's fix. */
+      const state = await loadSupervisorState(conversationId).catch(() => undefined);
+      const reason =
+        (state?.totalContinuations || 0) >= STALL_PROBE_MAX_TOTAL_CONTINUATIONS
+          ? `absolute per-turn ceiling reached (${STALL_PROBE_MAX_TOTAL_CONTINUATIONS})`
+          : `no progress in ${STALL_PROBE_MAX_CONTINUATIONS} consecutive continuations`;
       logger.info(
-        `[harnessSupervisor] conv=${convLabel} stall detected but auto-continue cap reached`,
+        `[harnessSupervisor] conv=${convLabel} stall detected but not continuing — ${reason}`,
       );
       return {};
     }
     logger.info(
       `[harnessSupervisor] conv=${convLabel} stall detected — blocking Stop to continue ` +
-        `(stopHookActive=${input?.stopHookActive === true})`,
+        `(stopHookActive=${input?.stopHookActive === true}, toolCalls=${toolCount})`,
     );
     return { decision: 'block', reason: STALL_PROBE_MESSAGE };
   };
