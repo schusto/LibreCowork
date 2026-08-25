@@ -1,4 +1,5 @@
 import { memo } from 'react';
+import { RefreshCw } from 'lucide-react';
 import {
   Tools,
   Constants,
@@ -23,7 +24,12 @@ import {
   SubagentCall,
   SteerPart,
 } from './Parts';
-import { getCachedPreview, getActivityLabelPart, getActivityLabelText } from '~/utils';
+import {
+  getCachedPreview,
+  getActivityLabelPart,
+  getActivityLabelText,
+  isContinuationActivityLabel,
+} from '~/utils';
 import { getAskUserQuestionPart } from '~/utils/approval';
 import AskUserQuestionCall from './AskUserQuestionCall';
 import { isBashProgrammaticToolCall } from './routing';
@@ -164,9 +170,29 @@ const Part = memo(function Part({
     /** Orphan label (its block's parts were filtered/hidden): renders as a
      *  standalone line. Labeled blocks normally render via ToolCallGroup,
      *  which consumes the label part as the group header instead. */
-    const display = getActivityLabelText(getActivityLabelPart(part));
+    const labelPart = getActivityLabelPart(part);
+    const display = getActivityLabelText(labelPart);
     if (!display) {
       return null;
+    }
+    /** [cowork] A harness stall-recovery restart, not a generated summary of
+     *  the model's own work. It gets a rule-and-icon treatment rather than the
+     *  muted italic line below because it must be findable by eye in a long
+     *  response: the first version reused the ordinary label styling and was
+     *  reported as "no output as far as I could see" — it WAS rendering, it
+     *  just looked exactly like the assistant's own commentary. */
+    if (isContinuationActivityLabel(labelPart)) {
+      return (
+        <div
+          className="my-3 flex items-center gap-2 text-xs text-amber-600 dark:text-amber-400"
+          data-testid="stall-continuation"
+        >
+          <div className="h-px flex-1 bg-amber-600/30 dark:bg-amber-400/30" />
+          <RefreshCw className="size-3.5 shrink-0" aria-hidden={true} />
+          <span className="break-words italic">{display}</span>
+          <div className="h-px flex-1 bg-amber-600/30 dark:bg-amber-400/30" />
+        </div>
+      );
     }
     const failed = part.status === 'failed' || part.status === 'partial';
     return (
