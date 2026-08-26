@@ -12,7 +12,7 @@ export type ActivityLabelPart = Omit<
   Extract<TMessageContentParts, { type: ContentTypes.ACTIVITY_LABEL }>,
   'activity_label_type'
 > & {
-  activity_label_type?: 'phase' | 'continuation';
+  activity_label_type?: 'phase' | 'continuation' | 'proactive_context';
   activity_start_index?: number;
   activity_end_index?: number;
   activity_count?: number;
@@ -120,14 +120,28 @@ export function isContinuationActivityLabel(part: ActivityLabelPart | undefined)
   return part?.activity_label_type === 'continuation';
 }
 
+/**
+ * [cowork] A harness-supervisor proactive memory/work-graph injection marker,
+ * not a generated label. Like `isContinuationActivityLabel`, it describes
+ * something the HARNESS did before the model ran rather than summarising a
+ * batch of tool calls, so it must never be consumed as a group header — it
+ * belongs on its own line, at the start of the turn it fired for.
+ */
+export function isProactiveContextActivityLabel(part: ActivityLabelPart | undefined): boolean {
+  return part?.activity_label_type === 'proactive_context';
+}
+
 export function getBatchActivityLabelPart(
   part: TMessageContentParts | undefined,
 ): ActivityLabelPart | undefined {
   const label = getActivityLabelPart(part);
-  /** Excluding continuation markers here is what routes them down the
-   *  `{ type: 'single' }` path in `groupToolCalls`, and from there to `Part`'s
-   *  standalone-label rendering. */
-  return label != null && !isPhaseActivityLabel(label) && !isContinuationActivityLabel(label)
+  /** Excluding continuation/proactive_context markers here is what routes
+   *  them down the `{ type: 'single' }` path in `groupToolCalls`, and from
+   *  there to `Part`'s standalone-label rendering. */
+  return label != null &&
+    !isPhaseActivityLabel(label) &&
+    !isContinuationActivityLabel(label) &&
+    !isProactiveContextActivityLabel(label)
     ? label
     : undefined;
 }

@@ -658,8 +658,9 @@ export type TMessageContentParts =
       type: ContentTypes.ACTIVITY_LABEL;
       activity_label?: string;
       /** Missing means the legacy/per-batch activity label. */
-      /** 'continuation' marks a harness stall-recovery restart (cowork). */
-      activity_label_type?: 'phase' | 'continuation';
+      /** 'continuation' marks a harness stall-recovery restart; 'proactive_context'
+       *  marks a harness proactive memory/work-graph injection (cowork). */
+      activity_label_type?: 'phase' | 'continuation' | 'proactive_context';
       tool_call_ids?: string[];
       /** Parent phase bounds and telemetry. */
       activity_start_index?: number;

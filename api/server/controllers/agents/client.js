@@ -1648,6 +1648,7 @@ class AgentClient extends BaseClient {
      * upstream's own per-agent memory partitioning and is orthogonal to this.
      * See docs/31_harness_memory_supervisor.md, docs/36_harness_supervisor_implementation_report.md.
      */
+    const streamId = this.options.req?._resumableStreamId || null;
     const latestUserText = orderedMessages[orderedMessages.length - 1]?.text;
     const [proactiveContext, stuckNudge] = await Promise.all([
       getProactiveMemoryContext({
@@ -1655,6 +1656,47 @@ class AgentClient extends BaseClient {
         conversationId: this.conversationId,
         userId: this.options?.req?.user?.id,
         agent: this.options?.agent,
+        /**
+         * Draws the same UI-only "did this actually fire" marker docs/41 §11
+         * built for stall-recovery continuations, using the identical splice
+         * protocol: claim the next `contentParts` index, push the part, bump
+         * the shared steer offset so later SDK-emitted indices shift past it,
+         * then emit. Everything the protocol needs — `streamId` (from
+         * `req._resumableStreamId`, set in request.js before
+         * `client.sendMessage()`/`buildMessages()` ever runs), `contentParts`
+         * / `steerOffsetState` (constructor fields, already empty at this
+         * point), and the GenerationJobManager job (created in that same
+         * request.js pass) — already exists here, before `createRun` and
+         * before any Graph. See docs/42_proactive_injection_visibility_report.md.
+         */
+        onInjected: streamId
+          ? ({ text }) => {
+              const index = this.contentParts.length;
+              const part = {
+                type: ContentTypes.ACTIVITY_LABEL,
+                [ContentTypes.ACTIVITY_LABEL]: text,
+                /** Own sub-type so it renders distinctly from the
+                 *  stall-recovery 'continuation' marker — see Part.tsx. */
+                activity_label_type: 'proactive_context',
+                status: 'ok',
+              };
+              this.contentParts.push(part);
+              this.steerOffsetState.offset += 1;
+              return GenerationJobManager.emitChunk(
+                streamId,
+                {
+                  event: ActivityLabelEvents.ON_ACTIVITY_LABEL,
+                  data: {
+                    index,
+                    part,
+                    responseMessageId: this.responseMessageId,
+                    conversationId: this.conversationId,
+                  },
+                },
+                { durable: true, expectedCreatedAt: this.jobCreatedAt },
+              );
+            }
+          : undefined,
       }),
       trackAndDetectStuckPattern({
         conversationId: this.conversationId,
@@ -1666,7 +1708,22 @@ class AgentClient extends BaseClient {
       // docs/41_stall_recovery_stop_hook_report.md.
       resetAutoContinueCounter(this.conversationId),
     ]);
-    if (proactiveContext) sharedRunContextParts.push(proactiveContext);
+    /**
+     * [cowork] Delivered as a final instruction message appended after the
+     * user's own message (see chatCompletion, near `hydrateMissingIndexTokenCounts`)
+     * rather than folded into `sharedRunContextParts`/`additional_instructions`.
+     * Live testing (docs/42_proactive_injection_visibility_report.md §4) showed
+     * the system-prompt-tail placement reaches the model — confirmed via
+     * `additionalInstructions` → `buildDynamicInstructionsString()` →
+     * `systemRunnable`, token-counted before the run starts — but gets
+     * discounted: a weak match was ignored even in reasoning, and a strong,
+     * clearly on-topic match got read into reasoning yet never surfaced in the
+     * visible answer. Repositioning it as the last thing before generation
+     * (same convention as the stall-recovery nudge: a `HumanMessage` with
+     * `additional_kwargs: { role: 'system', source: 'hook' }`, ephemeral to
+     * this call and never persisted) targets exactly that gap.
+     */
+    this.proactiveContextMessage = proactiveContext || null;
     if (stuckNudge) sharedRunContextParts.push(stuckNudge);
     // [cowork] Stall-recovery: establish the DONE_TAG completion-marker
     // convention every turn (synchronous, no I/O) — see
@@ -2862,6 +2919,29 @@ class AgentClient extends BaseClient {
             `[AgentClient] Dropped ${primeResult.alwaysApplyDropped} always-apply prime(s) to stay within MAX_PRIMED_SKILLS_PER_TURN.`,
           );
         }
+      }
+
+      /**
+       * [cowork] Harness supervisor — proactive work-graph/chat context,
+       * appended as the LAST message before the run rather than folded into
+       * the system-prompt tail (see buildMessages, where it's stashed on
+       * `this.proactiveContextMessage`). Same convention the stall-recovery
+       * nudge already uses: a `HumanMessage` with `additional_kwargs: { role:
+       * 'system', source: 'hook' }`, because a bare mid-conversation
+       * `SystemMessage` is rejected by the Anthropic and Google providers.
+       * Ephemeral to this call — `initialMessages` is never itself persisted,
+       * so this doesn't stick around on later turns the way the stall-recovery
+       * nudge does within a single turn's continuations (docs/41 §12).
+       * Appended before `hydrateMissingIndexTokenCounts` runs so the new
+       * message gets a real token count instead of an undercounted context.
+       */
+      if (this.proactiveContextMessage) {
+        initialMessages.push(
+          new HumanMessage({
+            content: this.proactiveContextMessage,
+            additional_kwargs: { role: 'system', source: 'hook' },
+          }),
+        );
       }
 
       if (indexTokenCountMap && isEnabled(process.env.AGENT_DEBUG_LOGGING)) {

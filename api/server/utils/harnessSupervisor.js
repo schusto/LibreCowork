@@ -323,6 +323,28 @@ const STALL_PROBE_INDICATOR =
   process.env.CWK_SUPERVISOR_STALL_PROBE_INDICATOR ??
   'Continuing automatically — the response stopped before signalling completion (continuation %d)';
 
+/**
+ * Text shown in the chat when proactive work-graph/chat injection actually
+ * fires — i.e. getProactiveMemoryContext() found something and pushed it into
+ * sharedRunContextParts, not on every turn regardless of outcome. Set to an
+ * empty string to suppress the indicator while leaving injection itself on:
+ * the same "turn it on to check, off once trusted" switch as
+ * CWK_SUPERVISOR_STALL_PROBE_INDICATOR above.
+ *
+ * Rendered as an `activity_label` content part, NOT as text in the response —
+ * same reasoning as STALL_PROBE_INDICATOR: `packages/api/src/agents/client.ts`
+ * classifies activity labels as "UI-only progress headers — never model
+ * input, never billed output", so the marker can't leak into a later turn's
+ * context or be charged as output tokens. This closes the visibility gap
+ * docs/42_proactive_injection_visibility_report.md was written to close:
+ * without it, "fired and came back thin" and "never fired" look identical
+ * from the chat. The first `%d` is the work-graph hit count, the second the
+ * chat hit count.
+ */
+const INJECTION_INDICATOR =
+  process.env.CWK_SUPERVISOR_INJECTION_INDICATOR ??
+  'Consulted memory + work graph for this task (%d work-graph, %d chat results)';
+
 const EMBED_URL  = process.env.EMBED_URL  || 'http://host.docker.internal:9000/v1/embeddings';
 const QDRANT_URL = process.env.QDRANT_URL || 'http://host.docker.internal:6333';
 const QDRANT_COLL_WORK_GRAPH = process.env.QDRANT_COLL_WORK_GRAPH || 'work_graph';
@@ -478,7 +500,7 @@ function formatChatHit(hit) {
  *   sharedRunContextParts, or null if nothing crossed threshold / gated by
  *   topic-shift / supervisor is disabled / the pass failed or timed out.
  */
-async function getProactiveMemoryContext({ userMessage, conversationId, userId }) {
+async function getProactiveMemoryContext({ userMessage, conversationId, userId, onInjected }) {
   if (!SUPERVISOR_ENABLED) return null;
   if (!userMessage || userMessage.trim().length < MIN_MESSAGE_CHARS) return null;
 
@@ -564,13 +586,17 @@ async function getProactiveMemoryContext({ userMessage, conversationId, userId }
     }
 
     const lines = [
-      '# Auto-surfaced background (harness supervisor)',
+      '# Instruction: relevant background was found automatically — check it before you respond',
       '',
-      'The following were retrieved automatically based on similarity to your ' +
-        'current message — not requested by you. Treat them as a starting ' +
-        'point, not a complete answer: call `search_work_graph` or ' +
-        '`search_memory` directly for a deeper or differently-phrased look ' +
-        'before relying on this alone.',
+      'The system searched memory and the work graph based on your message above ' +
+        '(not something you asked for) and found the items below. Before writing ' +
+        'your response: decide whether any of this is actually relevant. If it ' +
+        'is, use it AND explicitly tell the user what you found and how it ' +
+        'applies — do not silently factor it into your reasoning without ' +
+        'surfacing it. If none of it is relevant, ignore it and answer normally; ' +
+        'do not force a connection that is not there. For a deeper or ' +
+        'differently-phrased look than what is shown here, call ' +
+        '`search_work_graph` or `search_memory` directly.',
       '',
       ...workGraphHits.map(formatWorkGraphHit),
       ...chatHits.map(formatChatHit),
@@ -590,6 +616,29 @@ async function getProactiveMemoryContext({ userMessage, conversationId, userId }
         `work_graph=${workGraphHits.length} chats=${chatHits.length} ` +
         `~chars=${block.length}`,
     );
+
+    /**
+     * Surface the injection in the chat — same best-effort, never-blocking
+     * contract as the stall-recovery indicator: a marker that fails to draw
+     * is a cosmetic loss, not a reason to drop content that already passed
+     * the relevance threshold.
+     */
+    if (typeof onInjected === 'function' && INJECTION_INDICATOR) {
+      try {
+        await onInjected({
+          text: INJECTION_INDICATOR.replace('%d', String(workGraphHits.length)).replace(
+            '%d',
+            String(chatHits.length),
+          ),
+          workGraphCount: workGraphHits.length,
+          chatCount: chatHits.length,
+        });
+      } catch (e) {
+        logger.warn(
+          `[harnessSupervisor] conv=${convLabel} injection indicator emit failed: ${e.message}`,
+        );
+      }
+    }
     return block;
   };
 
