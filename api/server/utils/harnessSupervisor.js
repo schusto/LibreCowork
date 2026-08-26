@@ -813,7 +813,18 @@ function isDoneMessage(message) {
  * @param {string} [conversationId]
  * @returns {Promise<boolean>}
  */
-async function tryReserveStallProbeSlot(conversationId, { toolCount } = {}) {
+/**
+ * Cheap normalization for round-over-round text comparison: collapse
+ * whitespace and cap length, so trivial formatting drift doesn't defeat the
+ * repeated-text check and a pathologically long reply doesn't bloat Mongo
+ * state. Not a similarity metric — exact match on the normalized string only.
+ */
+function normalizeResponseText(text) {
+  if (typeof text !== 'string') return '';
+  return text.trim().replace(/\s+/g, ' ').slice(0, 500);
+}
+
+async function tryReserveStallProbeSlot(conversationId, { toolCount, responseText } = {}) {
   if (!SUPERVISOR_ENABLED || !STALL_PROBE_ENABLED || !STALL_PROBE_REENTRY_ENABLED || !conversationId) {
     return false;
   }
@@ -822,6 +833,7 @@ async function tryReserveStallProbeSlot(conversationId, { toolCount } = {}) {
     const unproductive = state?.consecutiveUnproductiveContinuations || 0;
     const total = state?.totalContinuations || 0;
     const lastToolCount = state?.lastToolCount || 0;
+    const lastResponseText = state?.lastResponseText || '';
 
     /** Absolute ceiling first: it holds no matter how productive the agent is. */
     if (total >= STALL_PROBE_MAX_TOTAL_CONTINUATIONS) {
@@ -830,17 +842,34 @@ async function tryReserveStallProbeSlot(conversationId, { toolCount } = {}) {
 
     /**
      * Progress signal: did the agent actually DO anything since the previous
-     * continuation? Tool calls are the honest measure for this workload — the
+     * continuation? Tool calls are the primary measure for this workload — the
      * observed stall is narrated intent with no tool call ("...then use
      * edit_block:"), while a round that really ran a test leaves ToolMessages
      * behind. Raw message count would be useless here: the nudge this feature
      * injects is itself a message, so the count grows every round by
      * construction. ToolMessages cannot be inflated that way.
      *
-     * `toolCount` omitted (older callers, and the pure-function tests) means
-     * "no progress information" and falls back to the flat-cap behaviour.
+     * Tool count alone is not sufficient, though: a model that keeps issuing
+     * NEW but equally unproductive tool calls (e.g. retrying a search with
+     * different phrasing, never finding anything) looks like it's progressing
+     * by this measure alone, while its own concluding text repeats round over
+     * round — observed live (docs/42 §diagnosis-followup) as several
+     * consecutive continuations closing on byte-identical apology text while
+     * still burning fresh `web_search` calls each round. `responseText` is
+     * the stalled round's own final message (the same text
+     * `shouldFireStallProbe` just read to decide THIS round counts as a
+     * stall) — an exact repeat of the previous round's stalled text means no
+     * real progress regardless of tool count.
+     *
+     * `toolCount`/`responseText` omitted (older callers, and the pure-function
+     * tests) means "no progress information" and falls back to the flat-cap
+     * behaviour.
      */
-    const madeProgress = typeof toolCount === 'number' && toolCount > lastToolCount;
+    const madeProgressByTools = typeof toolCount === 'number' && toolCount > lastToolCount;
+    const normalizedResponseText = normalizeResponseText(responseText);
+    const isRepeatedText =
+      normalizedResponseText.length > 0 && normalizedResponseText === lastResponseText;
+    const madeProgress = madeProgressByTools && !isRepeatedText;
     const nextUnproductive = madeProgress ? 0 : unproductive + 1;
 
     /** Only CONSECUTIVE unproductive rounds count against the main cap, so a
@@ -856,6 +885,7 @@ async function tryReserveStallProbeSlot(conversationId, { toolCount } = {}) {
       consecutiveUnproductiveContinuations: nextUnproductive,
       totalContinuations: total + 1,
       ...(typeof toolCount === 'number' && { lastToolCount: toolCount }),
+      ...(normalizedResponseText.length > 0 && { lastResponseText: normalizedResponseText }),
     });
     return true;
   } catch (e) {
@@ -969,9 +999,16 @@ function createStallRecoveryStopHook(conversationId, { onContinue } = {}) {
      * distinguishes "stalled but making headway between stalls" from
      * "spinning". See tryReserveStallProbeSlot.
      */
-    const toolCount = (input?.messages ?? []).filter((m) => getMessageType(m) === 'tool').length;
+    const runMessages = input?.messages ?? [];
+    const toolCount = runMessages.filter((m) => getMessageType(m) === 'tool').length;
+    /** The stalled round's own final text — same message shouldFireStallProbe
+     *  just read to call this a stall. Lets tryReserveStallProbeSlot catch a
+     *  round that repeats its own conclusion verbatim while still issuing
+     *  fresh-but-unproductive tool calls (e.g. retried searches that never
+     *  find anything) — a real pattern tool-count alone missed. */
+    const responseText = extractMessageText(runMessages[runMessages.length - 1]);
     /** Cap is authoritative and fails closed; see tryReserveStallProbeSlot. */
-    const reserved = await tryReserveStallProbeSlot(conversationId, { toolCount });
+    const reserved = await tryReserveStallProbeSlot(conversationId, { toolCount, responseText });
     if (!reserved) {
       /** Distinguish the two ways of declining — "it was spinning" and "this
        *  turn has simply had enough continuations" are different diagnoses,
