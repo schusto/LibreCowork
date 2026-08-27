@@ -737,14 +737,43 @@ function containsDoneTag(text) {
 }
 
 /**
+ * True when the FINAL paragraph of `text` reads as a question directed at
+ * the user — "which approach do you want?", "ska jag göra X eller Y?" — i.e.
+ * the model is legitimately waiting for a decision, not stalled. Absence of
+ * DONE_TAG alone can't distinguish these: neither case is "done," but only
+ * one should be auto-continued. Observed live (2026-08-26): a genuine
+ * clarifying question got nudged to "continue your tasks," which the model
+ * then read as permission to proceed without an answer, assuming the user
+ * either didn't know or didn't want to respond.
+ *
+ * Checked on the LAST paragraph only (split on blank lines) so an earlier
+ * rhetorical question in a long answer can't suppress a genuine stall later
+ * in the same response — only the actual last thing the model said matters.
+ * A trailing `?` (optionally wrapped in closing markdown/quote punctuation)
+ * is deliberately a blunt, cheap check in the same spirit as DONE_TAG itself
+ * — not sentence-level NLP, which is more machinery than this needs.
+ */
+const TRAILING_QUESTION_PATTERN = /[?？][)\]"'*_~`]*$/;
+function endsWithQuestionToUser(text) {
+  if (typeof text !== 'string') return false;
+  const paragraphs = text.trim().split(/\n\s*\n/);
+  const lastParagraph = paragraphs[paragraphs.length - 1]?.trim() ?? '';
+  return TRAILING_QUESTION_PATTERN.test(lastParagraph);
+}
+
+/**
  * Continuation candidate check, applied to the messages a single
  * `run.processStream()` call just produced (`run.getRunMessages()` —
  * scoped to that one call, not the whole conversation; see the module
  * docstring's Component 3 section). True only when this run made at least
  * one real tool call (a ToolMessage is present), ended on a plain-text
  * AIMessage with no further tool_calls, AND that final message does not
- * carry the DONE_TAG completion marker — DONE_TAG absence is now the sole
- * and authoritative signal, no length-based override.
+ * carry the DONE_TAG completion marker, AND that final message does not
+ * read as a question directed at the user (see endsWithQuestionToUser) —
+ * DONE_TAG absence is the primary signal, no length-based override, but a
+ * trailing question is a second, independent reason not to fire: the model
+ * isn't stalled, it's waiting for the user's answer, and nudging it to
+ * "continue" there is actively wrong (2026-08-26 live finding).
  *
  * A length-based fallback (fire only if the final text was also short) was
  * tried and then REMOVED after live testing found it caused the opposite
@@ -777,7 +806,9 @@ function shouldFireStallProbe(runMessages) {
   if (getMessageType(last) !== 'ai') return false;
   const toolCalls = last?.tool_calls;
   if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
-  return !containsDoneTag(extractMessageText(last));
+  const text = extractMessageText(last);
+  if (containsDoneTag(text)) return false;
+  return !endsWithQuestionToUser(text);
 }
 
 /**
@@ -934,7 +965,11 @@ function getStallProbeTagInstruction() {
     'When you have fully completed the current request and there is ' +
     `nothing further to do, end your response with the exact tag ${DONE_TAG} ` +
     'on its own line. If more work remains, do not include this tag — just ' +
-    'continue working.'
+    'continue working. If instead you are asking the user a question or ' +
+    'need their decision before you can continue, end your response ' +
+    'normally (with the question) and also omit the tag — a response ' +
+    "ending in a question is recognized as waiting for the user's reply, " +
+    'not as incomplete work to resume on its own.'
   );
 }
 
@@ -985,9 +1020,20 @@ function createStallRecoveryStopHook(conversationId, { onContinue } = {}) {
   return async function stallRecoveryStopHook(input) {
     if (!shouldFireStallProbe(input?.messages)) {
       /** Debug-level either way: a silent non-firing decision was previously
-       *  diagnosable only by querying Mongo directly (docs/39 §10). */
+       *  diagnosable only by querying Mongo directly (docs/39 §10). Reason
+       *  recomputed here (cheap string checks) purely for this log line —
+       *  shouldFireStallProbe stays a plain boolean so its contract/tests
+       *  don't change. "awaiting user input" vs "done/no stall" is worth
+       *  telling apart on its own after the 2026-08-26 question-nudge bug. */
+      const lastMsg = (input?.messages ?? []).at(-1);
+      const lastText = getMessageType(lastMsg) === 'ai' ? extractMessageText(lastMsg) : '';
+      const reason = containsDoneTag(lastText)
+        ? 'DONE_TAG present'
+        : endsWithQuestionToUser(lastText)
+          ? 'ends in a question — awaiting user input'
+          : 'no stall condition (mid tool-call or no prior tool call)';
       logger.debug(
-        `[harnessSupervisor] conv=${convLabel} stall-recovery Stop hook: no continuation needed`,
+        `[harnessSupervisor] conv=${convLabel} stall-recovery Stop hook: no continuation needed (${reason})`,
       );
       return {};
     }
