@@ -42,10 +42,7 @@ export const CONTEXT_REDUCTION_ENABLED: boolean =
   (process.env.CWK_CONTEXT_REDUCTION ?? 'true').toLowerCase() !== 'false';
 
 export const THINK_KEEP_TURNS: number = parseInt(process.env.CWK_THINK_KEEP_TURNS ?? '2', 10);
-export const TOOL_TRUNCATE_TURNS: number = parseInt(
-  process.env.CWK_TOOL_TRUNCATE_TURNS ?? '3',
-  10,
-);
+export const TOOL_TRUNCATE_TURNS: number = parseInt(process.env.CWK_TOOL_TRUNCATE_TURNS ?? '3', 10);
 export const TOOL_TRUNCATE_CHARS: number = parseInt(
   process.env.CWK_TOOL_TRUNCATE_CHARS ?? '2000',
   10,
@@ -62,6 +59,16 @@ export const RAG_TRUNCATE_CHARS: number = parseInt(
 export const WEB_TRUNCATE_TURNS: number = parseInt(process.env.CWK_WEB_TRUNCATE_TURNS ?? '2', 10);
 export const WEB_TRUNCATE_CHARS: number = parseInt(
   process.env.CWK_WEB_TRUNCATE_CHARS ?? '1000',
+  10,
+);
+/**
+ * Browsing tier keep window, in CALLS not user turns — a single task routinely
+ * makes several browser_snapshot/scrape/crawl calls back-to-back within one
+ * turn, before any turn-based window below would ever apply.
+ */
+export const BROWSING_KEEP_CALLS: number = parseInt(process.env.CWK_BROWSING_KEEP_CALLS ?? '2', 10);
+export const BROWSING_TRUNCATE_CHARS: number = parseInt(
+  process.env.CWK_BROWSING_TRUNCATE_CHARS ?? '3000',
   10,
 );
 
@@ -88,6 +95,37 @@ export const WEB_SEARCH_TOOL_NAMES: ReadonlySet<string> = new Set([
   'search',
   'searxng_search',
   'brave_search',
+]);
+
+/**
+ * Rendered-page / browser-automation tools: browsermcp (drives your own live
+ * Chrome tab via the extension), Playwright MCP (its own separate Chromium),
+ * crawl4ai, and the scraper MCP. A single call can return a full
+ * accessibility snapshot, screenshot, or page dump — tens of thousands of
+ * characters — and one task routinely chains several of these before the
+ * turn-based tiers above ever get a chance to apply. Windowed by call count
+ * instead: only the most recent BROWSING_KEEP_CALLS calls across all four
+ * tools, in the order they were made, stay verbatim.
+ */
+export const BROWSING_TOOL_NAMES: ReadonlySet<string> = new Set([
+  // browsermcp
+  'browser_snapshot_mcp_browser',
+  'browser_screenshot_mcp_browser',
+  'browser_get_console_logs_mcp_browser',
+  // Playwright MCP
+  'browser_snapshot_mcp_playwright_mcp',
+  'browser_take_screenshot_mcp_playwright_mcp',
+  'browser_console_messages_mcp_playwright_mcp',
+  'browser_network_requests_mcp_playwright_mcp',
+  'browser_evaluate_mcp_playwright_mcp',
+  // crawl4ai
+  'md_mcp_crawl4ai',
+  'html_mcp_crawl4ai',
+  'crawl_mcp_crawl4ai',
+  'execute_js_mcp_crawl4ai',
+  // scraper MCP
+  'scrape_url_mcp_scraper_mcp',
+  'scrape_url_smart_mcp_scraper_mcp',
 ]);
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -231,10 +269,12 @@ function stripOldThinkingBlocks(messages: ReducibleMessage[], thinkBoundary: num
 
 /**
  * Truncates and deduplicates tool_call output strings in assistant messages,
- * across three independent tiers (filesystem/dedup, RAG, web search — see
- * module docstring). Mutates `messages` in place, only replacing entries it
- * actually modifies. The dedup map is built left-to-right including the keep
- * window so older reads outside it can be correctly identified as redundant.
+ * across four independent tiers (filesystem/dedup, RAG, web search, browsing —
+ * see module docstring). Mutates `messages` in place, only replacing entries
+ * it actually modifies. The dedup map is built left-to-right including the
+ * keep window so older reads outside it can be correctly identified as
+ * redundant. The browsing tier is call-count windowed rather than
+ * turn-windowed, so it's computed once up front before the main pass.
  */
 function reduceToolResults(
   messages: ReducibleMessage[],
@@ -247,6 +287,36 @@ function reduceToolResults(
   /** path → md5 of last seen output (filesystem dedup only) */
   const lastSeen = new Map<string, string>();
 
+  /**
+   * Browsing tier is windowed by call count, not turn count — figure out up
+   * front which occurrences (identified by "msgIdx:partIdx") fall outside the
+   * last BROWSING_KEEP_CALLS calls across all browsing tools combined, in the
+   * order they were made.
+   */
+  const browsingTruncateKeys = new Set<string>();
+  {
+    const matches: string[] = [];
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role !== 'assistant' || !Array.isArray(msg.content)) {
+        continue;
+      }
+      msg.content.forEach((part, partIdx) => {
+        const name =
+          part?.type === ContentTypes.TOOL_CALL && part.tool_call != null
+            ? ((part.tool_call as ToolCallPart).name ?? '')
+            : '';
+        if (BROWSING_TOOL_NAMES.has(name)) {
+          matches.push(`${i}:${partIdx}`);
+        }
+      });
+    }
+    const keepFrom = Math.max(0, matches.length - BROWSING_KEEP_CALLS);
+    for (let m = 0; m < keepFrom; m++) {
+      browsingTruncateKeys.add(matches[m]);
+    }
+  }
+
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg.role !== 'assistant' || !Array.isArray(msg.content)) {
@@ -258,7 +328,7 @@ function reduceToolResults(
     const inWebWindow = webBoundary < 0 || i >= webBoundary;
 
     let msgModified = false;
-    const newContent: FormattedMessageContentPart[] = msg.content.map((part) => {
+    const newContent: FormattedMessageContentPart[] = msg.content.map((part, partIdx) => {
       if (part?.type !== ContentTypes.TOOL_CALL || part.tool_call == null) {
         return part;
       }
@@ -270,6 +340,23 @@ function reduceToolResults(
       const isRag = RAG_TOOL_NAMES.has(name);
       const isWeb = WEB_SEARCH_TOOL_NAMES.has(name);
       const isFileOp = DEDUP_TOOL_NAMES.has(name);
+      const isBrowsing = BROWSING_TOOL_NAMES.has(name);
+
+      // ── Browsing tier (call-count windowed, not turn-windowed) ─────────
+      if (isBrowsing) {
+        if (!browsingTruncateKeys.has(`${i}:${partIdx}`) || outputLen <= BROWSING_TRUNCATE_CHARS) {
+          return part;
+        }
+
+        const omitted = outputLen - BROWSING_TRUNCATE_CHARS;
+        const truncated =
+          output.slice(0, BROWSING_TRUNCATE_CHARS) +
+          `\n[... ${omitted.toLocaleString()} chars omitted — browsing result truncated by context reducer]`;
+        msgModified = true;
+        stats.truncated++;
+        stats.savedChars += omitted;
+        return { ...part, tool_call: { ...tc, output: truncated } };
+      }
 
       // ── Filesystem tier ──────────────────────────────────────────────
       if (isFileOp) {

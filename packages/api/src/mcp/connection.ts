@@ -1662,7 +1662,18 @@ export class MCPConnection extends EventEmitter {
         this.shouldStopReconnecting = false;
         this.reconnectAttempts = 0;
         if (isReconnect) {
-          if (this.client.getServerCapabilities()?.tools != null) {
+          // [cowork] v0.8.8-rc1 cold-catalog guard — REMOVE on upstream v0.8.8 merge
+          // (rc2's packages/api/src/mcp/catalog/recovery.ts supersedes this). See
+          // docs/22_librecowork_fork_changes.md §28. Upstream publishes an EMPTY
+          // catalog (dispatchToolsChanged([])) whenever getServerCapabilities()
+          // reports no tools on a reconnect — but that is also true for the brief
+          // window before the initialize handshake has populated capabilities.
+          // That empty publish overwrites the good (non-expiring) tool cache and
+          // sticks until the process restarts. Only publish [] when capabilities
+          // are actually present and genuinely declare no tools; otherwise force a
+          // refresh once the handshake lands.
+          const caps = this.client.getServerCapabilities();
+          if (caps == null || caps.tools != null) {
             this.toolListChangeGeneration++;
           } else {
             this.handledToolListChangeGeneration = this.toolListChangeGeneration;

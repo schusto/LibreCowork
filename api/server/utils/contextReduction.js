@@ -40,7 +40,7 @@
  * Transform 1 — strip old thinking blocks:
  *   Remove { type: 'think' } parts from assistant messages outside the keep window.
  *
- * Transform 2 — truncate/dedup old tool_call results (three independent tiers):
+ * Transform 2 — truncate/dedup old tool_call results (four independent tiers):
  *
  *   Filesystem tier (DEDUP_TOOL_NAMES):
  *     Dedup identical reads of the same path + truncate to TOOL_TRUNCATE_CHARS
@@ -57,6 +57,15 @@
  *     Outside that window, truncated to WEB_SEARCH_TRUNCATE_CHARS.
  *     No dedup.
  *
+ *   Browsing tier (BROWSING_TOOL_NAMES — browsermcp, Playwright MCP, crawl4ai,
+ *   scraper MCP):
+ *     Windowed by CALL COUNT, not user turn — a single task routinely chains
+ *     several page-render calls (snapshot/screenshot/scrape/crawl) back-to-back
+ *     within one turn, before any turn-based window above would apply. Only the
+ *     most recent BROWSING_KEEP_CALLS calls across all four tools combined stay
+ *     verbatim; earlier ones are truncated to BROWSING_TRUNCATE_CHARS regardless
+ *     of which turn they're in. No dedup.
+ *
  * Configuration (environment variables):
  *
  *   CWK_THINK_KEEP_TURNS          Keep thinking blocks in the last N user turns (default: 2).
@@ -67,6 +76,8 @@
  *   CWK_RAG_TRUNCATE_CHARS        Max chars for a RAG result outside its keep window (default: 2000).
  *   CWK_WEB_TRUNCATE_TURNS        Pass web search results verbatim in the last N user turns (default: 2).
  *   CWK_WEB_TRUNCATE_CHARS        Max chars for a web result outside its keep window (default: 1000).
+ *   CWK_BROWSING_KEEP_CALLS       Pass browsing tool results verbatim for the last N calls (default: 2).
+ *   CWK_BROWSING_TRUNCATE_CHARS   Max chars for a browsing result outside the keep-count (default: 3000).
  */
 
 const fs = require('fs');

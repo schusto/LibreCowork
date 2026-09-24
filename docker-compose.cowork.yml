@@ -99,7 +99,7 @@ services:
       small_ppt:
         condition: service_healthy
     networks:
-      - librechat_default
+      - cowork_infra
       - cowork_default
     volumes:
       - type: bind
@@ -139,7 +139,7 @@ services:
       - CWK_RAG_TRUNCATE_CHARS=2000   # max chars per RAG result outside the keep window
       - CWK_WEB_TRUNCATE_TURNS=2      # web search results kept verbatim for N turns (shorter — discussed quickly)
       - CWK_WEB_TRUNCATE_CHARS=1000   # max chars per web result outside the keep window
-      # - CWK_DUMP_CONTEXT=1            # dump raw formattedMessages to ~/proj/cowork/uploads/cwk-context-dumps/ (one file per request)
+      - CWK_DUMP_CONTEXT=1            # dump raw formattedMessages to ~/proj/cowork/uploads/cwk-context-dumps/ (one file per request) — [cowork] temporarily on to catch the web-researcher subagent losing its user brief (see docs/44)
       # - CWK_DUMP_DIR=/app/uploads/cwk-context-dumps  # default — maps to ~/proj/cowork/uploads/cwk-context-dumps/ on host
       # [cowork] Harness supervisor — proactive memory/work-graph injection + stuck-pattern nudge. See docs/31_harness_memory_supervisor.md.
       - CWK_SUPERVISOR_ENABLED=true
@@ -195,7 +195,11 @@ services:
     init: true
     pull_policy: always
     entrypoint: ["node", "/app/cli.js"]
-    command: ["--headless", "--browser", "chromium", "--no-sandbox", "--port", "8931", "--host", "0.0.0.0"]
+    # --isolated: per-connection in-memory profile (stops shared-page about:blank cross-talk).
+    # --timeout-*: real ceilings so a slow/blocked site fails fast instead of hanging the session.
+    command: ["--headless", "--browser", "chromium", "--no-sandbox", "--isolated",
+              "--timeout-navigation", "45000", "--timeout-action", "15000",
+              "--port", "8931", "--host", "0.0.0.0"]
     ports:
       - "127.0.0.1:8931:8931"
     networks:
@@ -269,7 +273,7 @@ services:
       - "127.0.0.1:3002:3002"
     networks:
       - cowork_default
-      - librechat_default
+      - cowork_infra
 
   # ── Byparr Service ────────────────────────────────────────────────────────
   byparr:
@@ -292,12 +296,72 @@ services:
       - cowork_default
     # TODO: Check ARM64 manifest availability for this image (if not available, remove or comment out)
 
+  # ── MCP sidecars (moved 2026-09-04 from config/LibreChat/docker-compose.override.yml) ──
+  # markitdown_mcp / mcp_office_documents are reached by LibreCowork via
+  # host.docker.internal:<port> (see librechat.yaml mcpServers), so publishing the
+  # port is all that's required — no cowork_infra membership needed.
+  markitdown_mcp:
+    build:
+      context: ../mcp/markitdown-mcp
+    container_name: librechat-markitdown_mcp-1
+    ports:
+      - '3001:3001'
+    volumes:
+      - /Users/erik/proj:/Users/erik/proj:ro
+    restart: unless-stopped
+    networks:
+      - cowork_default
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 3001)); s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  mcp_office_documents:
+    build:
+      context: ../mcp/mcp-ms-office-documents
+    container_name: librechat-mcp_office_documents-1
+    ports:
+      - '8958:8958'
+    volumes:
+      - ../mcp/mcp-ms-office-documents:/app
+      - ../uploads:/app/uploads
+      - ../uploads:/app/output
+    restart: unless-stopped
+    networks:
+      - cowork_default
+
+  # Nightly memory/work-graph consolidation. Needs MongoDB (cowork_infra) and the
+  # host MLX proxy. Its old `depends_on: [api, mongodb]` is gone — `api` is the
+  # retired LibreChat app and mongodb now lives in the infra compose.
+  memory_consolidator:
+    build:
+      context: ../mcp/memory
+    container_name: librechat-memory_consolidator-1
+    volumes:
+      - /Users/erik/proj:/Users/erik/proj
+    environment:
+      MEMORY_FILE:           /Users/erik/proj/cowork-data/memory/memory.md
+      DIGEST_FILE:           /Users/erik/proj/cowork-data/memory/digest.md
+      MONGO_URI:             mongodb://mongodb:27017/LibreChat
+      MLX_URL:               http://host.docker.internal:1235/v1
+      CONSOLIDATION_MODEL:   mlx-community/Qwen3.5-4B-OptiQ-4bit
+      CONSOLIDATION_DAYS:    "1"
+      MEMORY_TOKEN_CAP:      "1000"
+      CONTEXT_DOCS:          ""
+      NODE_PATH:             /app/node_modules
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    networks:
+      - cowork_default
+      - cowork_infra
+
 networks:
-  # Join the LibreChat stack's auto-created network so 'mongodb' and 'meilisearch'
-  # resolve by service name. The network name is <librechat_dir_basename>_default —
-  # 'librechat_default' when LibreChat lives in a directory called 'LibreChat'.
-  # If your LibreChat directory has a different name, adjust accordingly.
-  librechat_default:
+  # Shared infra network (mongodb / meilisearch / searxng / qdrant) owned by
+  # cowork/docker-compose.infra.yml. Must be up before this stack.
+  cowork_infra:
     external: true
   # Own internal network for cowork services
   cowork_default:

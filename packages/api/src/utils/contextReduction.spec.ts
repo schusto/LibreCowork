@@ -155,13 +155,61 @@ describe('applyContextReductionCore', () => {
     }
   });
 
+  it('truncates browsing tool calls by count, not by user turn, even within a single turn', () => {
+    // BROWSING_KEEP_CALLS defaults to 2 — five snapshots in one ongoing turn
+    // (no new user message between them) should still truncate the first three,
+    // even though they're all "recent" by the turn-based windows above.
+    const snapshots = Array.from({ length: 5 }, (_, n) =>
+      toolCallMsg('browser_snapshot_mcp_browser', `page-${n}-`.repeat(2000)),
+    );
+    const messages: ReducibleMessage[] = [userMsg('turn 1'), ...snapshots];
+
+    const result = applyContextReductionCore(messages);
+
+    // First 3 (indices 1-3 in messages, i.e. snapshots[0..2]) truncated.
+    for (let n = 0; n < 3; n++) {
+      const reduced = result.messages[1 + n];
+      expect(reduced).not.toBe(snapshots[n]);
+      const content = reduced.content;
+      if (Array.isArray(content)) {
+        const output = (content[0] as { tool_call?: { output?: string } }).tool_call?.output ?? '';
+        expect(output).toContain('browsing result truncated by context reducer');
+      }
+    }
+
+    // Last 2 (BROWSING_KEEP_CALLS) stay verbatim, reference-identical.
+    expect(result.messages[4]).toBe(snapshots[3]);
+    expect(result.messages[5]).toBe(snapshots[4]);
+
+    expect(result.stats.toolTruncated).toBe(3);
+  });
+
+  it('does not truncate browsing tool calls within the keep-count', () => {
+    const snapshots = [
+      toolCallMsg('md_mcp_crawl4ai', 'A'.repeat(500)),
+      toolCallMsg('scrape_url_mcp_scraper_mcp', 'B'.repeat(500)),
+    ];
+    const messages: ReducibleMessage[] = [userMsg('turn 1'), ...snapshots];
+
+    const result = applyContextReductionCore(messages);
+
+    expect(result.messages[1]).toBe(snapshots[0]);
+    expect(result.messages[2]).toBe(snapshots[1]);
+    expect(result.stats.toolTruncated).toBe(0);
+  });
+
   it('leaves RAG and web search results outside the tool-truncate window alone within their own longer/shorter windows', () => {
     const ragMsg: ReducibleMessage = {
       role: 'assistant',
       content: [
         {
           type: 'tool_call',
-          tool_call: { id: 'c1', name: 'search_knowledge_base', args: '{}', output: 'Z'.repeat(500) },
+          tool_call: {
+            id: 'c1',
+            name: 'search_knowledge_base',
+            args: '{}',
+            output: 'Z'.repeat(500),
+          },
         },
       ],
     };
