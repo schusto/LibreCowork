@@ -33,6 +33,8 @@ jest.mock('~/hooks', () => ({
   useAdaptiveSSE: jest.fn(),
   useResumeOnLoad: jest.fn(),
   useQueueDrain: jest.fn(),
+  useQueuedTurnReveal: jest.fn(),
+  useScrollbarGutterSeed: jest.fn(),
 }));
 
 jest.mock('../Presentation', () => ({
@@ -40,9 +42,12 @@ jest.mock('../Presentation', () => ({
   default: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
 }));
 jest.mock('../Header', () => ({ __esModule: true, default: () => <div /> }));
-jest.mock('../Footer', () => ({ __esModule: true, default: () => <div /> }));
+jest.mock('../Footer', () => ({
+  __esModule: true,
+  default: () => <div />,
+  useConfiguredFooter: () => false,
+}));
 jest.mock('../Landing', () => ({ __esModule: true, default: () => <div /> }));
-jest.mock('../ProjectLandingChip', () => ({ __esModule: true, default: () => <div /> }));
 jest.mock('../Messages/MessagesView', () => ({ __esModule: true, default: () => <div /> }));
 jest.mock('../Input/ChatForm', () => ({ __esModule: true, default: () => <div /> }));
 jest.mock('../Input/ConversationStarters', () => ({ __esModule: true, default: () => <div /> }));
@@ -108,5 +113,35 @@ describe('ChatView page heading', () => {
     expect(
       screen.queryByRole('heading', { level: 1, name: 'Previous chat' }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe('ChatView composer column', () => {
+  beforeEach(() => {
+    mockParams.mockReturnValue({ conversationId: 'convo-1' });
+    mockConversation.mockReturnValue({ conversationId: 'convo-1', title: 'Deploy checklist' });
+  });
+
+  /* The composer's in-flight steer overlay is painted above the composer's top
+     edge, so a scroll container here would clip it out of sight for the whole
+     run. The gutter that lines the column up with the messages has to be
+     reserved with padding instead. */
+  test('reserves the message column gutter without becoming a scroll container', () => {
+    const { container } = render(<ChatView />);
+
+    const composerColumn = container.querySelector('.scrollbar-gutter-spacer');
+
+    expect(composerColumn).not.toBeNull();
+    expect(composerColumn).not.toHaveClass('overflow-y-auto');
+    expect(composerColumn).not.toHaveClass('scrollbar-gutter-stable');
+  });
+
+  test('layers composer overlays above positioned tool glyphs in the message column', () => {
+    const { container } = render(<ChatView />);
+
+    const composerColumn = container.querySelector('.scrollbar-gutter-spacer');
+
+    expect(composerColumn).toHaveClass('[view-transition-name:chat-form]');
+    expect(composerColumn).toHaveClass('relative', 'z-10');
   });
 });

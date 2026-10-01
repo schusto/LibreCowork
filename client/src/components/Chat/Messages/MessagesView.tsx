@@ -1,89 +1,30 @@
-import { memo, useState, useRef, useEffect } from 'react';
+import { useState } from 'react';
 import { useAtomValue } from 'jotai';
 import { useRecoilValue } from 'recoil';
 import { Constants } from 'librechat-data-provider';
-import { CSSTransition } from 'react-transition-group';
 import type { TMessage } from 'librechat-data-provider';
-import { useScreenshot, useMessageScrolling, useLocalize } from '~/hooks';
-import ScrollToBottom from '~/components/Messages/ScrollToBottom';
+import { useScreenshot, useMessageScrolling, useScrollbarGutter, useLocalize } from '~/hooks';
+import { MessagesViewProvider, useChatContext, useFileMapContext } from '~/Providers';
+import { RowMountProvider, useProgressiveRowMount } from '~/hooks/Messages';
+import { useChatSurface } from '~/components/Chat/Subagents/surface';
+import useThreadRows from '~/hooks/Messages/useThreadRows';
 import { steerOverlayHeightFamily } from '~/store/steer';
-import { MessagesViewProvider } from '~/Providers';
+import { autoScrollAtom } from '~/store/autoScroll';
+import { FLAT_THREAD, ThreadList } from './Thread';
 import { fontSizeAtom } from '~/store/fontSize';
 import MultiMessage from './MultiMessage';
+import ScrollButton from './ScrollButton';
+import PendingTurn from './PendingTurn';
 import MessageNav from './MessageNav';
 import { cn } from '~/utils';
 import store from '~/store';
 
-const intersectionThreshold = 0.85;
-const visibilityDebounceRate = 150;
-
-/**
- * Owns the messages-end IntersectionObserver and the button visibility state,
- * so scroll-position flips re-render only this component instead of the whole
- * message tree host. Intersection is reported up through `onNearBottomChange`
- * for the resize-follow logic in `useMessageScrolling`.
- */
-const ScrollButton = memo(function ScrollButton({
-  scrollableRef,
-  messagesEndRef,
-  scrollHandler,
-  onNearBottomChange,
-}: {
-  scrollableRef: React.RefObject<HTMLDivElement | null>;
-  messagesEndRef: React.RefObject<HTMLDivElement | null>;
-  scrollHandler: (event: React.MouseEvent<HTMLButtonElement, MouseEvent>) => void;
-  onNearBottomChange: (isNearBottom: boolean) => void;
-}) {
-  const scrollButtonPreference = useRecoilValue(store.showScrollButton);
-  const [showScrollButton, setShowScrollButton] = useState(false);
-  const scrollToBottomRef = useRef<HTMLDivElement>(null);
-  const timeoutIdRef = useRef<NodeJS.Timeout>();
-
-  useEffect(() => {
-    if (!messagesEndRef.current || !scrollableRef.current) {
-      return;
-    }
-
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        onNearBottomChange(entry.isIntersecting);
-        clearTimeout(timeoutIdRef.current);
-        timeoutIdRef.current = setTimeout(() => {
-          setShowScrollButton(!entry.isIntersecting);
-        }, visibilityDebounceRate);
-      },
-      { root: scrollableRef.current, threshold: intersectionThreshold },
-    );
-
-    observer.observe(messagesEndRef.current);
-
-    return () => {
-      observer.disconnect();
-      clearTimeout(timeoutIdRef.current);
-    };
-  }, [messagesEndRef, scrollableRef, onNearBottomChange]);
-
-  return (
-    <CSSTransition
-      in={showScrollButton && scrollButtonPreference}
-      timeout={{
-        enter: 300,
-        exit: 250,
-      }}
-      classNames="scroll-animation"
-      unmountOnExit={true}
-      appear={true}
-      nodeRef={scrollToBottomRef}
-    >
-      <ScrollToBottom ref={scrollToBottomRef} scrollHandler={scrollHandler} />
-    </CSSTransition>
-  );
-});
-
 function MessagesViewContent({
   messagesTree: _messagesTree,
+  messages,
 }: {
   messagesTree?: TMessage[] | null;
+  messages?: TMessage[] | null;
 }) {
   const localize = useLocalize();
   const fontSize = useAtomValue(fontSizeAtom);
@@ -100,14 +41,34 @@ function MessagesViewContent({
     handleNearBottomChange,
   } = useMessageScrolling(_messagesTree);
 
+  useScrollbarGutter(scrollableRef);
+
   const { conversationId } = conversation ?? {};
+  const fileMap = useFileMapContext();
+  const threadRows = useThreadRows(FLAT_THREAD ? messages : null, conversationId, fileMap);
+
+  const { index, latestMessageDepth } = useChatContext();
+  const isSubmitting = useRecoilValue(store.isSubmittingFamily(index));
+  const { showScrollButton, maximizeChatSpace } = useChatSurface();
+  const autoScroll = useAtomValue(autoScrollAtom);
+  /** Re-arm from the conversation that owns the RENDERED tree: the Recoil
+   *  conversation id lags the route during warm-cache navigation, and keying
+   *  off it would first mount the new tree unwindowed, then narrow it after
+   *  the fact — visibly unmounting rows the user is already reading. */
+  const treeConversationId = _messagesTree?.[0]?.conversationId ?? conversationId;
+  const mountWindow = useProgressiveRowMount({
+    tailDepth: latestMessageDepth,
+    anchorBottom: autoScroll || isSubmitting,
+    isSubmitting,
+    conversationId: treeConversationId,
+    scrollableRef,
+  });
 
   /** The in-flight steer overlay floats above the composer over the bottom of
    *  the thread (see `InFlightSteers`); reserve an equal band here so the
    *  newest message rests above it and older ones scroll behind. */
-  const steerOverlayHeight = useAtomValue(
-    steerOverlayHeightFamily(conversationId ?? Constants.NEW_CONVO),
-  );
+  const overlayConversationId = conversationId ?? Constants.NEW_CONVO;
+  const steerOverlayHeight = useAtomValue(steerOverlayHeightFamily(overlayConversationId));
 
   return (
     <>
@@ -121,6 +82,10 @@ function MessagesViewContent({
               height: '100%',
               overflowY: 'auto',
               width: '100%',
+              /** The mount hook pins the anchor row itself (document-space
+               *  measurement); native scroll anchoring reacting to the same
+               *  insertions would double-correct. */
+              overflowAnchor: mountWindow != null ? 'none' : undefined,
             }}
           >
             <div
@@ -144,13 +109,28 @@ function MessagesViewContent({
               ) : (
                 <>
                   <div ref={screenshotTargetRef} data-testid="screenshot-target">
-                    <MultiMessage
-                      messagesTree={_messagesTree}
-                      messageId={conversationId ?? null}
-                      setCurrentEditId={setCurrentEditId}
-                      currentEditId={currentEditId ?? null}
-                    />
+                    <RowMountProvider mountWindow={mountWindow}>
+                      {FLAT_THREAD && threadRows ? (
+                        <ThreadList
+                          rows={threadRows}
+                          setCurrentEditId={setCurrentEditId}
+                          currentEditId={currentEditId ?? null}
+                        />
+                      ) : (
+                        <MultiMessage
+                          messagesTree={_messagesTree}
+                          messageId={conversationId ?? null}
+                          setCurrentEditId={setCurrentEditId}
+                          currentEditId={currentEditId ?? null}
+                        />
+                      )}
+                    </RowMountProvider>
                   </div>
+                  <PendingTurn
+                    scrollableRef={scrollableRef}
+                    messages={messages}
+                    maximizeChatSpace={maximizeChatSpace}
+                  />
                 </>
               )}
               <div
@@ -162,10 +142,14 @@ function MessagesViewContent({
           </div>
 
           <ScrollButton
+            conversationId={overlayConversationId}
+            enabled={showScrollButton}
+            maximizeChatSpace={maximizeChatSpace}
             scrollableRef={scrollableRef}
             messagesEndRef={messagesEndRef}
             scrollHandler={handleSmoothToRef}
             onNearBottomChange={handleNearBottomChange}
+            overlayHeight={steerOverlayHeight}
           />
 
           <MessageNav scrollableRef={scrollableRef} />
@@ -175,10 +159,16 @@ function MessagesViewContent({
   );
 }
 
-export default function MessagesView({ messagesTree }: { messagesTree?: TMessage[] | null }) {
+export default function MessagesView({
+  messagesTree,
+  messages,
+}: {
+  messagesTree?: TMessage[] | null;
+  messages?: TMessage[] | null;
+}) {
   return (
     <MessagesViewProvider>
-      <MessagesViewContent messagesTree={messagesTree} />
+      <MessagesViewContent messagesTree={messagesTree} messages={messages} />
     </MessagesViewProvider>
   );
 }

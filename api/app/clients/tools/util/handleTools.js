@@ -1,9 +1,14 @@
-const { logger } = require('@librechat/data-schemas');
+const { logger, getTenantId } = require('@librechat/data-schemas');
 const { Calculator, createSearchTool, createCodeExecutionTool } = require('@librechat/agents');
 const {
   checkAccess,
   toolkitParent,
+  toolRolePermissions,
+  checkToolRolePermission,
   createSafeUser,
+  loadMCPTools,
+  createAuthIdentityContext,
+  selectMCPUpstreamTokenProvider,
   mcpToolPattern,
   loadWebSearchAuth,
   splitMCPToolKey,
@@ -20,8 +25,12 @@ const {
   ASK_USER_QUESTION_TOOL_NAME,
   resolveWebSearchSSRFAgents,
   buildWebSearchDynamicContext,
+  codeExecutionAuthHeaders,
+  getCodeFileLocation,
+  resolveCodeExecutionContext,
 } = require('@librechat/api');
 const {
+  AuthType,
   Tools,
   Constants,
   Permissions,
@@ -54,6 +63,7 @@ const {
   resolveCollisionAuditNames,
 } = require('~/server/services/MCP');
 const { getMCPRequestContext } = require('~/server/services/MCPRequestContext');
+const { createOpenIDSessionTokenProvider } = require('~/server/services/OpenIDSessionRefresh');
 const { createFileSearchTool, primeFiles: primeSearchFiles } = require('./fileSearch');
 const { primeFiles: primeCodeFiles } = require('~/server/services/Files/Code/process');
 const { getUserPluginAuthValue } = require('~/server/services/PluginService');
@@ -141,7 +151,20 @@ const validateTools = async (user, tools = []) => {
 const loadToolWithAuth = (userId, authFields, ToolConstructor, options = {}) => {
   return async function () {
     const authValues = await loadAuthValues({ userId, authFields });
-    return new ToolConstructor({ ...options, ...authValues, userId });
+    const userProvidedAuthFields = new Set(
+      authFields
+        .flatMap((authField) => authField.split('||'))
+        .filter((authField) => {
+          const value = process.env[authField];
+          return !value || value.trim() === '' || value === AuthType.USER_PROVIDED;
+        }),
+    );
+    return new ToolConstructor({
+      ...options,
+      ...authValues,
+      userId,
+      userProvidedAuthFields,
+    });
   };
 };
 
@@ -329,11 +352,52 @@ const loadTools = async ({
   const shadowedServers = findShadowedServerNames(collisionAudit.names);
 
   for (const tool of tools) {
+    /** `loadTools` is the shared boundary for every runtime that equips these
+     *  tools — agents, and the Assistants required-action flow via
+     *  `processRequiredActions`, which never passes through the agent capability
+     *  filter. Gate here so a denied role cannot reach the sandbox or the search
+     *  index down any of them. The check is request-cached, so the agent path
+     *  that already resolved this grant pays nothing for the second look. */
+    const rolePermission = toolRolePermissions[tool];
+    if (rolePermission != null && options.req?.user != null) {
+      const allowed = await checkToolRolePermission({
+        req: options.req,
+        user: options.req.user,
+        permissionType: rolePermission,
+        getRoleByName,
+        context: 'handleTools',
+      });
+      if (!allowed) {
+        continue;
+      }
+    }
+
     if (tool === Tools.execute_code) {
       requestedTools[tool] = async () => {
+        const statefulSessions =
+          agent?.stateful_code_sessions === true &&
+          (await checkCapability(options.req, AgentCapabilities.stateful_code_sessions));
+        const codeExecutionContext =
+          options.codeExecutionContext ??
+          resolveCodeExecutionContext({
+            statefulSessions,
+            environment: agent?.stateful_code_environment,
+            environmentId: agent?.code_environment_id,
+            environments:
+              options.req?.config?.endpoints?.agents?.statefulCodeSessions?.environments,
+            userId: user,
+            agentId: agent?.id,
+            conversationId: options.req?.body?.conversationId,
+          });
         const { files, toolContext } = await primeCodeFiles({
           ...options,
+          signal,
           agentId: agent?.id,
+          codeApiBaseUrl: codeExecutionContext.baseUrl,
+          executionProfile: codeExecutionContext.executionProfile,
+          executionRouteKey: codeExecutionContext.executionRouteKey,
+          bridgeWorkerId: codeExecutionContext.bridgeWorkerId,
+          codeFileLocation: getCodeFileLocation(codeExecutionContext),
         });
         if (toolContext) {
           dynamicToolContextMap[tool] = toolContext;
@@ -341,18 +405,15 @@ const loadTools = async ({
         if (files?.length) {
           primedCodeFiles = files;
         }
-        /* Hedge the execute_code description toward persistence only when the
-         * admin `stateful_code_sessions` capability is on AND the agent opted
-         * in via the builder (off by default); the matching wire hint is set
-         * in the run config. Older @librechat/agents ignore the param. */
-        const statefulSessions =
-          agent?.stateful_code_sessions === true &&
-          (await checkCapability(options.req, AgentCapabilities.stateful_code_sessions));
         return createCodeExecutionTool({
           user_id: user,
           files,
-          authHeaders: () => getCodeApiAuthHeaders(options.req),
-          statefulSessions,
+          authHeaders: () =>
+            codeExecutionAuthHeaders(
+              (bridgeWorkerId) => getCodeApiAuthHeaders(options.req, bridgeWorkerId),
+              codeExecutionContext,
+            ),
+          ...codeExecutionContext,
         });
       };
       continue;
@@ -383,6 +444,7 @@ const loadTools = async ({
         }
 
         return createFileSearchTool({
+          appConfig: options.req.config,
           userId: user,
           files,
           entity_id: agent?.id,
@@ -396,6 +458,10 @@ const loadTools = async ({
         loadAuthValues,
         webSearchConfig: webSearch,
       });
+      if (!result.authenticated) {
+        logger.warn('[handleTools] Skipping web search because authentication is incomplete.');
+        continue;
+      }
       const { onSearchResults, onGetHighlights } = options?.[Tools.web_search] ?? {};
       const { httpAgent, httpsAgent } = resolveWebSearchSSRFAgents(
         result.authResult,
@@ -403,9 +469,7 @@ const loadTools = async ({
       );
       requestedTools[tool] = async () => {
         toolContextMap[tool] = buildWebSearchContext();
-        dynamicToolContextMap[tool] = buildWebSearchDynamicContext(
-          options.req?.conversationCreatedAt,
-        );
+        dynamicToolContextMap[tool] = buildWebSearchDynamicContext(options.req?.turnStartedAt);
         return createSearchTool({
           ...result.authResult,
           httpAgent,
@@ -560,88 +624,61 @@ const loadTools = async ({
   }
 
   const loadedTools = (await Promise.all(toolPromises)).flatMap((plugin) => plugin || []);
-  const mcpToolPromises = [];
-  /** MCP server tools are initialized sequentially by server */
-  let index = -1;
-  const failedMCPServers = new Set();
   const safeUser = createSafeUser(options.req?.user);
   const requestScopedConnections =
     options.requestScopedConnections ?? getMCPRequestContext(options.req, options.res);
+  /**
+   * Build the OBO upstream-token closure once at the request boundary (where
+   * `req`/`res` are in scope) and thread the function into MCP handling, so the
+   * MCP layer never receives the raw Express request. The closure reads/refreshes
+   * the live `req.session.openidTokens` at tool-call time and mirrors rotations
+   * to the `refreshToken` cookie when the response is still writable.
+   */
+  const oboIdentityContext = createAuthIdentityContext({
+    user: options.req?.user,
+    tenantId: getTenantId(),
+  });
+  const upstreamTokenProviderResolver = options.upstreamTokenProviderResolver;
+  const upstreamTokenProvider = selectMCPUpstreamTokenProvider({
+    upstreamTokenProvider: options.upstreamTokenProvider,
+    upstreamTokenProviderResolver,
+    createSessionProvider: () =>
+      createOpenIDSessionTokenProvider({
+        req: options.req,
+        res: options.res,
+        user: options.req?.user,
+        identityContext: oboIdentityContext,
+        tokenPreference: 'access_token',
+      }),
+  });
 
-  for (const [serverName, toolConfigs] of Object.entries(requestedMCPTools)) {
-    index++;
-    /** @type {LCAvailableTools} */
-    let availableTools = options.mcpAvailableTools?.[serverName];
-    for (const config of toolConfigs) {
-      try {
-        if (failedMCPServers.has(serverName)) {
-          continue;
-        }
-        const mcpParams = {
-          mcpPermissionContext,
-          index,
-          signal,
-          user: safeUser,
-          userMCPAuthMap,
-          configServers,
-          requestBody: options.req?.body,
-          requestScopedConnections,
-          res: options.res,
-          streamId: options.req?._resumableStreamId || null,
-          jobCreatedAt: options.jobCreatedAt,
-          model: agent?.model ?? model,
-          serverName: config.serverName,
-          provider: agent?.provider ?? endpoint,
-          config: config.config,
-        };
-
-        if (config.type === 'all' && toolConfigs.length === 1) {
-          /** Handle async loading for single 'all' tool config */
-          mcpToolPromises.push(
-            createMCPTools(mcpParams).catch((error) => {
-              logger.error(`Error loading ${serverName} tools:`, error);
-              return null;
-            }),
-          );
-          continue;
-        }
-        if (!availableTools) {
-          try {
-            availableTools = await getMCPServerTools(safeUser.id, serverName, config.config);
-          } catch (error) {
-            logger.error(`Error fetching available tools for MCP server ${serverName}:`, error);
-          }
-        }
-
-        /** Handle synchronous loading */
-        const mcpTool =
-          config.type === 'all'
-            ? await createMCPTools(mcpParams)
-            : await createMCPTool({
-                ...mcpParams,
-                availableTools,
-                toolKey: config.toolKey,
-                onAvailableTools: (tools) => {
-                  availableTools = tools;
-                },
-              });
-
-        if (Array.isArray(mcpTool)) {
-          loadedTools.push(...mcpTool);
-        } else if (mcpTool) {
-          loadedTools.push(mcpTool);
-        } else {
-          failedMCPServers.add(serverName);
-          logger.warn(
-            `MCP tool creation failed for "${config.toolKey}", server may be unavailable or unauthenticated.`,
-          );
-        }
-      } catch (error) {
-        logger.error(`Error loading MCP tool for server ${serverName}:`, error);
-      }
-    }
-  }
-  loadedTools.push(...(await Promise.all(mcpToolPromises)).flatMap((plugin) => plugin || []));
+  loadedTools.push(
+    ...(await loadMCPTools({
+      userId: user,
+      requestedTools: requestedMCPTools,
+      availableTools: options.mcpAvailableTools,
+      createTools: createMCPTools,
+      createTool: createMCPTool,
+      getAvailableTools: getMCPServerTools,
+      context: {
+        mcpPermissionContext,
+        signal,
+        user: safeUser,
+        userMCPAuthMap,
+        configServers,
+        requestBody: options.requestBody ?? options.req?.body,
+        requestScopedConnections,
+        res: options.res,
+        upstreamTokenProvider,
+        upstreamTokenProviderResolver,
+        oboIdentityContext,
+        streamId: options.req?._resumableStreamId || null,
+        jobCreatedAt: options.jobCreatedAt,
+        model: agent?.model ?? model,
+        provider: agent?.provider ?? endpoint,
+      },
+    })),
+  );
   return { loadedTools, toolContextMap, dynamicToolContextMap, primedCodeFiles };
 };
 

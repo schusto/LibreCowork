@@ -1,29 +1,111 @@
 const { logger } = require('@librechat/data-schemas');
 const {
+  formatMCPServerTools,
+  getUserMCPAuthMap,
   getMissingCustomUserVars,
+  loadMCPServerCatalogs: loadCatalogs,
+  resolveMCPReinitializeConfig,
   requiresEphemeralUserConnection,
   getMissingRuntimeBodyPlaceholderFields,
+  isMCPInitializationError,
+  prepareMCPAuthorizationMutation,
+  recordScheduledMCPToolAuthFailure,
 } = require('@librechat/api');
 const { CacheKeys, Constants } = require('librechat-data-provider');
 const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~/config');
-const { findToken, createToken, updateToken, deleteTokens } = require('~/models');
+const {
+  findToken,
+  createToken,
+  updateToken,
+  deleteTokens,
+  findPluginAuthsByKeys,
+} = require('~/models');
 const { getGraphApiToken } = require('~/server/services/GraphTokenService');
 const { exchangeOboToken } = require('~/server/services/OboTokenService');
 const { createOboTrustChecker } = require('~/server/services/OboPolicyService');
 const {
+  getMCPServerTools,
+  cacheMCPServerTools,
   getMCPToolsCacheGeneration,
   updateMCPServerTools,
-  getMCPServerTools,
+  invalidateCachedTools,
 } = require('~/server/services/Config');
-const { reserveMCPToolsChangedRevision } = require('@librechat/api');
 const { getLogStores } = require('~/cache');
+const {
+  clearMCPAuthorizationFenceRetry,
+  persistMCPAuthorizationFenceRetry,
+} = require('~/server/services/MCPAuthorizationFenceRetry');
 
 const MCP_REINITIALIZE_FAILURE_REASONS = {
-  UNREACHABLE: 'unreachable',
   MISSING_CUSTOM_USER_VARS: 'missing_custom_user_vars',
   OAUTH_REQUIRED: 'oauth_required',
   INITIALIZATION_FAILED: 'initialization_failed',
 };
+
+/** Wires application dependencies into the passive, request-local catalog recovery service.
+ * @param {Object} params
+ * @param {IUser} params.user
+ * @param {Array<{ serverName: string, serverConfig: object }>} params.servers
+ * @param {import('@librechat/api').UpstreamTokenProvider} [params.upstreamTokenProvider] - Live upstream-token closure for OBO discovery, built at the request boundary so this layer never receives the raw Express request.
+ * @param {import('@librechat/api').UpstreamTokenProviderResolver} [params.upstreamTokenProviderResolver]
+ * @param {import('@librechat/api').AuthIdentityContext} [params.oboIdentityContext] - Non-template-visible OBO identity context built from the real request user.
+ * @param {AbortSignal} [params.signal] - Cancels queued and in-flight catalog reads when the request ends.
+ * @param {import('@librechat/api').MCPServerCatalogRecoveryPolicy} [params.recoveryPolicy]
+ */
+async function loadMCPServerCatalogs({
+  user,
+  servers,
+  upstreamTokenProvider,
+  upstreamTokenProviderResolver,
+  oboIdentityContext,
+  signal,
+  recoveryPolicy,
+}) {
+  const flowManager = getFlowStateManager(getLogStores(CacheKeys.FLOWS));
+  const tokenMethods = { findToken, updateToken, createToken, deleteTokens };
+  const mcpManager = getMCPManager();
+  const onOAuthCredentialsChanging = (scope) =>
+    prepareMCPAuthorizationMutation(scope, {
+      invalidateRecoveryGeneration: invalidateCachedTools,
+      persistPublicationRetry: persistMCPAuthorizationFenceRetry,
+      clearPublicationRetry: clearMCPAuthorizationFenceRetry,
+      clearLocalRecovery: (userId, serverName, generation) =>
+        mcpManager.clearCatalogRecoveryState?.(userId, serverName, generation),
+      retryDelaysMs: recoveryPolicy?.authorizationFenceRetryMs,
+      attemptTimeoutMs: recoveryPolicy?.authorizationFenceTimeoutMs,
+    });
+  return loadCatalogs(
+    { user, servers, signal, recoveryPolicy },
+    {
+      loadUserMCPAuthMap: (userId, serverNames) =>
+        getUserMCPAuthMap({
+          userId,
+          servers: serverNames,
+          findPluginAuthsByKeys,
+        }),
+      discoverServerTools: (options) =>
+        mcpManager.discoverServerTools({
+          ...options,
+          flowManager,
+          tokenMethods,
+          graphTokenResolver: getGraphApiToken,
+          oboTokenResolver: exchangeOboToken,
+          oboTrustChecker: createOboTrustChecker(),
+          upstreamTokenProvider,
+          upstreamTokenProviderResolver,
+          oboIdentityContext,
+        }),
+      onOAuthCredentialsChanging,
+      formatServerTools: formatMCPServerTools,
+      recoveryTracker: mcpManager.getCatalogRecoveryTracker?.(),
+      getRecoveryGeneration: getMCPToolsCacheGeneration,
+      getCachedServerTools: getMCPServerTools,
+      getServerToolFunctionsSnapshot: (userId, serverName, serverConfig, options) =>
+        mcpManager.getServerToolFunctionsSnapshot(userId, serverName, serverConfig, options),
+      cacheServerTools: cacheMCPServerTools,
+    },
+  );
+}
 
 /**
  * Reinitializes an MCP server connection and discovers available tools.
@@ -31,6 +113,9 @@ const MCP_REINITIALIZE_FAILURE_REASONS = {
  * (per MCP spec, tool listing should be possible without auth).
  * @param {Object} params
  * @param {IUser} params.user - The user from the request object.
+ * @param {import('@librechat/api').UpstreamTokenProvider} [params.upstreamTokenProvider] - Live upstream-token closure for OBO connection establishment, built at the request boundary so this layer never receives the raw Express request.
+ * @param {import('@librechat/api').UpstreamTokenProviderResolver} [params.upstreamTokenProviderResolver]
+ * @param {import('@librechat/api').AuthIdentityContext} [params.oboIdentityContext] - Non-template-visible OBO identity context built from the real request user.
  * @param {string} params.serverName - The name of the MCP server
  * @param {boolean} params.returnOnOAuth - Whether to initiate OAuth and return, or wait for OAuth flow to finish
  * @param {AbortSignal} [params.signal] - The abort signal to handle cancellation.
@@ -42,6 +127,9 @@ const MCP_REINITIALIZE_FAILURE_REASONS = {
  * @param {import('@librechat/api').RequestBody} [params.requestBody]
  * @param {import('@librechat/api').RequestScopedMCPConnectionStore} [params.requestScopedConnections]
  * @param {Record<string, Record<string, string>>} [params.userMCPAuthMap]
+ * @param {import('@librechat/api').MCPServerCatalogRecoveryPolicy} [params.recoveryPolicy]
+ * @param {string | null} [params.streamId] - Owning generation's stream ID, if resumable.
+ * @param {number} [params.jobCreatedAt] - Owning generation epoch.
  */
 async function reinitMCPServer({
   user,
@@ -57,7 +145,13 @@ async function reinitMCPServer({
   serverConfig: providedConfig,
   requestBody,
   requestScopedConnections,
+  upstreamTokenProvider,
+  upstreamTokenProviderResolver,
+  oboIdentityContext,
   oauthEnd,
+  recoveryPolicy,
+  streamId,
+  jobCreatedAt,
 }) {
   /** @type {MCPConnection | null} */
   let connection = null;
@@ -75,60 +169,25 @@ async function reinitMCPServer({
 
   try {
     const registry = getMCPServersRegistry();
-    serverConfig =
-      serverConfig ?? (await registry.getServerConfig(serverName, user?.id, configServers));
-    ephemeralServer = serverConfig ? requiresEphemeralUserConnection(serverConfig) : false;
-    if (serverConfig?.inspectionFailed) {
-      if (serverConfig.source === 'config') {
-        logger.info(
-          `[MCP Reinitialize] Config-source server ${serverName} has inspectionFailed — retry handled by config cache`,
-        );
-        return {
-          availableTools: null,
-          success: false,
-          message: `MCP server '${serverName}' is still unreachable`,
-          failureReason: MCP_REINITIALIZE_FAILURE_REASONS.UNREACHABLE,
-          oauthRequired: false,
-          serverName,
-          oauthUrl: null,
-          tools: null,
-        };
-      } else {
-        logger.info(
-          `[MCP Reinitialize] Server ${serverName} had failed inspection, attempting reinspection`,
-        );
-        try {
-          const storageLocation = serverConfig.source === 'user' ? 'DB' : 'CACHE';
-          await registry.reinspectServer(serverName, storageLocation, user?.id);
-          logger.info(`[MCP Reinitialize] Reinspection succeeded for server: ${serverName}`);
-        } catch (reinspectError) {
-          logger.error(
-            `[MCP Reinitialize] Reinspection failed for server ${serverName}:`,
-            reinspectError,
-          );
-          return {
-            availableTools: null,
-            success: false,
-            message: `MCP server '${serverName}' is still unreachable`,
-            failureReason: MCP_REINITIALIZE_FAILURE_REASONS.UNREACHABLE,
-            oauthRequired: false,
-            serverName,
-            oauthUrl: null,
-            tools: null,
-          };
-        }
-      }
+    const resolution = await resolveMCPReinitializeConfig(
+      registry,
+      serverName,
+      serverConfig ?? (await registry.getServerConfig(serverName, user?.id, configServers)),
+      user?.id,
+    );
+    if (resolution.result) {
+      return resolution.result;
     }
+    serverConfig = resolution.serverConfig;
+    ephemeralServer = serverConfig ? requiresEphemeralUserConnection(serverConfig) : false;
 
     const customUserVars = userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
 
     const missingUserVars = getMissingCustomUserVars(serverConfig ?? {}, customUserVars);
     if (missingUserVars.length > 0) {
-      logger.warn(
-        `[MCP Reinitialize] Skipping server '${serverName}': required user-provided variable(s) not set: ${missingUserVars.join(
-          ', ',
-        )}. Tools will not be exposed until the user configures them.`,
-      );
+      logger.warn('[MCP Reinitialize] Skipping server with missing user configuration', {
+        missingVariableCount: missingUserVars.length,
+      });
       return {
         availableTools: null,
         success: false,
@@ -151,9 +210,8 @@ async function reinitMCPServer({
       : [];
     if (missingBodyFields.length > 0) {
       logger.info(
-        `[MCP Reinitialize] Server '${serverName}' requires request body field(s) [${missingBodyFields.join(
-          ', ',
-        )}] for runtime placeholders; connection deferred to first use in a chat turn`,
+        '[MCP Reinitialize] Runtime placeholders unresolved; connection deferred to first use',
+        { missingBodyFieldCount: missingBodyFields.length },
       );
       return {
         availableTools: null,
@@ -172,6 +230,16 @@ async function reinitMCPServer({
 
     const flowManager = _flowManager ?? getFlowStateManager(getLogStores(CacheKeys.FLOWS));
     const mcpManager = getMCPManager();
+    const onOAuthCredentialsChanging = (scope) =>
+      prepareMCPAuthorizationMutation(scope, {
+        invalidateRecoveryGeneration: invalidateCachedTools,
+        persistPublicationRetry: persistMCPAuthorizationFenceRetry,
+        clearPublicationRetry: clearMCPAuthorizationFenceRetry,
+        clearLocalRecovery: (userId, changedServerName) =>
+          mcpManager.clearCatalogRecoveryState?.(userId, changedServerName),
+        retryDelaysMs: recoveryPolicy?.authorizationFenceRetryMs,
+        attemptTimeoutMs: recoveryPolicy?.authorizationFenceTimeoutMs,
+      });
     const tokenMethods = { findToken, updateToken, createToken, deleteTokens };
 
     if (!ephemeralServer) {
@@ -184,7 +252,7 @@ async function reinitMCPServer({
     const oauthStart =
       _oauthStart ??
       (async (authURL, options) => {
-        logger.info(`[MCP Reinitialize] OAuth URL received for ${serverName}`);
+        logger.info('[MCP Reinitialize] OAuth URL received');
         if (authURL !== oauthUrl) {
           oauthExpiresAt = undefined;
         }
@@ -204,6 +272,7 @@ async function reinitMCPServer({
         serverName,
         flowManager,
         tokenMethods,
+        onOAuthCredentialsChanging,
         returnOnOAuth,
         oauthEnd,
         customUserVars,
@@ -214,11 +283,17 @@ async function reinitMCPServer({
         graphTokenResolver: getGraphApiToken,
         oboTokenResolver: exchangeOboToken,
         oboTrustChecker: createOboTrustChecker(),
+        upstreamTokenProvider,
+        upstreamTokenProviderResolver,
+        oboIdentityContext,
       });
 
-      logger.info(`[MCP Reinitialize] Successfully established connection for ${serverName}`);
+      logger.info('[MCP Reinitialize] Successfully established connection');
     } catch (err) {
-      logger.info(`[MCP Reinitialize] getConnection threw error: ${err.message}`);
+      if (isMCPInitializationError(err, signal)) {
+        throw err;
+      }
+      logger.info('[MCP Reinitialize] Connection attempt failed');
       logger.info(
         `[MCP Reinitialize] OAuth state - oauthRequired: ${oauthRequired}, oauthUrl: ${oauthUrl ? 'present' : 'null'}`,
       );
@@ -231,9 +306,7 @@ async function reinitMCPServer({
       const isOAuthFlowInitiated = err.message === 'OAuth flow initiated - return early';
 
       if (isOAuthError || oauthRequired || isOAuthFlowInitiated) {
-        logger.info(
-          `[MCP Reinitialize] OAuth required for ${serverName}, attempting tool discovery without auth`,
-        );
+        logger.info('[MCP Reinitialize] OAuth required; attempting tool discovery without auth');
         oauthRequired = true;
 
         try {
@@ -243,6 +316,7 @@ async function reinitMCPServer({
             serverName,
             flowManager,
             tokenMethods,
+            onOAuthCredentialsChanging,
             oauthStart,
             customUserVars,
             requestBody,
@@ -251,153 +325,60 @@ async function reinitMCPServer({
             graphTokenResolver: getGraphApiToken,
             oboTokenResolver: exchangeOboToken,
             oboTrustChecker: createOboTrustChecker(),
+            upstreamTokenProvider,
+            upstreamTokenProviderResolver,
+            oboIdentityContext,
           });
 
           if (discoveryResult.tools && discoveryResult.tools.length > 0) {
             tools = discoveryResult.tools;
             logger.info(
-              `[MCP Reinitialize] Discovered ${tools.length} tools for ${serverName} without full auth`,
+              `[MCP Reinitialize] Discovered ${tools.length} tools without full authentication`,
             );
           }
-        } catch (discoveryErr) {
-          logger.debug(
-            `[MCP Reinitialize] Tool discovery failed for ${serverName}: ${discoveryErr?.message ?? String(discoveryErr)}`,
-          );
+        } catch (error) {
+          if (isMCPInitializationError(error, signal)) {
+            throw error;
+          }
+          logger.debug('[MCP Reinitialize] Tool discovery failed');
         }
       } else {
-        logger.error(
-          `[MCP Reinitialize] Error initializing MCP server ${serverName} for user:`,
-          err,
-        );
+        logger.error('[MCP Reinitialize] Error initializing MCP server');
       }
     }
 
     if (connection && !oauthRequired) {
       publicationGeneration =
         mcpManager.getToolPublicationGeneration(connection) ?? publicationGeneration;
-      // ─────────────────────────────────────────────────────────────────────
-      // [cowork] Reserve app-level publish ordering BEFORE the tools/list call
-      // (mirrors connection.ts's refreshChangedTools). Without this,
-      // updateMCPServerTools() -> replaceAppServerTools() silently no-ops
-      // (logger.debug, no warning) for every APP-level (YAML) server
-      // reinitialized through this per-message path — tools.ts:375-378
-      // requires a non-empty `publicationRevision` and just `return false`s
-      // otherwise. The upstream rc1 reinit path here never supplied one.
-      //
-      // Symptom: the MCP server connects fine, tools/list returns real tools,
-      // yet the agent still fails with "configured to use MCP tools, but none
-      // are available" — with ZERO error/warn log lines, because the cache
-      // write was skipped, not failed. Manually clicking "reinitialize" in the
-      // UI works around it (api/server/routes/mcp.js's reinitialize route
-      // calls invalidateCachedTools() first, which forces the connection's
-      // OWN toolsChanged event — a separate path that DOES reserve a revision
-      // via connection.ts — to repopulate the cache on the next read).
-      // Found live 2026-09-11 on the `rag` server. See
-      // docs/22_librecowork_fork_changes.md §32. `reserveMCPToolsChangedRevision`
-      // itself no-ops (returns undefined) for genuinely user-scoped servers,
-      // so calling it unconditionally here is safe.
-      publicationRevision = await reserveMCPToolsChangedRevision({ serverName, serverConfig });
-      // ─────────────────────────────────────────────────────────────────────
       let snapshot;
       if (typeof connection.fetchOrderedToolsSnapshot === 'function') {
-        snapshot = await connection.fetchOrderedToolsSnapshot();
+        snapshot = await connection.fetchOrderedToolsSnapshot(undefined, signal);
       } else if (typeof connection.fetchToolsSnapshot === 'function') {
-        snapshot = await connection.fetchToolsSnapshot();
+        snapshot = await connection.fetchToolsSnapshot(undefined, signal);
       } else {
         snapshot = { tools: await connection.fetchTools(), complete: true };
       }
       if (snapshot.complete) {
         tools = snapshot.tools;
+        /** Reserved before this snapshot's tools/list; an app-level catalog cannot publish
+         * without it, and allocating a later one here would outrank fresher tools. */
+        publicationRevision = snapshot.publicationRevision;
+        if (snapshot.orderingUnavailable && typeof connection.refreshToolList === 'function') {
+          /** These tools still serve this request; the connection republishes the shared
+           * catalog under backoff rather than leaving it cold until the next reinitialize. */
+          connection
+            .refreshToolList()
+            .catch((err) =>
+              logger.debug(
+                `[MCP Reinitialize] Could not schedule a catalog republish for ${serverName}: ${err?.message ?? String(err)}`,
+              ),
+            );
+        }
       } else {
         logger.warn(
           `[MCP Reinitialize] Preserving cached tools for ${serverName} because tools/list returned an incomplete snapshot`,
         );
       }
-
-      // ─────────────────────────────────────────────────────────────────────────
-      // [cowork] BEGIN v0.8.8-rc1 MCP cold-catalog regression guard.
-      // ‼️  REMOVE THIS BLOCK when merging upstream LibreChat v0.8.8 (rc2 or final).
-      //     rc2 fixes this properly via packages/api/src/mcp/catalog/recovery.ts
-      //     (#15323 "Recover Missing MCP Catalogs" + #15429 "Shared Gate"), which
-      //     rediscovers via a fresh ephemeral connection instead of the pooled one.
-      //     See docs/22_librecowork_fork_changes.md §28.
-      //
-      // Symptom: after a long idle (overnight), the first message fails with
-      //   "[ResumableAgentController] ... configured to use MCP tools, but none are
-      //    available". Every server logs "Successfully established connection"
-      //    (twice — getOrFetch + refresh), retrying never recovers it, only a
-      //    container restart does.
-      //
-      // Root cause: for APP-level (YAML) servers, MCPManager.getConnection returns
-      //   the pooled MCPConnection verbatim and ignores `forceNew` (only
-      //   getUserConnection honors it). ConnectionsRepository only rebuilds on
-      //   isStale()/!isConnected(). So once a pooled app connection reports
-      //   isConnected()===true but its published tool catalog is [] (an idle
-      //   reconnect published an empty list, or tools/list briefly returned none),
-      //   nothing in the request path — not `forceNew`, not refreshToolList(), not
-      //   the tool cache (also empty) — can rebuild it. Only disconnectAppServers()
-      //   (process shutdown) clears it.
-      //
-      // Fix: when an app server hands back an empty catalog, force a real transport
-      //   rebuild on the connection object itself (connect() disconnects + rebuilds
-      //   + re-runs initialize) and read tools/list directly. Always log the
-      //   outcome at info level so a persistent failure is fully explained.
-      const gotNoUsableTools = !Array.isArray(tools) || tools.length === 0;
-      if (connection && !oauthRequired && !ephemeralServer && gotNoUsableTools) {
-        const snapCount = Array.isArray(snapshot?.tools) ? snapshot.tools.length : 'n/a';
-        let rebuiltCount = 'n/a';
-        let rebuiltComplete = 'n/a';
-        let connectedAfter = 'n/a';
-        try {
-          if (typeof connection.connect === 'function') {
-            await connection.connect();
-          } else if (typeof connection.refreshToolList === 'function') {
-            await connection.refreshToolList();
-          }
-          if (typeof connection.isConnected === 'function') {
-            connectedAfter = String(await connection.isConnected());
-          }
-          let rebuilt;
-          if (typeof connection.fetchToolsSnapshot === 'function') {
-            rebuilt = await connection.fetchToolsSnapshot();
-          } else {
-            rebuilt = { tools: await connection.fetchTools(), complete: true };
-          }
-          rebuiltComplete = String(rebuilt?.complete);
-          rebuiltCount = Array.isArray(rebuilt?.tools) ? String(rebuilt.tools.length) : 'n/a';
-          if (Array.isArray(rebuilt?.tools) && rebuilt.tools.length > 0) {
-            tools = rebuilt.tools;
-          }
-        } catch (rebuildErr) {
-          logger.warn(
-            `[MCP Reinitialize] [cowork] cold-catalog guard: forced reconnect for ${serverName} threw: ${
-              rebuildErr?.message ?? String(rebuildErr)
-            }`,
-          );
-        }
-
-        if (!Array.isArray(tools) || tools.length === 0) {
-          tools = null;
-          const cachedAvailableTools = await getMCPServerTools(user.id, serverName, serverConfig);
-          if (cachedAvailableTools && Object.keys(cachedAvailableTools).length > 0) {
-            availableTools = cachedAvailableTools;
-          }
-          logger.warn(
-            `[MCP Reinitialize] [cowork] cold-catalog guard EXHAUSTED for ${serverName}: ` +
-              `snapshot.complete=${snapshot?.complete} snapshot.tools=${snapCount} ` +
-              `rebuilt.complete=${rebuiltComplete} rebuilt.tools=${rebuiltCount} ` +
-              `connectedAfterRebuild=${connectedAfter} ` +
-              `cacheFallback=${availableTools ? Object.keys(availableTools).length : 0} tool(s)`,
-          );
-        } else {
-          logger.info(
-            `[MCP Reinitialize] [cowork] cold-catalog guard RECOVERED ${tools.length} tool(s) for ${serverName} ` +
-              `via forced reconnect (snapshot.tools was ${snapCount}, connectedAfter=${connectedAfter})`,
-          );
-        }
-      }
-      // [cowork] END v0.8.8-rc1 MCP cold-catalog regression guard.
-      // ─────────────────────────────────────────────────────────────────────────
     }
 
     if (tools && !ephemeralServer && publicationGeneration) {
@@ -420,8 +401,6 @@ async function reinitMCPServer({
         tools,
         serverConfig,
         ...(publicationGeneration && { publicationGeneration }),
-        // [cowork] see the reservation comment above — required for
-        // replaceAppServerTools() to actually persist app-level catalogs.
         ...(publicationRevision && { publicationRevision }),
       });
       if (availableTools == null) {
@@ -429,9 +408,10 @@ async function reinitMCPServer({
       }
     }
 
-    logger.debug(
-      `[MCP Reinitialize] Sending response for ${serverName} - oauthRequired: ${oauthRequired}, oauthUrl: ${oauthUrl ? 'present' : 'null'}`,
-    );
+    logger.debug('[MCP Reinitialize] Sending response', {
+      oauthRequired,
+      hasOauthUrl: Boolean(oauthUrl),
+    });
 
     const getResponseMessage = () => {
       if (oauthRequired && tools && tools.length > 0) {
@@ -467,25 +447,29 @@ async function reinitMCPServer({
       tools,
     };
 
-    logger.debug(`[MCP Reinitialize] Response for ${serverName}:`, {
+    logger.debug('[MCP Reinitialize] Response ready', {
       success: result.success,
       oauthRequired: result.oauthRequired,
-      oauthUrl: result.oauthUrl ? 'present' : null,
+      hasOauthUrl: Boolean(result.oauthUrl),
       toolsCount: tools?.length ?? 0,
     });
 
     return result;
   } catch (error) {
-    logger.error(
-      '[MCP Reinitialize] Error loading MCP Tools, servers may still be initializing:',
-      error,
-    );
+    if (isMCPInitializationError(error, signal)) {
+      await recordScheduledMCPToolAuthFailure(
+        { error, streamId, jobCreatedAt, userId: user?.id, serverName },
+        () => require('~/server/services/Schedules').recordMCPToolAuthFailure,
+      );
+      throw error;
+    }
+    logger.error('[MCP Reinitialize] Error loading MCP tools; servers may still be initializing');
   } finally {
     if (connection && ephemeralServer && !requestScopedConnections) {
       try {
         await connection.dispose();
-      } catch (error) {
-        logger.warn(`[MCP Reinitialize] Failed to dispose ephemeral server ${serverName}`, error);
+      } catch {
+        logger.warn('[MCP Reinitialize] Failed to dispose ephemeral server');
       }
     }
   }
@@ -493,4 +477,5 @@ async function reinitMCPServer({
 
 module.exports = {
   reinitMCPServer,
+  loadMCPServerCatalogs,
 };

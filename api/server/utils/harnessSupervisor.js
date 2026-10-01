@@ -1018,6 +1018,18 @@ function createStallRecoveryStopHook(conversationId, { onContinue } = {}) {
    *  number worth showing — without a second Mongo read per round. */
   let continuationNumber = 0;
   return async function stallRecoveryStopHook(input) {
+    /**
+     * @librechat/agents >= 4 owns the continuation loop and THROWS if a Stop
+     * hook injects after its own `maxStopContinuations` budget (default 8) is
+     * spent. Our per-turn ceiling is tracked separately in Mongo, so defer to
+     * the SDK's number here rather than relying on the two staying in step.
+     */
+    if (typeof input?.continuationBudgetRemaining === 'number' && input.continuationBudgetRemaining <= 0) {
+      logger.info(
+        `[harnessSupervisor] conv=${convLabel} stall-recovery Stop hook: SDK continuation budget exhausted — not continuing`,
+      );
+      return {};
+    }
     if (!shouldFireStallProbe(input?.messages)) {
       /** Debug-level either way: a silent non-firing decision was previously
        *  diagnosable only by querying Mongo directly (docs/39 §10). Reason
@@ -1092,7 +1104,9 @@ function createStallRecoveryStopHook(conversationId, { onContinue } = {}) {
         logger.warn(`[harnessSupervisor] conv=${convLabel} indicator emit failed: ${e.message}`);
       }
     }
-    return { decision: 'block', reason: STALL_PROBE_MESSAGE };
+    /** SDK >= 4 only continues when the hook supplies a message to inject
+     *  (`additionalContext` / `injectedMessages`); `reason` alone is ignored. */
+    return { decision: 'block', reason: STALL_PROBE_MESSAGE, additionalContext: STALL_PROBE_MESSAGE };
   };
 }
 

@@ -1,6 +1,6 @@
 # LibreCowork — runs alongside LibreChat on port 443 (HTTPS).
 # Shares LibreChat's MongoDB so conversations and agents are accessible in both UIs.
-# Build from local source (required for elicitation + TaskList changes).
+# Build from local source (required for the TaskList and other fork changes).
 #
 # Network note: librecowork joins the LibreChat stack's default network (librechat_default)
 # so it can reach 'mongodb' and 'meilisearch' by their service names, exactly as

@@ -7,6 +7,8 @@ const mockValidatePasswordReset = jest.fn((req, res, next) => next());
 const mockResetPasswordController = jest.fn((req, res) => res.status(204).end());
 
 jest.mock('@librechat/api', () => ({
+  limiterCache: jest.fn(),
+  createTwoFactorManagementLimiter: jest.fn(() => (req, res, next) => next()),
   createSetBalanceConfig: jest.fn(() => (req, res, next) => next()),
   forceRefreshCloudFrontAuthCookies: jest.fn(),
 }));
@@ -52,6 +54,7 @@ jest.mock('~/server/middleware', () => {
   const pass = (req, res, next) => next();
   return {
     logHeaders: pass,
+    requireSameOrigin: pass,
     loginLimiter: pass,
     setTwoFactorTempUser: pass,
     twoFactorTempLimiter: pass,

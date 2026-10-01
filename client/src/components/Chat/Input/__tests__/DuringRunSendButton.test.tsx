@@ -52,12 +52,19 @@ const steeringStub = ({
     interruptAndSend: mockInterruptAndSend,
   }) as unknown as SteeringControls;
 
-function Harness({ steering }: { steering: SteeringControls }) {
+function Harness({
+  steering,
+  isNewConversation,
+}: {
+  steering: SteeringControls;
+  isNewConversation: boolean;
+}) {
   const methods = useForm<{ text: string }>({ defaultValues: { text: TEXT } });
   return (
     <DuringRunSendButton
       control={methods.control}
       steering={steering}
+      isNewConversation={isNewConversation}
       getText={() => TEXT}
       onConsumed={mockOnConsumed}
     />
@@ -67,23 +74,35 @@ function Harness({ steering }: { steering: SteeringControls }) {
 type MenuOptions = StubOptions & {
   enterInterrupts?: boolean;
   enterToSend?: boolean;
+  shortcutsEnabled?: boolean;
   customShortcuts?: Record<string, ShortcutOverride>;
+  isNewConversation?: boolean;
 };
 
 function openMenu(options: MenuOptions = {}) {
-  const { enterInterrupts = false, enterToSend = true, customShortcuts = {}, ...stub } = options;
+  const {
+    enterInterrupts = false,
+    enterToSend = true,
+    shortcutsEnabled = true,
+    customShortcuts = {},
+    isNewConversation = false,
+    ...stub
+  } = options;
   render(
     <RecoilRoot
       initializeState={({ set }) => {
         set(store.steerInterruptsByDefault, enterInterrupts);
         set(store.enterToSend, enterToSend);
+        set(store.shortcutsEnabled, shortcutsEnabled);
         set(store.customShortcuts, customShortcuts);
       }}
     >
-      <Harness steering={steeringStub(stub)} />
+      <Harness steering={steeringStub(stub)} isNewConversation={isNewConversation} />
     </RecoilRoot>,
   );
-  expect(screen.getByText('com_ui_interrupt_steer')).toBeInTheDocument();
+  expect(
+    screen.getByText(isNewConversation ? 'com_ui_steer_first_turn_stop' : 'com_ui_interrupt_steer'),
+  ).toBeInTheDocument();
 }
 
 beforeEach(() => {
@@ -113,10 +132,11 @@ describe('DuringRunSendButton — Interrupt & steer availability', () => {
    * `interruptSteer` deliberately falls back to interrupt & send — disabling
    * the row there would make it dead for the whole first turn.
    */
-  test('keeps Interrupt & steer live before a conversation exists', () => {
-    openMenu({ pausedOnApproval: false, canSteer: false });
+  test('labels the first-response fallback as stop and send without changing its action', () => {
+    openMenu({ pausedOnApproval: false, canSteer: false, isNewConversation: true });
 
-    const row = screen.getByText('com_ui_interrupt_steer').closest('button');
+    expect(screen.queryByText('com_ui_interrupt_steer')).not.toBeInTheDocument();
+    const row = screen.getByText('com_ui_steer_first_turn_stop').closest('button');
     expect(row).toHaveAttribute('aria-disabled', 'false');
 
     fireEvent.click(row as HTMLButtonElement);
@@ -256,5 +276,13 @@ describe('DuringRunSendButton — hints follow the effective bindings', () => {
     expect(kbdFor('com_ui_queue')).toBeNull();
     expect(kbdFor('com_ui_interrupt_steer')).toBe('Ctrl ⇧ ⏎');
     expect(kbdFor('com_ui_interrupt_send')).toBe('Alt ⏎');
+  });
+
+  test('keeps plain Enter but hides shortcut hints when shortcuts are disabled', () => {
+    openMenu({ canSteer: true, shortcutsEnabled: false });
+    expect(kbdFor('com_ui_steer')).toBe('⏎');
+    expect(kbdFor('com_ui_queue')).toBeNull();
+    expect(kbdFor('com_ui_interrupt_steer')).toBeNull();
+    expect(kbdFor('com_ui_interrupt_send')).toBeNull();
   });
 });

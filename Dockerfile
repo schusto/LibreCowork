@@ -1,4 +1,4 @@
-# v0.8.8-rc1
+# v0.8.8
 
 # Base node image
 FROM node:24.16.0-alpine AS node
@@ -11,6 +11,8 @@ RUN apk add --no-cache python3 py3-pip uv
 
 # Set environment variable to use jemalloc
 ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
+# Disable dependency installation analytics before any npm lifecycle scripts run.
+ENV SCARF_ANALYTICS=false
 
 # Add `uv` for extended MCP support
 COPY --from=ghcr.io/astral-sh/uv:0.9.5-python3.12-alpine /usr/local/bin/uv /usr/local/bin/uvx /bin/
@@ -57,16 +59,6 @@ RUN \
     done
 
 COPY --chown=node:node . .
-
-# [cowork] Apply local dependency patches. Must run AFTER the source copy
-# above: `patches/` does not exist in the image at `npm ci` time (only the
-# package.json files are copied before install), so a `postinstall` hook could
-# never see it. Applied with `git apply` — git is already installed, `patch`
-# is not, and this avoids a devDependency plus a lockfile change. No `|| true`:
-# a patch that stops applying (e.g. after a dependency bump) must fail the
-# build loudly rather than silently dropping the behaviour it adds.
-# See patches/README.md and docs/41_stall_recovery_stop_hook_report.md.
-RUN for p in patches/*.patch; do [ -e "$p" ] || continue; echo "Applying $p" && git apply -p1 "$p"; done
 
 RUN \
     # Export NODE_OPTIONS so the memory limit is inherited by every npm

@@ -1,4 +1,8 @@
-import type { RefillIntervalUnit, TUserFavorite } from 'librechat-data-provider';
+import type {
+  TUserFavorite,
+  RefillIntervalUnit,
+  StatefulCodeEnvironment,
+} from 'librechat-data-provider';
 import type { Document, Types } from 'mongoose';
 import { CursorPaginationParams } from '~/common';
 
@@ -49,10 +53,21 @@ export interface IUser extends Document {
   expiresAt?: Date;
   termsAccepted?: boolean;
   termsAcceptedAt?: Date | null;
+  /** Internal fence that prevents agent-trigger admission during account deletion. */
+  agentTriggerDeletionStartedAt?: Date;
+  /** Expiring fences closing subagent admission while bulk deletions drain. */
+  subagentAdmissionFences?: Array<{
+    token: string;
+    expiresAt: Date;
+  }>;
   personalization?: {
     memories?: boolean;
+    statefulCodeEnvironment?: StatefulCodeEnvironment;
   };
   favorites?: TUserFavorite[];
+  /** Display order for the sidebar's Pinned section: favorite and pinned-chat
+   *  entry keys interleaved (`agent:`, `spec:`, `model:`, `convo:` prefixes). */
+  pinnedOrder?: string[];
   /** Per-skill active/inactive overrides. Key = skillId, value = active state. */
   skillStates?: Record<string, boolean>;
   createdAt?: Date;
@@ -78,6 +93,7 @@ export interface BalanceConfig {
   refillIntervalValue?: number;
   refillIntervalUnit?: RefillIntervalUnit;
   refillAmount?: number;
+  reservationTtlMs?: number;
 }
 
 export interface CreateUserRequest extends Partial<IUser> {
@@ -97,6 +113,7 @@ export interface UpdateUserRequest {
   termsAcceptedAt?: Date | null;
   personalization?: {
     memories?: boolean;
+    statefulCodeEnvironment?: StatefulCodeEnvironment;
   };
   skillStates?: Record<string, boolean>;
 }

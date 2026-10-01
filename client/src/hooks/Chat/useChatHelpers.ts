@@ -1,10 +1,16 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
+import { useSetAtom } from 'jotai';
 import { useQueryClient } from '@tanstack/react-query';
 import { Constants, QueryKeys, isAssistantsEndpoint } from 'librechat-data-provider';
 import { useRecoilState, useRecoilValue, useSetRecoilState, useRecoilCallback } from 'recoil';
 import type { TMessage } from 'librechat-data-provider';
+import {
+  useGetStartupConfig,
+  useAbortStreamMutation,
+  supportsGenerationProtocolV2,
+} from '~/data-provider';
 import { useLatestMessage, useLatestMessageId } from '~/hooks/Messages/useLatestMessage';
-import { supportsGenerationProtocolV2, useAbortStreamMutation } from '~/data-provider';
+import { siblingIdxFamily, siblingKey } from '~/components/Chat/Messages/Thread/state';
 import useChatFunctions from '~/hooks/Chat/useChatFunctions';
 import useSteerConvert from '~/hooks/Chat/useSteerConvert';
 import { resolveAbortSteerTarget } from '~/utils';
@@ -100,9 +106,13 @@ export default function useChatHelpers(index = 0, paramId?: string) {
   const latestMessageRef = useRef(latestMessage);
   latestMessageRef.current = latestMessage;
 
-  const setSiblingIdx = useSetRecoilState(
-    store.messagesSiblingIdxFamily(latestMessage?.parentMessageId ?? null),
+  const setSiblingIdx = useSetAtom(
+    siblingIdxFamily(siblingKey(latestMessage?.parentMessageId ?? null)),
   );
+  /** The setter is rebound whenever the tail's parent changes (every turn); the
+   *  ref keeps `handleContinue` referentially stable so rows do not re-render. */
+  const setSiblingIdxRef = useRef(setSiblingIdx);
+  setSiblingIdxRef.current = setSiblingIdx;
 
   const setMessages = useCallback(
     (messages: TMessage[]) => {
@@ -155,6 +165,7 @@ export default function useChatHelpers(index = 0, paramId?: string) {
     conversation,
     latestMessage,
     setSubmission,
+    setConversation,
   });
 
   const askRef = useRef(_ask);
@@ -367,15 +378,22 @@ export default function useChatHelpers(index = 0, paramId?: string) {
     (e: React.MouseEvent<HTMLButtonElement>) => {
       e.preventDefault();
       continueGeneration();
-      setSiblingIdx(0);
+      setSiblingIdxRef.current(0);
     },
-    [continueGeneration, setSiblingIdx],
+    [continueGeneration],
   );
 
   const [preset, setPreset] = useRecoilState(store.presetByIndex(index));
   const [showPopover, setShowPopover] = useRecoilState(store.showPopoverFamily(index));
   const [abortScroll, setAbortScroll] = useRecoilState(store.abortScrollFamily(index));
   const [optionSettings, setOptionSettings] = useRecoilState(store.optionSettingsFamily(index));
+
+  /** Read once per chat rather than per message row: message rows never unmount, so a
+   *  per-row config observer would accumulate for the length of the conversation.
+   *  Stays disabled until the config resolves, so a `feedback: false` deployment never
+   *  flashes controls whose writes the server rejects. */
+  const { data: startupConfig } = useGetStartupConfig();
+  const feedbackEnabled = startupConfig != null && startupConfig.interface?.feedback !== false;
 
   return useMemo(
     () => ({
@@ -408,6 +426,7 @@ export default function useChatHelpers(index = 0, paramId?: string) {
       setFiles,
       filesLoading,
       setFilesLoading,
+      feedbackEnabled,
     }),
     [
       newConversation,
@@ -439,6 +458,7 @@ export default function useChatHelpers(index = 0, paramId?: string) {
       setFiles,
       filesLoading,
       setFilesLoading,
+      feedbackEnabled,
     ],
   );
 }

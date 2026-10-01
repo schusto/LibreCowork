@@ -153,6 +153,9 @@ html {
   --text-secondary: var(--gray-600);
   --text-secondary-alt: var(--gray-500);
   --text-tertiary: var(--gray-500);
+  --text-muted: 105 110 121; /* Click UI global.color.text.muted #696e79 */
+  --shimmer-dip: 129 130 134;
+  --shimmer-dip-alpha: 0.18;
   --text-warning: var(--amber-700);
   --text-destructive: var(--red-600);
   --link: var(--blue-600);
@@ -170,6 +173,8 @@ html {
   --surface-hover-alt: var(--gray-300);
   --surface-composer-hover: var(--gray-200);
   --surface-primary: var(--white);
+  --chart-widget-surface: 255 255 255; /* Click UI dashboards.chartWidget.color.background.default #ffffff */
+  --chart-widget-stroke: 230 231 233; /* Click UI dashboards.chartWidget.color.stroke.default #e6e7e9 */
   --surface-primary-alt: var(--gray-50);
   --surface-primary-contrast: var(--gray-100);
   --surface-secondary: var(--gray-50);
@@ -183,6 +188,7 @@ html {
   --surface-destructive: var(--red-700);
   --surface-destructive-hover: var(--red-800);
   --surface-chat: var(--white);
+  --surface-code: var(--surface-primary-alt);
   --surface-qr: var(--white);
   --border-light: var(--gray-200);
   --border-light-alpha: 1;
@@ -213,7 +219,28 @@ html {
   --status-neutral: var(--gray-600);
   --status-neutral-subtle: var(--gray-100);
   --status-neutral-border: var(--gray-300);
+  --status-verified: 37 99 235;
   --text-on-status: var(--white);
+
+  /* Categorical series scale — slot order is the CVD-safety mechanism */
+  --series-1: 5 110 189;
+  --series-2: 233 86 13;
+  --series-3: 0 148 142;
+  --series-4: 182 123 5;
+  --series-5: 216 90 142;
+  --series-6: 126 35 205;
+  --series-7: 1 131 1;
+  --series-8: 63 81 181;
+
+  /* Code syntax highlighting */
+  --syntax-text: var(--gray-800);
+  --syntax-comment: var(--gray-500);
+  --syntax-meta: var(--gray-600);
+  --syntax-builtin: 154 103 0;
+  --syntax-keyword: 5 80 174;
+  --syntax-string: 10 123 98;
+  --syntax-attr: 154 47 106;
+  --syntax-title: 180 35 24;
 
   --surface-inverted: var(--gray-850);
   --surface-inverted-hover: var(--gray-700);
@@ -233,7 +260,14 @@ html {
   --theme-elevation-surface: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
   --theme-motion-fast: 150ms;
   --theme-motion-normal: 200ms;
-  --switch-unchecked: 0 0% 58%;
+  --switch-unchecked: 148 148 148;
+  --provider-openai: #19c37d;
+  --provider-openai-gpt4: #ab68ff;
+  --provider-openai-reasoning: #000000;
+  --provider-anthropic: #d09a74;
+  --provider-azure: linear-gradient(0.375turn, #61bde2, #4389d0);
+  --provider-bedrock: #268672;
+  --provider-foreground: #ffffff;
 }
 .dark {
   --brand-purple: 171 104 255;
@@ -242,6 +276,11 @@ html {
   --text-secondary: var(--gray-300);
   --text-secondary-alt: var(--gray-400);
   --text-tertiary: var(--gray-400);
+  --text-muted: 179 182 189; /* Click UI global.color.text.muted #b3b6bd */
+  --shimmer-base: 255 255 255;
+  --shimmer-base-alpha: 0.8;
+  --shimmer-dip: 179 179 179;
+  --shimmer-dip-alpha: 0.25;
   --text-warning: var(--amber-500);
   --text-destructive: var(--red-400);
   --link: var(--blue-400);
@@ -258,6 +297,8 @@ html {
   --surface-hover-alt: var(--gray-600);
   --surface-composer-hover: var(--gray-600);
   --surface-primary: var(--gray-900);
+  --chart-widget-surface: 40 40 40; /* Click UI dashboards.chartWidget.color.background.default #282828 */
+  --chart-widget-stroke: 50 50 50; /* Click UI dashboards.chartWidget.color.stroke.default #323232 */
   --surface-primary-alt: var(--gray-850);
   --surface-primary-contrast: var(--gray-850);
   --surface-secondary: var(--gray-800);
@@ -271,6 +312,7 @@ html {
   --surface-destructive: var(--red-800);
   --surface-destructive-hover: var(--red-900);
   --surface-chat: var(--gray-700);
+  --surface-code: var(--presentation);
   --surface-qr: var(--white);
   --border-light: var(--gray-700);
   --border-medium-alt: var(--gray-600);
@@ -281,7 +323,7 @@ html {
   --status-success: var(--green-300);
   --status-success-subtle: var(--green-950);
   --status-success-border: var(--green-800);
-  --status-success-strong: var(--green-800);
+  --status-success-strong: 8 135 89;
   --status-info: var(--blue-300);
   --status-info-subtle: var(--blue-950);
   --status-info-border: var(--blue-800);
@@ -297,7 +339,29 @@ html {
   --status-neutral: var(--gray-300);
   --status-neutral-subtle: var(--gray-800);
   --status-neutral-border: var(--gray-700);
+  --status-verified: 26 127 216;
   --text-on-status: var(--white);
+
+  /* Categorical series scale — same hues, stepped for the dark surface */
+  --series-1: 9 140 238;
+  --series-2: 217 87 35;
+  --series-3: 6 158 152;
+  --series-4: 200 133 12;
+  --series-5: 213 82 130;
+  --series-6: 171 104 254;
+  --series-7: 80 167 49;
+  --series-8: 120 130 190;
+
+  /* Code syntax highlighting. Comment and meta are the flattened equivalents of
+     the 50% and 60% alpha whites this palette used before it was tokenized. */
+  --syntax-text: var(--white);
+  --syntax-comment: 144 144 144;
+  --syntax-meta: 166 166 166;
+  --syntax-builtin: 233 149 12;
+  --syntax-keyword: 46 149 211;
+  --syntax-string: 0 166 125;
+  --syntax-attr: 223 48 121;
+  --syntax-title: 242 44 61;
 
   --surface-inverted: var(--white);
   --surface-inverted-hover: var(--gray-100);
@@ -305,13 +369,23 @@ html {
   --surface-fixed: var(--white);
   --surface-fixed-hover: var(--gray-100);
   --text-fixed: var(--gray-800);
-  --switch-unchecked: 0 0% 40%;
+  --switch-unchecked: 102 102 102;
+  --provider-openai: #19c37d;
+  --provider-openai-gpt4: #ab68ff;
+  --provider-openai-reasoning: #000000;
+  --provider-anthropic: #d09a74;
+  --provider-azure: linear-gradient(0.375turn, #61bde2, #4389d0);
+  --provider-bedrock: #268672;
+  --provider-foreground: #ffffff;
 }
 .gizmo {
   --text-primary: var(--gizmo-gray-950);
   --text-secondary: var(--gizmo-gray-600);
   --text-tertiary: var(--gizmo-gray-500);
+  --text-muted: 105 110 121; /* Click UI global.color.text.muted #696e79 */
   --surface-primary: var(--white);
+  --chart-widget-surface: 255 255 255; /* Click UI dashboards.chartWidget.color.background.default #ffffff */
+  --chart-widget-stroke: 230 231 233; /* Click UI dashboards.chartWidget.color.stroke.default #e6e7e9 */
   --surface-secondary: var(--gray-50);
   --surface-tertiary: var(--gray-100);
   --border-light: 0 0 0;
@@ -327,13 +401,165 @@ html {
   --text-primary: var(--gray-100);
   --text-secondary: var(--gray-300);
   --text-tertiary: var(--gizmo-gray-500);
+  --text-muted: 179 182 189; /* Click UI global.color.text.muted #b3b6bd */
   --surface-primary: var(--gray-900);
+  --chart-widget-surface: 40 40 40; /* Click UI dashboards.chartWidget.color.background.default #282828 */
+  --chart-widget-stroke: 50 50 50; /* Click UI dashboards.chartWidget.color.stroke.default #323232 */
   --surface-secondary: var(--gray-800);
   --surface-tertiary: var(--gray-700);
   --border-light: 217 217 227;
   --border-medium: 217 217 227;
   --border-heavy: 217 217 227;
   --border-xheavy: 217 217 227;
+}
+
+/* High contrast appearance modes.
+ *
+ * Every `IThemeRGB` token is delivered by the theme registry as an inline custom
+ * property on <html> (see packages/client/src/theme/themes/highContrast.ts), so
+ * this block only covers what the token layer cannot reach: the CSS-only
+ * variables and hard-coded literals elsewhere in this stylesheet. Every ratio
+ * quoted below is measured against the mode's own canvas, pure white or pure
+ * black. */
+html.high-contrast {
+  /* A 0.5rem bar is a small target to hit and a thin thing to see. */
+  --scrollbar-size: 0.75rem;
+  /* Keep both animated text stops at the AAA ratios declared by the palette. */
+  --shimmer-base-alpha: 1;
+  --shimmer-dip-alpha: 1;
+}
+html.high-contrast ::-webkit-scrollbar-thumb {
+  /* The 10%-alpha thumb is invisible against a pure black or white canvas. */
+  background-color: rgb(var(--border-heavy));
+}
+html.high-contrast ::-webkit-scrollbar-track {
+  border: 1px solid rgb(var(--border-light));
+}
+html.high-contrast * {
+  scrollbar-color: rgb(var(--border-heavy)) rgb(var(--surface-primary));
+  /* Controls that halve their own ring (`ring-opacity-50`, `ring-opacity-20`)
+   * keep it at full strength here. The outline rules below cover the controls
+   * that blank it outright. */
+  --tw-ring-opacity: 1;
+}
+/* `.dark body`/`.dark html` pin the page to #212121, which would leave a
+ * near-black canvas behind the pure black surfaces. */
+html.high-contrast,
+html.high-contrast body,
+html.high-contrast.dark,
+html.high-contrast.dark body {
+  background-color: rgb(var(--surface-primary));
+}
+/* Selection is otherwise left to the UA's system colours, which no theme
+ * controls. Inverting the canvas guarantees 21:1 for the selected run. */
+html.high-contrast ::selection {
+  background-color: rgb(var(--text-primary));
+  color: rgb(var(--surface-primary));
+}
+/* WCAG 2.4.13 wants a 2px perimeter as the floor; a contrast mode should exceed
+ * it. The global pair below hard-codes #000/#fff instead of reading the ink
+ * token, and the keyboard-modality rule for text fields sits at 2px. */
+html.high-contrast :focus-visible,
+html.high-contrast.dark :focus-visible {
+  outline: 3px solid rgb(var(--text-primary));
+  outline-offset: 2px;
+}
+/* Selection perimeters and placeholder ink used to live here, but they complete
+ * the exported palettes rather than this app: a package primitive rendered by
+ * an external consumer of `ThemeProvider` needs them too, and the published
+ * stylesheet is built only from package-owned CSS. They now ship from
+ * `packages/client/src/theme/highContrast.css`, which `main.jsx` pulls in with
+ * `@librechat/client/style.css`. What stays below is genuinely SPA-only. */
+html[data-input-modality='keyboard'].high-contrast
+  :where(
+    input:not([type]),
+    input:is(
+      [type='text'],
+      [type='search'],
+      [type='email'],
+      [type='password'],
+      [type='url'],
+      [type='tel'],
+      [type='number'],
+      [type='date'],
+      [type='datetime-local'],
+      [type='month'],
+      [type='week'],
+      [type='time']
+    ),
+    textarea
+  ):not(.lc-field):focus-visible {
+  outline: 3px solid rgb(var(--text-primary)) !important;
+  outline-offset: 2px !important;
+}
+/* The WCAG 1.4.1 link treatment moved to
+ * `packages/client/src/theme/highContrast.css` with the other rules that
+ * complete the exported palettes: `text-link` is a shared role, so a package
+ * primitive rendering a link needs the same non-colour cue. */
+/* The whole `@tailwindcss/typography` variable block is hard-coded hex, and
+ * message content carries `prose dark:prose-invert`, so the invert half is what
+ * dark mode reads. Both halves are remapped: the light set puts prose links at
+ * #0066cc, which is 3.77:1 on a black canvas and 5.40:1 on a white one, and
+ * every rule and border in the set (#cdcdcd, #e5e7eb, #424242, #4b5563) sits
+ * below the 3:1 non-text floor in one mode or the other. */
+html.high-contrast .prose {
+  --tw-prose-body: rgb(var(--text-primary));
+  --tw-prose-headings: rgb(var(--text-primary));
+  --tw-prose-lead: rgb(var(--text-primary));
+  --tw-prose-links: rgb(var(--link));
+  --tw-prose-bold: rgb(var(--text-primary));
+  --tw-prose-counters: rgb(var(--text-primary));
+  --tw-prose-bullets: rgb(var(--text-primary));
+  --tw-prose-hr: rgb(var(--border-medium));
+  --tw-prose-quotes: rgb(var(--text-primary));
+  --tw-prose-quote-borders: rgb(var(--border-medium));
+  --tw-prose-captions: rgb(var(--text-primary));
+  --tw-prose-code: rgb(var(--text-primary));
+  --tw-prose-pre-code: rgb(var(--text-primary));
+  --tw-prose-pre-bg: rgb(var(--surface-code));
+  --tw-prose-th-borders: rgb(var(--border-medium));
+  --tw-prose-td-borders: rgb(var(--border-medium));
+  --tw-prose-invert-body: rgb(var(--text-primary));
+  --tw-prose-invert-headings: rgb(var(--text-primary));
+  --tw-prose-invert-lead: rgb(var(--text-primary));
+  --tw-prose-invert-links: rgb(var(--link));
+  --tw-prose-invert-bold: rgb(var(--text-primary));
+  --tw-prose-invert-counters: rgb(var(--text-primary));
+  --tw-prose-invert-bullets: rgb(var(--text-primary));
+  --tw-prose-invert-hr: rgb(var(--border-medium));
+  --tw-prose-invert-quotes: rgb(var(--text-primary));
+  --tw-prose-invert-quote-borders: rgb(var(--border-medium));
+  --tw-prose-invert-captions: rgb(var(--text-primary));
+  --tw-prose-invert-code: rgb(var(--text-primary));
+  --tw-prose-invert-pre-code: rgb(var(--text-primary));
+  --tw-prose-invert-pre-bg: rgb(var(--surface-code));
+  --tw-prose-invert-th-borders: rgb(var(--border-medium));
+  --tw-prose-invert-td-borders: rgb(var(--border-medium));
+}
+/* Markdown structure borders are drawn from the raw grey palette, which lands
+ * at 1.6:1 on white and 2.1:1 on black, under the 3:1 non-text floor. */
+html.high-contrast .markdown blockquote,
+html.high-contrast .markdown th,
+html.high-contrast .markdown th:last-child,
+html.high-contrast .markdown td,
+html.high-contrast .markdown td:last-child {
+  border-color: rgb(var(--border-medium));
+}
+/* `.btn-neutral` (the Builder's Knowledge, Code Files and Assistant selectors
+ * and the delete trigger) predates the token layer and hard-codes its edge,
+ * label and hover fill. On white, `rgba(0, 0, 0, 0.1)` and #ececf1 sit at 1.1:1
+ * and 1.05:1; on black, #424242 sits at 2.09:1 for both the edge and the hover
+ * fill. All four are under the 3:1 non-text floor, which leaves the control
+ * boundary and its hover state unreadable. */
+html.high-contrast .btn-neutral,
+html.high-contrast.dark .btn-neutral {
+  background-color: rgb(var(--surface-primary));
+  border-color: rgb(var(--border-medium));
+  color: rgb(var(--text-primary));
+}
+html.high-contrast .btn-neutral:hover,
+html.high-contrast.dark .btn-neutral:hover {
+  background-color: rgb(var(--surface-hover));
 }
 
 .text-token-text-primary {
@@ -390,6 +616,14 @@ html {
 
 .bg-token-surface-secondary {
   background-color: rgb(var(--surface-secondary));
+}
+
+/* Forced-colors overrides the inline `background-color: currentColor` a masked
+ * CustomIcon paints with; `!important` is needed to beat that inline style. */
+@media (forced-colors: active) {
+  .custom-icon-tint {
+    background-color: CanvasText !important;
+  }
 }
 
 .ellipsis {
@@ -561,83 +795,82 @@ pre {
   margin: 0;
 }
 
-/* Scroll-to-bottom button — enter */
+/* Show the message time when the row is hovered. Tailwind group-hover
+   loses to `[@media(hover:hover)]:opacity-0` (same specificity, :where()).
+
+   Keyboard focus reveals it too, but only `:focus-visible`: a pointer that
+   clicks a tool card or an expand toggle inside the row leaves focus sitting
+   there, and plain `:focus-within` would pin the time open long after the
+   pointer moved away.
+
+   The condition matches the row itself as well as its descendants, because
+   `MessageNav` focuses the row through `tabindex="-1"` and `:has()` never
+   matches its own subject. Text-entry controls are excluded, because they
+   match `:focus-visible` on a plain mouse click. See `revealOnRowHoverClasses`
+   in `components/Chat/Messages/styles.ts` for the full reasoning. */
+@media (hover: hover) {
+  .message-render .message-timestamp {
+    opacity: 0;
+  }
+
+  .message-render:hover .message-timestamp,
+  .message-render:focus-visible .message-timestamp,
+  .message-render:has(:focus-visible:not(:is(input, textarea, [contenteditable])))
+    .message-timestamp {
+    opacity: 1;
+  }
+}
+
+/* Scroll-to-bottom: fade and rise on the same path. No scale. */
+/* Inertness during the transition is owned by the button's `interactive` prop,
+   not by these classes: the wrapper is already inert, and a descendant that
+   opts back into pointer events stays hit-testable however its parent paints. */
 .scroll-animation-enter {
   opacity: 0;
-  transform: translateY(12px) scale(0.9);
-  pointer-events: none;
+  transform: translateY(8px);
 }
 
 .scroll-animation-enter-active {
-  animation: scroll-btn-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    opacity var(--resize-dur) var(--resize-ease),
+    transform var(--resize-dur) var(--resize-ease);
 }
 
 .scroll-animation-enter-done {
   opacity: 1;
-  transform: translateY(0) scale(1);
+  transform: translateY(0);
 }
 
-@keyframes scroll-btn-enter {
-  0% {
-    opacity: 0;
-    transform: translateY(12px) scale(0.9);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
+.scroll-animation-exit {
+  opacity: 1;
+  transform: translateY(0);
 }
 
-/* Scroll-to-bottom button — exit */
 .scroll-animation-exit-active {
-  animation: scroll-btn-exit 0.25s cubic-bezier(0.4, 0, 1, 1) forwards;
-  pointer-events: none;
+  opacity: 0;
+  transform: translateY(8px);
+  transition:
+    opacity 180ms cubic-bezier(0.4, 0, 1, 1),
+    transform 180ms cubic-bezier(0.4, 0, 1, 1);
 }
 
 .scroll-animation-exit-done {
   display: none;
 }
 
-@keyframes scroll-btn-exit {
-  0% {
-    opacity: 1;
-    transform: translateY(0) scale(1);
+@media (prefers-reduced-motion: reduce) {
+  .scroll-animation-enter,
+  .scroll-animation-exit,
+  .scroll-animation-exit-active {
+    transform: none;
   }
-  100% {
-    opacity: 0;
-    transform: translateY(8px) scale(0.95);
+
+  .scroll-animation-enter-active,
+  .scroll-animation-exit-active {
+    transition: opacity 150ms ease;
   }
-}
-
-/* Scroll-to-bottom button */
-.premium-scroll-button {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  padding: 0;
-  border-radius: 50%;
-  border: 1px solid rgba(0, 0, 0, 0.08);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
-  background-color: #ffffff;
-  z-index: 10;
-  overflow: hidden;
-  transition: transform 100ms ease;
-}
-
-.dark .premium-scroll-button {
-  border-color: rgba(255, 255, 255, 0.1);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-  background-color: #2a2a2e;
-}
-
-.scroll-animation-enter-active .premium-scroll-button {
-  pointer-events: none !important;
-}
-
-.premium-scroll-button:active {
-  transform: scale(0.95);
 }
 
 .prose {
@@ -992,16 +1225,10 @@ pre {
   margin-top: 0;
 }
 
-code,
-pre {
-  font-family:
-    Consolas,
-    Söhne Mono,
-    Monaco,
-    Andale Mono,
-    Ubuntu Mono,
-    monospace !important;
-}
+/* `code`, `kbd`, `samp` and `pre` take their font from Tailwind's preflight, which
+   reads `theme.fontFamily.mono` — see `tailwind.config.cjs`. Do not restate it here:
+   this file used to, with `!important`, which silently beat every `font-mono` class
+   in the app and pinned code to faces the repository does not ship. */
 code.language-text,
 code.language-txt,
 code.language-plaintext,
@@ -1014,7 +1241,7 @@ code[class*='language-'],
 pre[class*='language-'] {
   word-wrap: normal;
   background: none;
-  color: rgb(var(--gray-800));
+  color: rgb(var(--syntax-text));
   -webkit-hyphens: none;
   hyphens: none;
   font-size: 0.85rem;
@@ -1036,27 +1263,27 @@ pre[class*='language-'] {
   white-space: normal;
 }
 .hljs-comment {
-  color: rgb(var(--gray-500));
+  color: rgb(var(--syntax-comment));
 }
 .hljs-meta {
-  color: rgb(var(--gray-600));
+  color: rgb(var(--syntax-meta));
 }
 .hljs-built_in,
 .hljs-class .hljs-title {
-  color: #9a6700;
+  color: rgb(var(--syntax-builtin));
 }
 .hljs-doctag,
 .hljs-formula,
 .hljs-keyword,
 .hljs-literal {
-  color: #0550ae;
+  color: rgb(var(--syntax-keyword));
 }
 .hljs-addition,
 .hljs-attribute,
 .hljs-meta-string,
 .hljs-regexp,
 .hljs-string {
-  color: #0a7b62;
+  color: rgb(var(--syntax-string));
 }
 .hljs-attr,
 .hljs-number,
@@ -1066,59 +1293,14 @@ pre[class*='language-'] {
 .hljs-template-variable,
 .hljs-type,
 .hljs-variable {
-  color: #9a2f6a;
+  color: rgb(var(--syntax-attr));
 }
 .hljs-bullet,
 .hljs-link,
 .hljs-selector-id,
 .hljs-symbol,
 .hljs-title {
-  color: #b42318;
-}
-.dark code.hljs,
-.dark code[class*='language-'],
-.dark pre[class*='language-'] {
-  color: #fff;
-}
-.dark .hljs-comment {
-  color: hsla(0, 0%, 100%, 0.5);
-}
-.dark .hljs-meta {
-  color: hsla(0, 0%, 100%, 0.6);
-}
-.dark .hljs-built_in,
-.dark .hljs-class .hljs-title {
-  color: #e9950c;
-}
-.dark .hljs-doctag,
-.dark .hljs-formula,
-.dark .hljs-keyword,
-.dark .hljs-literal {
-  color: #2e95d3;
-}
-.dark .hljs-addition,
-.dark .hljs-attribute,
-.dark .hljs-meta-string,
-.dark .hljs-regexp,
-.dark .hljs-string {
-  color: #00a67d;
-}
-.dark .hljs-attr,
-.dark .hljs-number,
-.dark .hljs-selector-attr,
-.dark .hljs-selector-class,
-.dark .hljs-selector-pseudo,
-.dark .hljs-template-variable,
-.dark .hljs-type,
-.dark .hljs-variable {
-  color: #df3079;
-}
-.dark .hljs-bullet,
-.dark .hljs-link,
-.dark .hljs-selector-id,
-.dark .hljs-symbol,
-.dark .hljs-title {
-  color: #f22c3d;
+  color: rgb(var(--syntax-title));
 }
 
 [role='button'],
@@ -1258,9 +1440,16 @@ button {
 }
 
 /* Webkit scrollbar */
+:root {
+  /* Width of the app's own scrollbars, and so of the band a
+     `scrollbar-gutter: stable` container holds back. `.scrollbar-gutter-spacer`
+     reserves the same band without becoming a scroll container. */
+  --scrollbar-size: 0.5rem;
+}
+
 ::-webkit-scrollbar {
   height: 0.1em;
-  width: 0.5rem;
+  width: var(--scrollbar-size);
 }
 
 ::-webkit-scrollbar-thumb {
@@ -1321,6 +1510,18 @@ button {
 body,
 html {
   height: 100%;
+}
+
+/* Scoped to the drawer-gesture breakpoint (useSidebarState's 768px): on small
+   screens the app never scrolls at the root, so chaining out of nested
+   scrollers has nothing legitimate to reach — this kills Chrome Android's
+   pull-to-refresh and horizontal overscroll gliding into browser navigation.
+   Desktop keeps native trackpad back/forward and refresh gestures. */
+@media (max-width: 768px) {
+  body,
+  html {
+    overscroll-behavior: none;
+  }
 }
 
 .dark body,
@@ -2102,6 +2303,8 @@ html {
 .message-editor-text {
   font-size: var(--markdown-font-size, var(--font-size-base));
   line-height: 1.6;
+  /* `.prose` sets max-width: 65ch; fill the chat-form column instead. */
+  max-width: none;
 }
 
 .message-content pre code {
@@ -2153,13 +2356,11 @@ html {
   padding-right: 0.5rem;
   font-size: 1rem;
   line-height: 1.5rem;
-  color: black;
+  color: rgb(var(--text-primary));
   box-shadow: 0 2px 4px 0 rgb(0 0 0 / 0.25);
 }
 
 .tooltip:where(.dark, .dark *) {
-  background-color: rgb(var(--surface-primary));
-  color: white;
   box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.35);
 }
 
@@ -2263,7 +2464,7 @@ html[data-input-modality='keyboard']
 
 .popover-ui:focus-visible,
 .popover-ui[data-focus-visible] {
-  outline: var(--bg-surface-hover);
+  outline: 2px solid rgb(var(--text-primary));
   outline-offset: -1px;
 }
 
@@ -2434,14 +2635,22 @@ html[data-input-modality='keyboard']
   }
 }
 
+/* The sweep every in-flight label shares: a running tool call, streaming
+   reasoning, the elapsed timer. Painted from theme roles rather than fixed
+   black/white keyed off `.dark`, so a stored or custom theme restates it the
+   way it restates any other color. Unset, the base falls back to whatever
+   `--text-primary` is in scope AT THE LABEL — resolving it in a `:root`
+   declaration instead would freeze the default and ignore theme scopes applied
+   further down. Dark declares a base outright: its established value is dimmer
+   than that theme's text color rather than equal to it. */
 .shimmer {
   display: inline-block;
   position: relative;
   background: linear-gradient(
     90deg,
-    rgb(33, 33, 33) 25%,
-    rgba(129, 130, 134, 0.18) 50%,
-    rgb(33, 33, 33) 75%
+    rgb(var(--shimmer-base, var(--text-primary)) / var(--shimmer-base-alpha, 1)) 25%,
+    rgb(var(--shimmer-dip) / var(--shimmer-dip-alpha, 1)) 50%,
+    rgb(var(--shimmer-base, var(--text-primary)) / var(--shimmer-base-alpha, 1)) 75%
   );
   background-size: 200% 100%;
   background-clip: text;
@@ -2450,20 +2659,32 @@ html[data-input-modality='keyboard']
   animation: shimmer 4s linear infinite;
 }
 
-.dark .shimmer {
-  background: linear-gradient(
-    90deg,
-    rgba(255, 255, 255, 0.8) 25%,
-    rgba(179, 179, 179, 0.25) 50%,
-    rgba(255, 255, 255, 0.8) 75%
-  );
-  background-size: 200% 100%;
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: shimmer 4s linear infinite;
+/* Halting the animation alone is not a fallback: the background would settle
+   at position 0 and show only half the sweep, stranding the tail of the label
+   in the near-invisible dip. Drop the gradient and hand the glyphs back to the
+   color they would have had. */
+@media (prefers-reduced-motion: reduce) {
+  .shimmer {
+    background: none;
+    animation: none;
+    -webkit-text-fill-color: currentcolor;
+  }
 }
 
 .sharepoint-picker-bg {
   background-color: rgb(var(--surface-dialog));
+}
+
+/* ask_user_question popover <-> chat-card morph (view transition) */
+::view-transition-group(ask-question),
+::view-transition-old(ask-question),
+::view-transition-new(ask-question) {
+  animation-duration: 280ms;
+  animation-timing-function: cubic-bezier(0.32, 0.72, 0.22, 1);
+}
+
+/* The composer keeps its own snapshot group stacked above the morphing
+   question card, so the card travels behind the ChatForm, not over it. */
+::view-transition-group(chat-form) {
+  z-index: 2;
 }

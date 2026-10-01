@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { v4 } from 'uuid';
 import { SSE } from 'sse.js';
+import { useStore } from 'jotai';
 import { useSetRecoilState } from 'recoil';
 import {
   request,
@@ -19,12 +20,14 @@ import type {
 } from 'librechat-data-provider';
 import type { EventHandlerParams } from './useEventHandlers';
 import type { TResData } from '~/common';
-import { clearAllDrafts, applyPendingAction, findPendingActionMessageIndex } from '~/utils';
+import { clearComposerDrafts, applyPendingAction, findPendingActionMessageIndex } from '~/utils';
+import { pendingApprovalActionFamily } from '~/components/Chat/approval/state';
 import { useGetStartupConfig, useGetUserBalance } from '~/data-provider';
+import { startedAsNewConversation } from './useEventHandlers';
 import { useAuthContext } from '~/hooks/AuthContext';
 import useEventHandlers from './useEventHandlers';
 import useUsageHandler from './useUsageHandler';
-import store, { activeElicitationsState, elicitationDataState } from '~/store';
+import store from '~/store';
 
 type ChatHelpers = Pick<
   EventHandlerParams,
@@ -37,14 +40,13 @@ export default function useSSE(
   isAddedRequest = false,
   runIndex = 0,
 ) {
+  const jotaiStore = useStore();
   const setActiveRunId = useSetRecoilState(store.activeRunFamily(runIndex));
 
   const { token, isAuthenticated } = useAuthContext();
   const [completed, setCompleted] = useState(new Set());
   const setAbortScroll = useSetRecoilState(store.abortScrollFamily(runIndex));
   const setShowStopButton = useSetRecoilState(store.showStopButtonByIndex(runIndex));
-  const setActiveElicitations = useSetRecoilState(activeElicitationsState);
-  const setElicitationData = useSetRecoilState(elicitationDataState);
 
   const { setMessages, getMessages, setConversation, setIsSubmitting, newConversation } =
     chatHelpers;
@@ -68,6 +70,7 @@ export default function useSSE(
     getMessages,
     setCompleted,
     isAddedRequest,
+    runIndex,
     setConversation,
     setIsSubmitting,
     newConversation,
@@ -123,7 +126,9 @@ export default function useSSE(
         /** A queued delta flush reading the older streaming copy must never
          * land on top of the server-final write. */
         cancelPendingDeltaFlush();
-        clearAllDrafts(submission.conversation?.conversationId);
+        clearComposerDrafts(runIndex, submission.conversation?.conversationId, {
+          includeNewChatDraft: startedAsNewConversation(submission),
+        });
         try {
           finalHandler(data, submission as EventSubmission);
           finalizeUsage(data, { ...submission, userMessage });
@@ -156,6 +161,11 @@ export default function useSSE(
          * produced — apply any queued delta before reading the cache. */
         flushPendingDeltas();
         const pendingAction = data.data as Agents.PendingAction;
+        const pendingConversationId =
+          pendingAction.conversationId ?? submission.conversation?.conversationId;
+        if (pendingConversationId) {
+          jotaiStore.set(pendingApprovalActionFamily(pendingConversationId), pendingAction);
+        }
         const messages = getMessages() ?? [];
         const index = findPendingActionMessageIndex(messages, pendingAction);
         if (index >= 0) {
@@ -174,18 +184,6 @@ export default function useSSE(
           tapStream(data.data, { ...submission, userMessage });
         }
         stepHandler(data, { ...submission, userMessage } as EventSubmission);
-      } else if (data.type === 'elicitation_created' && data.elicitationData) {
-        const elicitationData = data.elicitationData;
-        setElicitationData((prev) => ({
-          ...prev,
-          [elicitationData.id]: elicitationData,
-        }));
-        if (elicitationData.tool_call_id) {
-          setActiveElicitations((prev) => ({
-            ...prev,
-            [elicitationData.tool_call_id]: { ...elicitationData },
-          }));
-        }
       } else if (data.sync != null) {
         const runId = v4();
         setActiveRunId(runId);
