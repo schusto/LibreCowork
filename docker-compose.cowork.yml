@@ -132,6 +132,8 @@ services:
       - HOST=0.0.0.0
       - PORT=3080
       - MONGO_URI=mongodb://mongodb:27017/LibreChat
+      # [cowork] Title generation timeout (ms). 10 min: slow local models / cold loads.
+      - TITLE_CONVO_TIMEOUT_MS=600000
       - MEILI_HOST=http://meilisearch:7700
       # TLS is terminated by cowork-proxy (nginx); the Node app stays plain HTTP.
       # [cowork] Context reduction — set to 'false' to disable all reduction for testing
