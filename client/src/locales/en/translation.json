@@ -444,6 +444,8 @@
   "com_nav_audio_play_error": "Error playing audio: {{0}}",
   "com_nav_audio_process_error": "Error processing audio: {{0}}",
   "com_nav_auto_expand_tools": "Auto-expand tool details",
+  "com_nav_context_reduction": "Context compaction (strip old thinking/tool output)",
+  "com_nav_info_context_reduction": "Trims older thinking blocks and truncates/dedupes old tool results to save context. Off by default because it changes the message prefix on every request, which kills the KV cache hit rate in long chats. Turn on only when you need the extra headroom.",
   "com_nav_auto_scroll": "Auto-Scroll to latest message on chat open",
   "com_nav_auto_send_prompts": "Send prompts on select",
   "com_nav_auto_send_prompts_desc": "Automatically submit prompt to chat when selected",

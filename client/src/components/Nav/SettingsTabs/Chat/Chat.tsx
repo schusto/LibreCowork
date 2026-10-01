@@ -58,6 +58,13 @@ const toggleSwitchConfigs = [
     key: 'autoExpandTools',
   },
   {
+    stateAtom: store.contextReduction,
+    localizationKey: 'com_nav_context_reduction' as const,
+    switchId: 'contextReduction',
+    hoverCardText: 'com_nav_info_context_reduction' as const,
+    key: 'contextReduction',
+  },
+  {
     stateAtom: store.LaTeXParsing,
     localizationKey: 'com_nav_latex_parsing' as const,
     switchId: 'latexParsing',

@@ -108,10 +108,13 @@ const DUMP_DIR = process.env.CWK_DUMP_DIR ?? '/app/uploads/cwk-context-dumps';
  * @param {object[]} orderedMessages    - Parallel DB message array (accepted for API stability;
  *                                        unused in Phase 1 — Phase 2 will add compressed field lookup).
  * @param {string}   [conversationId]  - Optional, for log correlation.
+ * @param {boolean}  [enabledOverride] - Per-request override of CONTEXT_REDUCTION_ENABLED
+ *                                       (from the Chat settings toggle / `ephemeralAgent.contextReduction`).
  * @returns {object[]} Reduced message array.
  */
-function applyContextReduction(formattedMessages, orderedMessages, conversationId) {
-  return applyContextReductionWithStats(formattedMessages, orderedMessages, conversationId).messages;
+function applyContextReduction(formattedMessages, orderedMessages, conversationId, enabledOverride) {
+  return applyContextReductionWithStats(formattedMessages, orderedMessages, conversationId, enabledOverride)
+    .messages;
 }
 
 /**
@@ -121,12 +124,18 @@ function applyContextReduction(formattedMessages, orderedMessages, conversationI
  * log line. Added for harnessSupervisor.js's stuck-pattern detector, which
  * needs toolDeduped per request. See docs/31_harness_memory_supervisor.md.
  *
+ * @param {boolean} [enabledOverride] - When a boolean, takes precedence over
+ *   `CONTEXT_REDUCTION_ENABLED` for this call. Lets a single chat opt in/out
+ *   of reduction via the Chat settings "Context compaction" toggle, which is
+ *   sent per-request as `ephemeralAgent.contextReduction` — see
+ *   client/src/store/settings.ts and docs/18_context_reduction.md.
  * @returns {{messages: object[], stats: object|null}} stats is null when
  *   reduction was skipped entirely (disabled, or empty input) — callers must
  *   handle that case, not assume stats is always populated.
  */
-function applyContextReductionWithStats(formattedMessages, orderedMessages, conversationId) {
-  if (!CONTEXT_REDUCTION_ENABLED) return { messages: formattedMessages, stats: null };
+function applyContextReductionWithStats(formattedMessages, orderedMessages, conversationId, enabledOverride) {
+  const enabled = typeof enabledOverride === 'boolean' ? enabledOverride : CONTEXT_REDUCTION_ENABLED;
+  if (!enabled) return { messages: formattedMessages, stats: null };
   if (!formattedMessages || formattedMessages.length === 0) {
     return { messages: formattedMessages, stats: null };
   }

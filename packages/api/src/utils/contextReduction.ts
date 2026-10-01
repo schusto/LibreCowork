@@ -34,12 +34,15 @@ import type { FormattedMessageContentPart, FormattedMessageWithContent } from '~
 // ── Configuration (environment variables, read once at import) ─────────────
 
 /**
- * Master on/off switch. Set `CWK_CONTEXT_REDUCTION=false` to disable all
- * reduction everywhere it's consumed. Any value other than 'false'
- * (case-insensitive) leaves it enabled.
+ * Master on/off switch, used only as the fallback when a request doesn't
+ * specify its own `ephemeralAgent.contextReduction` override (see the Chat
+ * settings toggle, off by default: mutating older turns on every request
+ * tanks the KV cache hit rate in long chats). Set `CWK_CONTEXT_REDUCTION=true`
+ * to default reduction on for requests that don't opt in/out explicitly. Any
+ * value other than 'true' (case-insensitive) leaves it disabled.
  */
 export const CONTEXT_REDUCTION_ENABLED: boolean =
-  (process.env.CWK_CONTEXT_REDUCTION ?? 'true').toLowerCase() !== 'false';
+  (process.env.CWK_CONTEXT_REDUCTION ?? 'false').toLowerCase() === 'true';
 
 export const THINK_KEEP_TURNS: number = parseInt(process.env.CWK_THINK_KEEP_TURNS ?? '2', 10);
 export const TOOL_TRUNCATE_TURNS: number = parseInt(process.env.CWK_TOOL_TRUNCATE_TURNS ?? '3', 10);

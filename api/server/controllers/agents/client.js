@@ -1538,10 +1538,14 @@ class AgentClient extends BaseClient {
     // No DB writes, no async, no LLM — pure transform. See docs/18_context_reduction.md.
     // WithStats variant also surfaces `stats.toolDeduped` for the harness
     // supervisor's stuck-pattern detector below. See docs/31_harness_memory_supervisor.md.
+    // [cowork] Per-chat override of the CWK_CONTEXT_REDUCTION default (off), set via the
+    // Chat settings "Context compaction" toggle and sent as ephemeralAgent.contextReduction.
+    const contextReductionOverride = this.options.req?.body?.ephemeralAgent?.contextReduction;
     const { messages: reducedPayload, stats: reductionStats } = applyContextReductionWithStats(
       formattedMessages,
       orderedMessages,
       this.conversationId,
+      contextReductionOverride,
     );
     payload = reducedPayload;
 

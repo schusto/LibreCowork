@@ -123,6 +123,13 @@ export type TEphemeralAgent = {
    * `tool_intents` agent capability to be enabled by the admin.
    */
   describe_intent?: boolean;
+  /**
+   * Per-chat override for LibreCowork's deterministic context reduction
+   * (thinking-block strip + tool result dedup/truncation). Undefined defers
+   * to the server default (off); `true` forces it on for this turn, `false`
+   * forces it off. See docs/18_context_reduction.md in the cowork repo.
+   */
+  contextReduction?: boolean;
 };
 
 export type TPayload = Partial<TMessage> &

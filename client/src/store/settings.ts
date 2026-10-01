@@ -71,6 +71,13 @@ const localStorageAtoms = {
   splitAtTarget: atomWithLocalStorage('splitAtTarget', false),
   rememberDefaultFork: atomWithLocalStorage(LocalStorageKeys.REMEMBER_FORK_OPTION, false),
   saveBadgesState: atomWithLocalStorage('saveBadgesState', false),
+  /**
+   * Deterministic context reduction (thinking-block strip + tool result
+   * dedup/truncation, see docs/18_context_reduction.md). Off by default —
+   * with it on, mutating older turns on every request tanks the KV cache hit
+   * rate in long chats. Flip on only when a chat needs the extra headroom.
+   */
+  contextReduction: atomWithLocalStorage('contextReduction', false),
 
   // Beta features settings
   modularChat: atomWithLocalStorage('modularChat', true),
