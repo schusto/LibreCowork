@@ -5186,6 +5186,37 @@ class AgentClient extends BaseClient {
             );
           },
         });
+        /**
+         * [cowork] EXPERIMENTAL (2026-10-07) — make clean-exit checkpoints durable so the
+         * SDK's Stop-hook continuation can find its segment checkpoint.
+         *
+         * Problem: when anything attaches a checkpointer (toolApproval.enabled, or
+         * ask_user_question), the SDK's continuation path calls resolveCompletedSegmentConfig
+         * (@librechat/agents run.ts) and throws "Cannot identify the checkpoint committed by the
+         * completed graph segment" — LazyMongoSaver discards every write-less (non-paused)
+         * checkpoint at graph exit, before our Stop hook even runs.
+         *
+         * Workaround: LazyMongoSaver persists everything for configs carrying
+         * LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY (checkpointer.ts isEventActorInvocation). We set
+         * only that key — not the owner/depth keys the real event-actor path adds.
+         *
+         * OPEN RISKS / UNVERIFIED (see docs/50_stall_recovery_checkpointer_fix.md):
+         *  1. Borrowed flag: meant for event-actor runs; only the saver's persist-everything
+         *     branches were checked, not every consumer.
+         *  2. Size: every turn now writes its full state as one Mongo doc. Past the hard limit
+         *     (16 MB less headroom) the saver throws CheckpointTooLargeError and the turn FAILS.
+         *     Long runs are exactly the ones that stall, so watch the "[checkpointer] ... MB" logs.
+         *  3. Cleanup: clean path prunes nothing after the turn (see finally below); we rely on
+         *     the pre-run prune of this generation + the Mongo TTL, so dead checkpoints linger.
+         *  4. Untested end to end: that getState/getStateHistory then yields a snapshot whose
+         *     runStepState matches (executionId, streamSegment) of the segment being continued.
+         * Fallback if this proves unsound: make the saver persist the segment-end checkpoint
+         * when a continuation is planned (saver/SDK change; reconcile with upstream).
+         */
+        if (stallRecoveryHook && runUsesCheckpointer && this.eventActorInvocationId == null) {
+          config.configurable[LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY] =
+            `cowork-stall-recovery:${this.responseMessageId}`;
+        }
         const reasoningLabel = this.buildReasoningLabelWiring(streamId, abortController.signal);
         const offsetHandlers = createSteerIndexOffsetHandlers(
           this.options.eventHandlers,

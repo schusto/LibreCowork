@@ -107,18 +107,23 @@ services:
       - cowork_infra
       - cowork_default
     volumes:
+      # Config + tool-approval policy live in ~/agent-controls (not writable by the agent user). Mounted read-only.
+      # librechat.yaml keeps its container path (/app/librechat.yaml: loadTitleConfig reads it directly).
       - type: bind
-        source: ./librechat.yaml
+        source: /Users/erik/agent-controls/policy/librechat.yaml
         target: /app/librechat.yaml
+        read_only: true
+      - type: bind
+        source: /Users/erik/agent-controls/policy
+        target: /agent-controls/policy
+        read_only: true
       - type: bind
         source: /Users/erik/proj
         target: /Users/erik/proj
 #      - type: bind
 #        source: /Volumes/Multimedia/Musik
 #        target: /Volumes/Multimedia/Musik
-      - type: bind
-        source: /Users/erik/proj/cowork/mcp/desktop-commander/config.json
-        target: /root/.desktop-commander/config.json
+      # (desktop-commander config.json mount removed: Desktop Commander now runs natively as ai-agent)
       - type: bind
         source: /Users/erik/proj/cowork/uploads
         target: /app/uploads
