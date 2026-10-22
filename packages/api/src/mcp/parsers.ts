@@ -94,6 +94,19 @@ function isImageContent(item: t.ToolContentPart): item is t.ImageContent {
   return item.type === 'image';
 }
 
+/**
+ * SVG is XML text, not a raster format: vision backends (LM Studio, llama.cpp) reject
+ * `data:image/svg+xml` URLs with "'url' field must be a base64 encoded image", so SVG is
+ * delivered to the model as text instead of an image part.
+ */
+function isSvgMimeType(mimeType?: string | null): boolean {
+  return mimeType?.toLowerCase().split(';')[0].trim() === 'image/svg+xml';
+}
+
+function decodeSvgText(item: t.ImageContent): string {
+  return isRemoteImageUrl(item.data) ? item.data : Buffer.from(item.data, 'base64').toString('utf8');
+}
+
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
 /**
@@ -115,7 +128,7 @@ function readResourceBody(resource: t.ResourceContents): t.ResourceBody {
   }
 
   const mimeType = resource.mimeType;
-  if (mimeType != null && mimeType.toLowerCase().startsWith('image/')) {
+  if (mimeType != null && mimeType.toLowerCase().startsWith('image/') && !isSvgMimeType(mimeType)) {
     return { image: { type: 'image', data: resource.blob, mimeType } };
   }
 
@@ -204,6 +217,9 @@ function parseAsString(result: t.MCPToolCallResponse): string {
         return resourceText.join('\n');
       }
       if (isImageContent(item)) {
+        if (isSvgMimeType(item.mimeType)) {
+          return decodeSvgText(item);
+        }
         assertImageDataWithinLimit(item);
       }
       return JSON.stringify(item, null, 2);
@@ -263,6 +279,10 @@ export function formatToolContent(
 
     image: (item) => {
       if (!isImageContent(item)) {
+        return;
+      }
+      if (isSvgMimeType(item.mimeType)) {
+        currentTextBlock += (currentTextBlock ? '\n\n' : '') + decodeSvgText(item);
         return;
       }
       collectImage(item);

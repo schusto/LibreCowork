@@ -71,6 +71,23 @@ describe('formatToolContent', () => {
           expect(artifacts).toBeUndefined();
         });
 
+        it('should deliver SVG images as text, not as an image_url part', () => {
+          const svg = '<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>';
+          const result: t.MCPToolCallResponse = {
+            content: [
+              {
+                type: 'image',
+                data: Buffer.from(svg).toString('base64'),
+                mimeType: 'image/svg+xml',
+              },
+            ],
+          };
+
+          const [content, artifacts] = formatToolContent(result, provider);
+          expect(content).toBe(svg);
+          expect(artifacts).toBeUndefined();
+        });
+
         it('should extract images to artifacts and keep text as string', () => {
           const result: t.MCPToolCallResponse = {
             content: [
