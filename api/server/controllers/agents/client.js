@@ -378,6 +378,62 @@ class AgentClient extends BaseClient {
     });
   }
 
+  /**
+   * [cowork] Tells the agent where attachments it was NOT sent live on disk, so it can open
+   * them with whatever MCP/file tools it has. Companion to `fileConfig.endpoints.custom.
+   * defaultLLMDeliveryPath` in librechat.yaml: anything the model cannot read natively (PDF,
+   * Office, archives, audio, ...) resolves to delivery path `none`, which leaves it out of the
+   * prompt entirely, so without this note the agent would not know the file exists.
+   * See docs/51_attachments_as_files_for_tools.md.
+   *
+   * Local uploads only (`filepath` is `/uploads/<user>/<file>`, which the compose file mounts
+   * from CWK_HOST_UPLOADS_DIR into the container); returns null when the variable is unset,
+   * so the feature is off by default. Built from `message_file_map`, so files attached in
+   * earlier turns stay listed on later turns.
+   *
+   * KNOWN LIMITS: assumes the container's `/uploads` is the host dir in CWK_HOST_UPLOADS_DIR;
+   * other storage strategies (S3, ...) are skipped; the agent's MCP tools must be able to
+   * read that host path (the agent-sandbox ACL may deny it, see docs/49).
+   * @returns {string | null}
+   */
+  buildAttachmentPathNote() {
+    const hostRoot = process.env.CWK_HOST_UPLOADS_DIR;
+    if (!hostRoot) {
+      return null;
+    }
+    const byId = new Map();
+    for (const file of Object.values(this.message_file_map ?? {}).flat()) {
+      if (file?.file_id && !byId.has(file.file_id)) {
+        byId.set(file.file_id, file);
+      }
+    }
+    const lines = [];
+    for (const file of byId.values()) {
+      const source = file.source ?? FileSources.local;
+      const filepath = file.filepath;
+      if (
+        source !== FileSources.local ||
+        typeof filepath !== 'string' ||
+        !filepath.startsWith('/uploads/') ||
+        filepath.includes('..') ||
+        this.getAttachmentDeliveryPath(file) !== 'none'
+      ) {
+        continue;
+      }
+      const hostPath = `${hostRoot.replace(/\/+$/, '')}/${filepath.slice('/uploads/'.length)}`;
+      lines.push(`- "${file.filename}" (${file.type || 'unknown type'}): ${hostPath}`);
+    }
+    if (lines.length === 0) {
+      return null;
+    }
+    return [
+      '# Attached files (not included in the prompt)',
+      'The user attached the file(s) below. Their content was NOT sent to you; they are on disk at the paths shown.',
+      'Open them with whichever of your tools can read that file type (PDF, Office, data, audio, ...).',
+      ...lines,
+    ].join('\n');
+  }
+
   getProcessableAttachmentsForEndpoint(attachments, modelBoundAttachments) {
     const admittedModelAttachments =
       modelBoundAttachments ?? this.getModelBoundAttachmentsForEndpoint(attachments);
@@ -3061,7 +3117,11 @@ class AgentClient extends BaseClient {
      * `additional_kwargs: { role: 'system', source: 'hook' }`, ephemeral to
      * this call and never persisted) targets exactly that gap.
      */
-    this.proactiveContextMessage = proactiveContext || null;
+    // [cowork] Attachments left out of the prompt (delivery path `none`) are announced with their
+    // host path, appended with the proactive context so it rides the same after-user-message slot.
+    const attachmentPathNote = this.buildAttachmentPathNote();
+    this.proactiveContextMessage =
+      [proactiveContext, attachmentPathNote].filter(Boolean).join('\n\n') || null;
     if (stuckNudge) sharedRunContextParts.push(stuckNudge);
     // [cowork] Stall-recovery: establish the DONE_TAG completion-marker
     // convention every turn (synchronous, no I/O) — see

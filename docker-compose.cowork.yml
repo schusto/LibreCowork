@@ -154,6 +154,7 @@ services:
       - CWK_RAG_TRUNCATE_CHARS=2000   # max chars per RAG result outside the keep window
       - CWK_WEB_TRUNCATE_TURNS=2      # web search results kept verbatim for N turns (shorter — discussed quickly)
       - CWK_WEB_TRUNCATE_CHARS=1000   # max chars per web result outside the keep window
+      - CWK_HOST_UPLOADS_DIR=/Users/erik/proj/cowork/uploads   # [cowork] host path of the /app/uploads mount; enables the attached-file path note (client.js buildAttachmentPathNote, docs/51). Unset = off
       - CWK_DUMP_CONTEXT=1            # dump raw formattedMessages to ~/proj/cowork/uploads/cwk-context-dumps/ (one file per request) — [cowork] temporarily on to catch the web-researcher subagent losing its user brief (see docs/44)
       # - CWK_DUMP_DIR=/app/uploads/cwk-context-dumps  # default — maps to ~/proj/cowork/uploads/cwk-context-dumps/ on host
       # [cowork] Harness supervisor — proactive memory/work-graph injection + stuck-pattern nudge. See docs/31_harness_memory_supervisor.md.
