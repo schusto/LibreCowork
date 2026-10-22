@@ -114,6 +114,13 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
   return createInMemoryServices(inMemoryOptions);
 }
 
+/** [cowork] CWK_STALE_JOB_TIMEOUT_MS override for the stale-running-job failsafe. */
+function resolveStaleJobTimeoutMs(): number {
+  const raw = process.env.CWK_STALE_JOB_TIMEOUT_MS;
+  const parsed = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 1_200_000;
+}
+
 /**
  * Create in-memory stream services
  */
@@ -122,7 +129,10 @@ function createInMemoryServices(options?: StreamServicesConfig['inMemoryOptions'
     ttlAfterComplete: options?.ttlAfterComplete ?? 300000, // 5 minutes
     maxJobs: options?.maxJobs ?? 1000,
     // Failsafe for crashed/hung generations (mirrors RedisJobStore's running-job TTL).
-    staleJobTimeout: options?.staleJobTimeout ?? 1_200_000, // 20 minutes
+    // [cowork] Inactivity limit, overridable via CWK_STALE_JOB_TIMEOUT_MS (0 disables):
+    // a cold 80k+ prefill on a local dense model is silent for >20 min, which the
+    // upstream default reaped as "Generation timed out". See docs/architecture/libre-cowork-fork.md.
+    staleJobTimeout: options?.staleJobTimeout ?? resolveStaleJobTimeoutMs(), // default 20 minutes
   });
 
   const eventTransport = new InMemoryEventTransport();
