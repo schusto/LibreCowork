@@ -3336,6 +3336,30 @@ describe('User parameter passing tests', () => {
     });
   });
 
+  describe('createUnavailableToolStub: unknown tool on a reachable server', () => {
+    it('names the real tools instead of claiming the server is unavailable', async () => {
+      const mockUser = { id: 'unknown-tool-user' };
+      const mockRes = { write: jest.fn(), flush: jest.fn() };
+      mockReinitMCPServer.mockResolvedValueOnce({
+        availableTools: {
+          start_process_mcp_unknownsrv: { function: { name: 'start_process_mcp_unknownsrv', description: 'x', parameters: {} } },
+          read_file_mcp_unknownsrv: { function: { name: 'read_file_mcp_unknownsrv', description: 'x', parameters: {} } },
+        },
+      });
+      const stub = await createMCPTool({
+        res: mockRes,
+        user: mockUser,
+        toolKey: `execute_command${Constants.mcp_delimiter}unknownsrv`,
+        provider: 'openai',
+        availableTools: {},
+      });
+      const result = await stub.invoke({});
+      expect(result).toContain('Unknown tool "execute_command"');
+      expect(result).toContain('start_process, read_file');
+      expect(result).not.toContain('temporarily unavailable');
+    });
+  });
+
   describe('negative tool cache and throttle interaction', () => {
     it('should cache tool as missing even when throttled (cross-user dedup)', async () => {
       const mockUser = { id: 'throttle-test-user' };

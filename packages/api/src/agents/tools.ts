@@ -495,7 +495,16 @@ export interface RegisterFileAuthoringToolsParams {
  * per-request state — so a single frozen object is safe to share across
  * every agent init.
  */
-const SKILL_READ_FILE_DESCRIPTION = `${ReadFileToolDefinition.description}
+/**
+ * Leads the skill-variant file tool descriptions. These tools carry unprefixed names
+ * (`read_file`, `edit_file`, `create_file`) that models mistake for the general file tools,
+ * so they try them first on ordinary paths and fail before switching to the MCP tools.
+ */
+const SKILL_FILES_ONLY_NOTICE = `NOT a general filesystem tool: it works on skill files (paths under "skills/") and code-sandbox files only. It cannot see the user's project or disk files; for those use the MCP file tools instead (for example read_file_mcp_desktop_commander, edit_block_mcp_desktop_commander, write_file_mcp_desktop_commander).`;
+
+const SKILL_READ_FILE_DESCRIPTION = `${SKILL_FILES_ONLY_NOTICE}
+
+${ReadFileToolDefinition.description}
 
 Also accepts authored skill file paths using "skills/{skillName}/...", including "skills/{skillName}/SKILL.md".`;
 
@@ -560,7 +569,7 @@ const CODE_READ_FILE_DEF: LCTool = Object.freeze({
 
 function createAttachedWorkspaceReadFileDef(includeSkillFileInstructions: boolean): LCTool {
   const baseDescription = includeSkillFileInstructions
-    ? SKILL_READ_FILE_DESCRIPTION
+    ? SKILL_READ_FILE_DESCRIPTION.replace(`${SKILL_FILES_ONLY_NOTICE}\n\n`, '')
     : CODE_READ_FILE_DESCRIPTION;
   return Object.freeze({
     name: ReadFileToolDefinition.name,
@@ -837,7 +846,9 @@ const CODE_EDIT_FILE_PARAMETERS: LCTool['parameters'] = Object.freeze({
   required: ['path'],
 }) as LCTool['parameters'];
 
-const SKILL_CREATE_FILE_DESCRIPTION = `Create a new file, or overwrite an existing file with explicit intent.
+const SKILL_CREATE_FILE_DESCRIPTION = `${SKILL_FILES_ONLY_NOTICE}
+
+Create a new file, or overwrite an existing file with explicit intent.
 
 Use for new files and full rewrites. Requires overwrite: true to replace existing files.
 
@@ -860,7 +871,9 @@ Targets code-execution sandbox paths. Prefer /mnt/data/{file} for files that sho
 
 Very long content can exceed the streamed tool-argument limit (64 KB by default) and fail the call. For large files, create the file with its first section, then extend it with edit_file.`;
 
-const SKILL_EDIT_FILE_DESCRIPTION = `Apply targeted text replacements to an existing file.
+const SKILL_EDIT_FILE_DESCRIPTION = `${SKILL_FILES_ONLY_NOTICE}
+
+Apply targeted text replacements to an existing file.
 
 Use for small, precise changes. Each old_text must match exactly one location. Tries exact match first; falls back to whitespace-tolerant matching if needed. Reports which matching strategy was used. Returns a unified diff.
 
@@ -917,6 +930,9 @@ const ATTACHED_CODE_EDIT_FILE_DESCRIPTION = `Apply one or more ordered text repl
 Use a path in the form "workspace/{relativePath}". Every old_text must match exactly one location at its step in the batch, unless that edit sets replace_all. Exact matching is tried first; where this environment allows it, whitespace-only differences are also accepted, and a whitespace-only miss names the line to copy. Up to 100 replacements and 1 MiB of edit text are allowed; the entire batch commits atomically or makes no change. A failure names every edit that did not apply and why, so fix those edits and retry.`;
 
 const ATTACHED_SKILL_CREATE_FILE_DESCRIPTION = `${SKILL_CREATE_FILE_DESCRIPTION.replace(
+  `${SKILL_FILES_ONLY_NOTICE}\n\n`,
+  '',
+).replace(
   'Non-skills paths target the code-execution sandbox when enabled. Prefer /mnt/data/{file}.',
   'For the selected attached environment, non-skill paths must use "workspace/{relativePath}".',
 )}`;

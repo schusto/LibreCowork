@@ -132,6 +132,33 @@ function evictStale(map, ttl) {
 const unavailableMsg =
   "This tool's MCP server is temporarily unavailable. Please try again shortly.";
 
+/** CWK: server name -> tool names seen on the last successful (re)connect. Lets the stub for a tool that does not
+ *  exist say so (with the real names) instead of claiming the server is unavailable. See docs/architecture/libre-cowork-fork.md. */
+const knownServerTools = new Map();
+
+/** @param {string} serverName @param {LCAvailableTools | undefined} tools */
+function rememberServerTools(serverName, tools) {
+  if (serverName == null || tools == null || typeof tools !== 'object') {
+    return;
+  }
+  const suffix = `${Constants.mcp_delimiter}${normalizeServerName(serverName)}`;
+  const names = Object.keys(tools)
+    .filter((key) => key.endsWith(suffix))
+    .map((key) => key.slice(0, -suffix.length));
+  if (names.length > 0) {
+    knownServerTools.set(serverName, names);
+  }
+}
+
+/** @param {string} toolName @param {string} serverName */
+function unknownToolMsg(toolName, serverName) {
+  const names = knownServerTools.get(serverName);
+  if (!names || names.length === 0) {
+    return unavailableMsg;
+  }
+  return `Unknown tool "${toolName}" on MCP server "${serverName}": no such tool exists, the server is reachable. Do not retry this name. Available tools: ${names.join(', ')}.`;
+}
+
 function getOAuthFlowId(userId, serverName, tenantId = getTenantId()) {
   if (!tenantId) {
     return MCPOAuthHandler.generateFlowId(userId, serverName);
@@ -551,7 +578,8 @@ async function isEarlyDomainAllowed({
  */
 function createUnavailableToolStub(toolName, serverName) {
   const normalizedToolKey = `${toolName}${Constants.mcp_delimiter}${normalizeServerName(serverName)}`;
-  const _call = async () => [unavailableMsg, null];
+  const msg = unknownToolMsg(toolName, serverName);
+  const _call = async () => [msg, null];
   const toolInstance = tool(_call, {
     schema: {
       type: 'object',
@@ -561,7 +589,7 @@ function createUnavailableToolStub(toolName, serverName) {
       required: [],
     },
     name: normalizedToolKey,
-    description: unavailableMsg,
+    description: msg,
     responseFormat: AgentConstants.CONTENT_AND_ARTIFACT,
   });
   toolInstance.mcp = true;
@@ -1141,6 +1169,7 @@ async function createMCPTool({
   /** @type {LCFunctionTool | undefined} */
   let toolEntry = findToolEntry(availableTools);
   if (!toolEntry) {
+    rememberServerTools(serverName, availableTools);
     const cachedAt = useMissingToolCache ? missingToolCache.get(toolKey) : undefined;
     if (cachedAt && Date.now() - cachedAt < MISSING_TOOL_TTL_MS) {
       logger.debug('[MCP] Tool is in negative cache; returning unavailable stub');
@@ -1168,6 +1197,7 @@ async function createMCPTool({
     });
     if (result?.availableTools) {
       onAvailableTools?.(result.availableTools);
+      rememberServerTools(serverName, result.availableTools);
     }
     toolEntry = findToolEntry(result?.availableTools);
 
