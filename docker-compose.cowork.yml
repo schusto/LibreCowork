@@ -30,6 +30,11 @@ services:
     # private IP origins (192.168.x, etc.).
     ports:
       - "0.0.0.0:8083:80"
+    # The image's own check hits http://localhost/, which resolves to ::1 here while nginx listens on IPv4 only.
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 3s
     volumes:
       - type: bind
         source: ./nginx/sandbox-startup.js
@@ -100,9 +105,6 @@ services:
     # from a private IP without a wildcard domain + trusted cert setup.
     ports:
       - "0.0.0.0:3081:3080"
-    depends_on:
-      small_ppt:
-        condition: service_healthy
     networks:
       - cowork_infra
       - cowork_default
@@ -181,22 +183,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
-
-  small_ppt:
-    build:
-      context: /Users/erik/proj/cowork/mcp/small-powerpoint-mcp
-    container_name: small-ppt-cowork
-    ports:
-      - '8961:8960'
-    volumes:
-      - /Users/erik/proj:/Users/erik/proj
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 8960)); s.close()"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
 
   # ── Playwright MCP ────────────────────────────────────────────────────────
   # Microsoft's official @playwright/mcp server. Gives agents headless Chromium

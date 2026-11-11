@@ -547,6 +547,13 @@ async function getProactiveMemoryContext({ userMessage, conversationId, userId, 
         collection: QDRANT_COLL_WORK_GRAPH,
         limit: WORK_GRAPH_LIMIT,
         scoreThreshold: WORK_GRAPH_THRESHOLD,
+        // Person-knowledge lifecycle: an *assumption* (inferred, not yet
+        // confirmed by recurrence) is searchable on demand but never pushed
+        // into a conversation. Points indexed before the field exists carry no
+        // `lifecycle` key and are unaffected by must_not.
+        filter: {
+          must_not: [{ key: 'lifecycle', match: { value: 'assumption' } }],
+        },
       }).catch((e) => {
         logger.warn(`[harnessSupervisor] work_graph search failed: ${e.message}`);
         return [];
