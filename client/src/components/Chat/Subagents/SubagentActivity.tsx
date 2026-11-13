@@ -15,6 +15,8 @@ import {
 } from './status';
 import MarkdownLite from '~/components/Chat/Messages/Content/MarkdownLite';
 import ContentParts from '~/components/Chat/Messages/Content/ContentParts';
+// [cowork] Scoped tasklist: mark subagent-thread content as 'inline' todo rendering (D2).
+import { TodoRenderModeContext } from '~/components/Chat/Messages/Content/TaskList';
 import Container from '~/components/Chat/Messages/Content/Container';
 import { EmptyText } from '~/components/Chat/Messages/Content/Parts';
 import ScrollToBottom from '~/components/Messages/ScrollToBottom';
@@ -362,17 +364,22 @@ export function SubagentActivityContent({
     ) : null;
   } else {
     body = (
-      <ContentParts
-        content={parts}
-        messageId={activityId ?? 'subagent-activity-panel'}
-        conversationId={conversationId}
-        isCreatedByUser={false}
-        isLast
-        isSubmitting={isSubmitting}
-        showThinking={showThinking}
-        isLatestMessage={isSubmitting}
-        foldLiveActivity={false}
-      />
+      /** [cowork] Scoped tasklist (D2): inside a subagent thread the thread's OWN
+       *  todo lists render inline from its own content args, and the pinned bottom
+       *  widget copy is suppressed — never mirrors the parent's list. */
+      <TodoRenderModeContext.Provider value="inline">
+        <ContentParts
+          content={parts}
+          messageId={activityId ?? 'subagent-activity-panel'}
+          conversationId={conversationId}
+          isCreatedByUser={false}
+          isLast
+          isSubmitting={isSubmitting}
+          showThinking={showThinking}
+          isLatestMessage={isSubmitting}
+          foldLiveActivity={false}
+        />
+      </TodoRenderModeContext.Provider>
     );
   }
 

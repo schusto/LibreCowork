@@ -48,7 +48,7 @@ import AgentHandoff from './AgentHandoff';
 import CodeAnalyze from './CodeAnalyze';
 import Container from './Container';
 import WebSearch from './WebSearch';
-import TaskList from './TaskList';
+import TaskList, { useTodoRenderMode } from './TaskList';
 import ToolCall from './ToolCall';
 import Image from './Image';
 
@@ -84,7 +84,10 @@ const Part = memo(function Part({
   hideAttachments,
   onToolExpand,
 }: PartProps) {
-  const { partIndex } = useMessageContext();
+  const messageContext = useMessageContext();
+  const { partIndex } = messageContext ?? {};
+  // [cowork] 'inline' inside subagent thread/activity surfaces; 'suppressed' in root chat.
+  const todoRenderMode = useTodoRenderMode();
   if (!part) {
     return null;
   }
@@ -500,10 +503,21 @@ const Part = memo(function Part({
           toolCall.name?.startsWith(TODO_UPDATE_TOOL) ||
           toolCall.name?.startsWith(TODO_CLEAR_TOOL)
         ) {
-          // The TaskList widget is now rendered as a pinned element by ContentParts,
-          // always showing the latest snapshot above the message content.
-          // Suppress the per-tool-call inline render to avoid duplication.
-          return null;
+          // [cowork] Scoped tasklist (design §3.4/D2): in the ROOT chat the pinned
+          // bottom widget owns the display, so suppress the inline card as before.
+          // Inside a subagent thread / activity phase ('inline' mode) render this
+          // thread's OWN list from its own args — never the parent's.
+          if (todoRenderMode === 'suppressed') {
+            return null;
+          }
+          return (
+            <TaskList
+              args={toolCall.args ?? '{}'}
+              isSubmitting={isSubmitting}
+              conversationId={messageContext?.conversationId}
+              messageId={messageContext?.messageId}
+            />
+          );
         }
         return (
           <ToolCall

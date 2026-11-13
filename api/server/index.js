@@ -421,6 +421,7 @@ const startServer = async () => {
   app.use('/api/search', routes.search);
   app.use('/api/messages', routes.messages);
   app.use('/api/convos', routes.convos);
+  app.use('/api/tasks', routes.tasks); // [cowork] scoped task-list store (docs/changes/2026-11-scoped-tasklist.md)
   app.use('/api/traces', routes.traces);
   app.use('/api/presets', routes.presets);
   app.use('/api/projects', routes.projects);
@@ -460,18 +461,6 @@ const startServer = async () => {
       res.json(response.data);
     } catch {
       res.json({ phase: 'idle' });
-    }
-  });
-
-  /** Todo status — proxies to mlx-proxy so sub-agent todo_update calls are visible
-   *  in the parent conversation's TaskList widget even though they occur in a
-   *  different message context and never appear in the parent's content stream. */
-  app.get('/api/todo_status', async (req, res) => {
-    try {
-      const response = await axios.get('http://host.docker.internal:1235/todo_status', { timeout: 1000 });
-      res.json(response.data);
-    } catch {
-      res.json({ todos: [], updated_at: null });
     }
   });
 

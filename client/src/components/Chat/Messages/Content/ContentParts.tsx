@@ -46,7 +46,7 @@ import Sources from '~/components/Web/Sources';
 import ToolCallGroup from './ToolCallGroup';
 import { blocksLiveFold } from './live';
 import Container from './Container';
-import TaskList from './TaskList';
+import TaskList, { useTodoRenderMode } from './TaskList';
 import Part from './Part';
 
 const TODO_TOOL_PREFIX_CP = 'todo_update';
@@ -1158,9 +1158,15 @@ const ContentPartsBody = memo(function ContentPartsBody({
 
   // [cowork] Latest todo_update/todo_clear args for the pinned TaskList widget
   const latestTodoArgs = getLatestTodoArgs(content);
-  // Only render the sticky footer container when it would actually contain something
+  // Only render the sticky footer container when it would actually contain something.
+  // [cowork] Suppressed inside 'inline' surfaces (subagent thread panels): there the
+  // thread's own inline TaskList cards carry the display (D2), a second pinned copy
+  // inside the panel would duplicate them.
+  const todoRenderMode = useTodoRenderMode();
   const showStickyWidgets =
-    !nestedActivityPhase && (latestTodoArgs !== null || (isLatestMessage && effectiveIsSubmitting));
+    todoRenderMode === 'suppressed' &&
+    !nestedActivityPhase &&
+    (latestTodoArgs !== null || (isLatestMessage && effectiveIsSubmitting));
 
   /** Columns only when at least two agents share a group — a lone group
    *  renders here, where tool grouping and activity labels apply. */
@@ -1217,7 +1223,12 @@ const ContentPartsBody = memo(function ContentPartsBody({
       {showStickyWidgets && (
         <div className="sticky bottom-0 z-10 -mx-1 px-1 pb-1 pt-0.5 bg-gradient-to-t from-surface-primary via-surface-primary to-transparent">
           {latestTodoArgs !== null && (
-            <TaskList args={latestTodoArgs} isSubmitting={effectiveIsSubmitting} />
+            <TaskList
+              args={latestTodoArgs}
+              isSubmitting={effectiveIsSubmitting}
+              conversationId={conversationId}
+              messageId={messageId}
+            />
           )}
           {isLatestMessage && effectiveIsSubmitting && <PrefillProgress isLatestMessage={true} />}
         </div>

@@ -193,3 +193,7 @@ scripts/activity-labels/results/
 !e2e/lighthouse/librechat.yaml
 /.lighthouse/
 /e2e/lighthouse/.test-results/
+
+# Fork work archives (timestamped pre-change copies) - stay on disk
+*.pre-p3-*
+*.pre-v2-*
