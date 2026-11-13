@@ -9,6 +9,7 @@ const {
   createStallRecoveryStopHook,
   resetAutoContinueCounter,
   getStallProbeTagInstruction,
+  getToolVoiceReminder,
 } = require('~/server/utils/harnessSupervisor');
 const { getBufferString, HumanMessage } = require('@librechat/agents/langchain/messages');
 const {
@@ -3120,8 +3121,22 @@ class AgentClient extends BaseClient {
     // [cowork] Attachments left out of the prompt (delivery path `none`) are announced with their
     // host path, appended with the proactive context so it rides the same after-user-message slot.
     const attachmentPathNote = this.buildAttachmentPathNote();
+    // [cowork] Tool-voice reminder (component 4): re-seeds the tool-call
+    // behaviour when a tool-using conversation drifts into N consecutive
+    // tool-free assistant turns. Rides the SAME after-user-message slot as
+    // the proactive context — docs/42 §4 showed that placement beats the
+    // system-prompt tail, which the model discounts. Predicate runs on the
+    // reduced payload (the array actually sent to the backend), so thinking
+    // stripping/truncation cannot desync the view. See harnessSupervisor.js.
+    const toolVoiceReminder = getToolVoiceReminder(reducedPayload);
+    if (toolVoiceReminder) {
+      logger.debug(
+        `[harnessSupervisor] conv=${(this.conversationId || '').slice(-8)} ` +
+          'tool_voice_reminder fired',
+      );
+    }
     this.proactiveContextMessage =
-      [proactiveContext, attachmentPathNote].filter(Boolean).join('\n\n') || null;
+      [proactiveContext, attachmentPathNote, toolVoiceReminder].filter(Boolean).join('\n\n') || null;
     if (stuckNudge) sharedRunContextParts.push(stuckNudge);
     // [cowork] Stall-recovery: establish the DONE_TAG completion-marker
     // convention every turn (synchronous, no I/O) — see

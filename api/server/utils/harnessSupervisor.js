@@ -244,6 +244,15 @@ const STATE_TTL_MS = parseInt(
 const STALL_PROBE_ENABLED =
   (process.env.CWK_SUPERVISOR_STALL_PROBE_ENABLED ?? 'true').toLowerCase() !== 'false';
 /**
+ * [cowork] 2026-11-13. Legacy gate kept behind a flag: when true, restore the
+ * old precondition that a turn must contain >=1 LangChain 'tool'-typed message
+ * before the stall probe may fire. Default false — see shouldFireStallProbe for
+ * why the precondition was removed (blind to symptom-B drift; unreliable here
+ * because tool results ride assistant content parts rather than ToolMessages).
+ */
+const STALL_PROBE_REQUIRE_TOOL_CALL =
+  (process.env.CWK_SUPERVISOR_STALL_PROBE_REQUIRE_TOOL_CALL ?? 'false').toLowerCase() === 'true';
+/**
  * Separate, narrower switch from STALL_PROBE_ENABLED above: it gates whether
  * the `Stop` hook that performs the continuation is registered at all.
  * Detection-side behaviour (the DONE_TAG instruction pushed into every turn's
@@ -303,9 +312,14 @@ const STALL_PROBE_MAX_TOTAL_CONTINUATIONS = parseInt(
 const DONE_TAG = process.env.CWK_SUPERVISOR_STALL_PROBE_DONE_TAG ?? '<---DONE--->';
 const STALL_PROBE_MESSAGE =
   process.env.CWK_SUPERVISOR_STALL_PROBE_MESSAGE ??
-  `If the work is done and no instructions are missing just print ${DONE_TAG}, ` +
-    'otherwise continue your tasks and achieve your goal. When you are fully ' +
-    `done add ${DONE_TAG} at the end.`;
+  `You stopped without signalling completion. If the work is genuinely done ` +
+    `and nothing is missing, reply exactly ${DONE_TAG}. Otherwise continue: ` +
+    'call the next tool for the next step — describing an intended action ' +
+    'instead of executing it is a failure mode. If a todo/task-list tool is ' +
+    'available, keep it current while you work (mark the active step ' +
+    'in_progress, completed steps completed) and finish every item before ' +
+    `signalling; when all items are completed, clear or close the list, then ` +
+    `end your final response with ${DONE_TAG} on its own line.`;
 
 /**
  * Text shown in the chat when a continuation fires. Set to an empty string to
@@ -344,6 +358,47 @@ const STALL_PROBE_INDICATOR =
 const INJECTION_INDICATOR =
   process.env.CWK_SUPERVISOR_INJECTION_INDICATOR ??
   'Consulted memory + work graph for this task (%d work-graph, %d chat results)';
+
+/**
+ * [cowork] Component 4: tool-voice reminder (2026-11).
+ * Long-context symptom observed on Qwen3.8-Flash-Next: after 2-3 purely
+ * conversational assistant turns in a tool-using conversation, the model's
+ * prior for emitting tool calls decays (in-context behavioral momentum) —
+ * it narrates intended actions instead of executing them. A turn reminding
+ * it restores the behavior; re-running the same message sometimes does,
+ * which shows the prior dipped rather than vanished. Prevention layer for
+ * exactly the failure the stall probe cannot catch BY DESIGN: the probe
+ * requires >=1 tool call in the turn (docs 2026-08-stall-recovery §2), so a
+ * tool-free turn that SHOULD have contained a call is invisible to it.
+ * Fires only when BOTH hold: (a) the most recent TOOL_VOICE_GAP assistant
+ * turns contain no tool call, (b) a tool call exists within the previous
+ * TOOL_VOICE_RECENT_TURNS assistant turns — pure-chat conversations are
+ * therefore never nagged. Stateless predicate over the reduced payload
+ * (no Mongo, no embedding, no latency). See docs/changes/2026-11-tool-voice-reminder.md.
+ */
+const TOOL_VOICE_ENABLED =
+  (process.env.CWK_TOOL_VOICE_ENABLED ?? 'true').toLowerCase() !== 'false';
+const TOOL_VOICE_GAP = parseInt(process.env.CWK_TOOL_VOICE_GAP ?? '2', 10);
+const TOOL_VOICE_RECENT_TURNS = parseInt(
+  process.env.CWK_TOOL_VOICE_RECENT_TURNS ?? '10',
+  10,
+);
+
+/**
+ * [cowork] Component 5: todo-list voice (2026-11). Agents use the scoped
+ * tasklist sparsely even though its own tool description asks for it — tool
+ * descriptions lose weight mid-conversation, the same discount docs/42 showed
+ * for the system-prompt tail. Fix rides the proven per-turn instruction slot:
+ * getStallProbeTagInstruction() (pushed into sharedRunContextParts every turn)
+ * gains a compact progress-tracking section with one REAL example call
+ * (registry name todo_update_mcp_todo_list, schema from mcp/todo_list/server.js
+ * v2), phrased conditionally ("if you have such a tool") so agents without
+ * the tool attached are never told to call something they lack. The
+ * continuation probe message carries the same reminder — see
+ * STALL_PROBE_MESSAGE. See docs/changes/2026-11-tool-voice-reminder.md §7.
+ */
+const TODO_VOICE_ENABLED =
+  (process.env.CWK_TODO_VOICE_ENABLED ?? 'true').toLowerCase() !== 'false';
 
 const EMBED_URL  = process.env.EMBED_URL  || 'http://host.docker.internal:9000/v1/embeddings';
 const QDRANT_URL = process.env.QDRANT_URL || 'http://host.docker.internal:6333';
@@ -806,8 +861,23 @@ function endsWithQuestionToUser(text) {
  */
 function shouldFireStallProbe(runMessages) {
   if (!Array.isArray(runMessages) || runMessages.length === 0) return false;
-  const hadToolCall = runMessages.some((m) => getMessageType(m) === 'tool');
-  if (!hadToolCall) return false;
+  // [cowork] 2026-11-13: the former `>=1 'tool'-typed message` precondition
+  // is OFF by default. It made the probe structurally blind to the drift
+  // failure (a tool-free turn that should have contained a call — symptom B)
+  // and, worse, unreliable on this architecture: tool results ride assistant
+  // content parts, not LangChain ToolMessages, so `getMessageType(m)==='tool'`
+  // can stay false even after genuine tool work (suspected cause of the
+  // 2026-11-13 live miss). DONE_TAG presence/absence plus the final-question
+  // exemption carry the whole decision now — the tag instruction is injected
+  // EVERY turn, so even pure-chat answers are covered by the same contract.
+  // Residual cost: a complete pure-chat reply that forgot the tag burns one
+  // bounded probe round and self-corrects (same trade-off already accepted
+  // for the removed length gate, docs 2026-08-stall-recovery §8). Set
+  // CWK_SUPERVISOR_STALL_PROBE_REQUIRE_TOOL_CALL=true for legacy behavior.
+  if (STALL_PROBE_REQUIRE_TOOL_CALL) {
+    const hadToolCall = runMessages.some((m) => getMessageType(m) === 'tool');
+    if (!hadToolCall) return false;
+  }
   const last = runMessages[runMessages.length - 1];
   if (getMessageType(last) !== 'ai') return false;
   const toolCalls = last?.tool_calls;
@@ -966,16 +1036,113 @@ async function resetAutoContinueCounter(conversationId) {
  */
 function getStallProbeTagInstruction() {
   if (!SUPERVISOR_ENABLED || !STALL_PROBE_ENABLED) return null;
-  return (
+  const completion =
     '# Harness note — completion signal\n\n' +
     'When you have fully completed the current request and there is ' +
     `nothing further to do, end your response with the exact tag ${DONE_TAG} ` +
-    'on its own line. If more work remains, do not include this tag — just ' +
-    'continue working. If instead you are asking the user a question or ' +
-    'need their decision before you can continue, end your response ' +
-    'normally (with the question) and also omit the tag — a response ' +
-    "ending in a question is recognized as waiting for the user's reply, " +
-    'not as incomplete work to resume on its own.'
+    'on its own line. If more work remains, do not include the tag — just ' +
+    'continue working. If instead you are asking a question or need the ' +
+    'user\'s decision before continuing, end normally (with the question) ' +
+    'and omit the tag.';
+  // [cowork] Component 5: todo-list voice. Exact callable names ride the
+  // instruction because tool descriptions lose weight mid-conversation and
+  // agents were observed searching the registry for the tasklist tool at
+  // runtime instead of using it (2026-11-13 live check). Conditional wording:
+  // agents without these tools attached must not be told to call them.
+  const tracking = TODO_VOICE_ENABLED
+    ? '\n\n# Progress tracking\n\n' +
+      'For any multi-step task keep a visible task list with the scoped ' +
+      'tasklist MCP tools. Use these EXACT tool names (searching the ' +
+      'registry for them wastes a turn):\n' +
+      '- `todo_update_mcp_todo_list` — full snapshot every time; fields per ' +
+      'item: content (imperative), activeForm (present continuous), status ' +
+      '(pending | in_progress | completed)\n' +
+      '- `todo_get_mcp_todo_list` — read the current list\n' +
+      '- `todo_clear_mcp_todo_list` — dismiss the widget once every item is ' +
+      'completed\n\n' +
+      'Create the list before the first real step, resend the updated ' +
+      'snapshot after each step, keep exactly one item in_progress while ' +
+      'working, set every item completed when finished, then clear the list ' +
+      `before ending with ${DONE_TAG}. Example first call: {"todos": [{"content": "Run tests", "activeForm": "Running tests", "status": "in_progress"}, {"content": "Write report", "activeForm": "Writing report", "status": "pending"}]}`
+    : '';
+  return completion + tracking;
+}
+
+/**
+ * [cowork] True when an assistant message (reduced-payload shape, see
+ * contextReduction.js header) contains at least one tool_call content part.
+ * Checks both the parts-array form ({ type: 'tool_call' }) and a plain
+ * message.tool_calls array, so the predicate works on either representation.
+ */
+function assistantHasToolCall(message) {
+  if (!message) return false;
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    return true;
+  }
+  const content = message.content;
+  if (Array.isArray(content)) {
+    return content.some(
+      (part) => part && typeof part === 'object' && part.type === 'tool_call',
+    );
+  }
+  return false;
+}
+
+/**
+ * [cowork] Tool-voice reminder (component 4), or null when it should not fire.
+ *
+ * Predicate over the reduced payload messages (the same array
+ * applyContextReductionWithStats produced): scan assistant messages from the
+ * end; fire only when the last TOOL_VOICE_GAP of them are all tool-free AND
+ * a tool call appears within the next TOOL_VOICE_RECENT_TURNS assistant
+ * messages behind them. Consequences: a conversation that never used tools
+ * stays silent (condition b fails); a healthy tool-using conversation stays
+ * silent (condition a fails); only the drift pattern nags.
+ *
+ * Text design rules (learned the hard way during drafting, 2026-11-13):
+ * examples inside injected text are imitated with full fidelity, including
+ * mistakes — so examples must be real, executable-shaped calls, and the wire
+ * envelope is deliberately NOT re-taught here: chat_template.jinja injects
+ * the canonical envelope fresh every request; a second copy risks teaching a
+ * competing syntax. The example teaches decision + argument shape only.
+ *
+ * @param {Array<{role?: string, content?: unknown, tool_calls?: unknown[]}>} payloadMessages
+ * @returns {string|null}
+ */
+function getToolVoiceReminder(payloadMessages) {
+  if (!SUPERVISOR_ENABLED || !TOOL_VOICE_ENABLED) return null;
+  if (!Array.isArray(payloadMessages) || payloadMessages.length === 0) {
+    return null;
+  }
+  const assistants = payloadMessages.filter((m) => m?.role === 'assistant');
+  if (assistants.length < TOOL_VOICE_GAP + 1) return null;
+
+  // Condition (a): the most recent GAP assistant turns contain no tool call.
+  const gapSlice = assistants.slice(-TOOL_VOICE_GAP);
+  if (gapSlice.some(assistantHasToolCall)) return null;
+
+  // Condition (b): a tool call exists within RECENT_TURNS assistant messages
+  // behind the gap. Nothing older counts — long-dead tool use means this is
+  // just a chat conversation again, not a drifting agent.
+  const lookback = assistants.slice(
+    -(TOOL_VOICE_GAP + TOOL_VOICE_RECENT_TURNS),
+    -TOOL_VOICE_GAP,
+  );
+  if (!lookback.some(assistantHasToolCall)) return null;
+
+  return (
+    '# Harness note — tool use\n\n' +
+    'You have tools available and used them earlier in this conversation. ' +
+    'If this request involves reading files, running commands, fetching ' +
+    'data, or changing anything, act with a tool call instead of describing ' +
+    'what you would do. Narrating intended actions without executing them ' +
+    'is a failure mode. Before concluding a tool does not exist, search for ' +
+    'it by exact name once more. Correct calls carry every required ' +
+    'argument, for example {"name": "tool_search", "arguments": {"query": ' +
+    '"start process shell command"}}. If a scoped tasklist tool is attached, ' +
+    'its exact name is `todo_update_mcp_todo_list` and a correct call looks ' +
+    'like {"todos": [{"content": "Run tests", "activeForm": "Running tests", ' +
+    '"status": "in_progress"}]}.'
   );
 }
 
@@ -1125,6 +1292,7 @@ module.exports = {
   tryReserveStallProbeSlot,
   resetAutoContinueCounter,
   getStallProbeTagInstruction,
+  getToolVoiceReminder,
   STALL_PROBE_MESSAGE,
   DONE_TAG,
   STALL_PROBE_REENTRY_ENABLED,
