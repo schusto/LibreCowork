@@ -202,6 +202,15 @@ router.post('/', internalSecretAuth, async (req, res) => {
       logger.warn(`[tasks] growth trim failed for ${conversationId}: ${e.message}`);
     }
 
+    // INVARIANT (finding 2): userId reaching $set is always a non-empty string.
+    // Both branches above guarantee it — exists-branch requires
+    // `typeof userId === 'string'` plus ownership; first-turn branch requires
+    // mongoose.isValidObjectId(userId). So the `: null` below is unreachable
+    // defensive narrowing, NOT a path that persists null. Locked by the spec
+    // 'rejects absent/null userId on an existing conversation', which asserts
+    // countDocuments({ userId: null }) === 0 after both attempts. Do not soften
+    // either guard: GET's fallback filters on userId (F3), so a null-stamped doc
+    // would be permanently invisible to its own owner.
     await getCollection().updateOne(
       { _id },
       {
