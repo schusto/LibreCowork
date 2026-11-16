@@ -133,6 +133,33 @@ router.post('/', internalSecretAuth, async (req, res) => {
   const _id = `${conversationId}:${messageId}`;
   const updatedAt = new Date();
   try {
+    // Multi-tenant hardening (Fix 1): the internal secret authenticates the
+    // SERVICE, not the scope. conversationId/messageId/userId originate from the
+    // chat request body upstream (no ownership validation found there: grep of
+    // controllers/agents/client.js for conversation validity checks is empty),
+    // so make the write self-checking instead of trusting two independently
+    // supplied facts: an existing conversation must belong to the userId given.
+    const Conversation = mongoose.models.Conversation;
+    if (!Conversation) {
+      logger.error('[tasks] Conversation model unavailable; refusing unverified write');
+      return res.status(500).json({ error: 'ownership check unavailable' });
+    }
+    const convoExists = await Conversation.exists({ conversationId });
+    if (convoExists) {
+      const owned =
+        typeof userId === 'string' && (await db.getConvo(userId, conversationId));
+      if (!owned) {
+        logger.warn(`[tasks] POST rejected: supplied userId does not own ${conversationId}`);
+        return res.status(400).json({ error: 'userId does not own conversationId' });
+      }
+    } else if (mongoose.isValidObjectId(userId)) {
+      // First turn: the conversation row is not persisted yet. Accept on a
+      // well-formed userId; log so we learn how often this case occurs.
+      logger.info(`[tasks] POST accepted before conversation exists (user ${userId})`);
+    } else {
+      return res.status(400).json({ error: 'unknown conversation and userId is not a valid id' });
+    }
+
     await getCollection().updateOne(
       { _id },
       {
