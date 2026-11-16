@@ -73,6 +73,25 @@ const todo = (label = 't') => [
   { content: label, activeForm: `doing ${label}`, status: 'pending' },
 ];
 
+describe('Fix 7 — compound index for the fallback query', () => {
+  it('tasklists carries TTL and conversationId+updatedAt indexes', async () => {
+    await request(app) // ensure getCollection() ran at least once
+      .post('/api/tasks')
+      .set(SECRET)
+      .send({ conversationId: 'c-f7', messageId: 'm1', userId: objId(), todos: todo() });
+    // Indexes are ensured fire-and-forget; give them a moment to land.
+    let names = [];
+    for (let i = 0; i < 25; i++) {
+      const idx = await collection.indexes();
+      names = idx.map((x) => Object.keys(x.key).join('+'));
+      if (names.includes('conversationId+updatedAt') && names.includes('updatedAt')) break;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    expect(names).toContain('updatedAt');
+    expect(names).toContain('conversationId+updatedAt');
+  });
+});
+
 describe('Fix 6 — DELETE keeps secret-or-JWT semantics after dedupe', () => {
   it('internal secret deletes; non-owner JWT gets 404; owner JWT deletes', async () => {
     const owner = objId();

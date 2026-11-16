@@ -66,6 +66,12 @@ function getCollection() {
     collection
       .createIndex({ updatedAt: 1 }, { expireAfterSeconds: TTL_SECONDS })
       .catch((e) => logger.warn(`[tasks] failed to ensure TTL index: ${e.message}`));
+    // F7: fallback GET filters conversationId and sorts updatedAt — same lazy,
+    // fire-and-forget posture; failure only means an unindexed sort, never a
+    // read/write error.
+    collection
+      .createIndex({ conversationId: 1, updatedAt: -1 })
+      .catch((e) => logger.warn(`[tasks] failed to ensure fallback index: ${e.message}`));
   }
   return collection;
 }
