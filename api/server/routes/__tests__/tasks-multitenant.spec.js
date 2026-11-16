@@ -73,6 +73,25 @@ const todo = (label = 't') => [
   { content: label, activeForm: `doing ${label}`, status: 'pending' },
 ];
 
+describe('Fix 4 — fallback sort has a deterministic tiebreaker', () => {
+  it('equal updatedAt resolves to the higher _id', async () => {
+    const convo = 'convo-f4';
+    const now = new Date();
+    await collection.insertMany([
+      {
+        _id: `${convo}:msg-a`, userId: objId(), conversationId: convo,
+        messageId: 'msg-a', todos: todo('a'), updatedAt: now,
+      },
+      {
+        _id: `${convo}:msg-b`, userId: objId(), conversationId: convo,
+        messageId: 'msg-b', todos: todo('b'), updatedAt: now,
+      },
+    ]);
+    const res = await request(app).get('/api/tasks').set(SECRET).query({ conversationId: convo });
+    expect(res.body.todos[0].content).toBe('b'); // 'msg-b' > 'msg-a' lexicographically
+  });
+});
+
 describe('Fix 3 — GET fallback filters by the JWT owner', () => {
   it('JWT caller never receives a doc whose stored userId differs', async () => {
     const owner = objId();

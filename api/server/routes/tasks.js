@@ -189,6 +189,9 @@ router.post('/', internalSecretAuth, async (req, res) => {
  * doc for the conversation (continuity fallback, design §3.4 first bullet —
  * "newest" = highest updatedAt; actor docs share the same key space today per
  * the KNOWN RISK note, so this doubles as the turn-scoped read).
+ * SEMANTICS (F4): the fallback is a LAST-WRITER-WINS VIEW OF THE CONVERSATION.
+ * Two parallel runs in one conversation see each other's list through it; that
+ * is accepted behaviour while documents are turn-scoped, not actor-scoped.
  */
 router.get('/', internalSecretOrJwt, async (req, res) => {
   const conversationId = req.query?.conversationId;
@@ -224,7 +227,7 @@ router.get('/', internalSecretOrJwt, async (req, res) => {
         conversationId,
         ...(req.user.id !== 'internal-service' && { userId: req.user.id }),
       })
-      .sort({ updatedAt: -1 })
+      .sort({ updatedAt: -1, _id: -1 }) // _id breaks ties deterministically (F4)
       .limit(1)
       .next();
     return res.status(200).json({ todos: doc?.todos ?? [], updatedAt: doc?.updatedAt ?? null });
