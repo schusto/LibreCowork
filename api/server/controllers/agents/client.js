@@ -9,7 +9,9 @@ const {
   createStallRecoveryStopHook,
   resetAutoContinueCounter,
   getStallProbeTagInstruction,
-  getToolVoiceReminder,
+  decideToolVoice,
+  assistantHasToolCall,
+  getToolErrorVoice,
 } = require('~/server/utils/harnessSupervisor');
 const { getBufferString, HumanMessage } = require('@librechat/agents/langchain/messages');
 const {
@@ -3121,22 +3123,63 @@ class AgentClient extends BaseClient {
     // [cowork] Attachments left out of the prompt (delivery path `none`) are announced with their
     // host path, appended with the proactive context so it rides the same after-user-message slot.
     const attachmentPathNote = this.buildAttachmentPathNote();
-    // [cowork] Tool-voice reminder (component 4): re-seeds the tool-call
-    // behaviour when a tool-using conversation drifts into N consecutive
-    // tool-free assistant turns. Rides the SAME after-user-message slot as
-    // the proactive context — docs/42 §4 showed that placement beats the
-    // system-prompt tail, which the model discounts. Predicate runs on the
-    // reduced payload (the array actually sent to the backend), so thinking
-    // stripping/truncation cannot desync the view. See harnessSupervisor.js.
-    const toolVoiceReminder = getToolVoiceReminder(reducedPayload);
-    if (toolVoiceReminder) {
+    // [cowork] Tool-voice reminder (component 4 + claim variant 4b): re-seeds
+    // the tool-call behaviour when a tool-using conversation drifts into N
+    // consecutive tool-free assistant turns, or (flagged) when a recent
+    // tool-free assistant turn claims completed work. Rides the SAME
+    // after-user-message slot as the proactive context — docs/42 §4 showed
+    // that placement beats the system-prompt tail, which the model discounts.
+    // Predicate runs on the reduced payload (the array actually sent to the
+    // backend), so thinking stripping/truncation cannot desync the view.
+    // See harnessSupervisor.js.
+    const toolVoiceDecision = decideToolVoice(reducedPayload);
+    // [cowork] Tool-error voice (component 6): when the run ENDED with a
+    // trailing streak of error-classified tool results, nudge diagnosis —
+    // ephemeral per-request injection, expires as soon as the streak breaks
+    // (the reason it left the chat template). Precedence rule: if BOTH this
+    // and the tool-voice reminder would fire in the same turn, emit ONLY the
+    // tool-error voice; an active error streak is the more specific
+    // diagnosis of why the model should change behaviour right now. See
+    // docs/changes/2026-11-tool-error-voice.md.
+    const toolErrorVoice = getToolErrorVoice(reducedPayload);
+    const effectiveToolVoice = toolErrorVoice ?? (toolVoiceDecision ? toolVoiceDecision.text : null);
+    if (toolErrorVoice) {
       logger.debug(
         `[harnessSupervisor] conv=${(this.conversationId || '').slice(-8)} ` +
-          'tool_voice_reminder fired',
+          (toolVoiceDecision
+            ? 'both voices fired → tool_error_voice wins precedence'
+            : 'tool_error_voice fired'),
+      );
+    } else if (toolVoiceDecision) {
+      logger.debug(
+        `[harnessSupervisor] conv=${(this.conversationId || '').slice(-8)} ` +
+          `tool_voice_reminder fired (${toolVoiceDecision.reason})`,
+      );
+    }
+    /**
+     * [cowork] S4 fire/no-recovery telemetry (2026-11-16): one structured
+     * INFO line per request where any voice fired, so conversion rate is
+     * measurable by grep without a spike run. Stateless by construction:
+     * `last_assistant_called` reads the most recent assistant message of the
+     * SAME reducedPayload — on the next request that message is the turn
+     * following the fire, so joining consecutive tv_telemetry lines per
+     * conversation yields fired→recovered pairs without stored state.
+     * Stable field order; parse positionally.
+     */
+    if (effectiveToolVoice) {
+      const tvVoiceName = toolErrorVoice
+        ? 'error'
+        : toolVoiceDecision.reason === 'claim'
+          ? 'claim'
+          : 'tool';
+      const tvLastAssistant = [...reducedPayload].reverse().find((m) => m?.role === 'assistant');
+      logger.info(
+        `[harnessSupervisor] tv_telemetry conv=${(this.conversationId || '').slice(-8)} ` +
+          `voice=${tvVoiceName} fired=true last_assistant_called=${assistantHasToolCall(tvLastAssistant)}`,
       );
     }
     this.proactiveContextMessage =
-      [proactiveContext, attachmentPathNote, toolVoiceReminder].filter(Boolean).join('\n\n') || null;
+      [proactiveContext, attachmentPathNote, effectiveToolVoice].filter(Boolean).join('\n\n') || null;
     if (stuckNudge) sharedRunContextParts.push(stuckNudge);
     // [cowork] Stall-recovery: establish the DONE_TAG completion-marker
     // convention every turn (synchronous, no I/O) — see

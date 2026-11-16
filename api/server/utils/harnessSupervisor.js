@@ -385,6 +385,97 @@ const TOOL_VOICE_RECENT_TURNS = parseInt(
 );
 
 /**
+ * [cowork] Component 4b (S1, 2026-11-16): claim-based trigger variant for the
+ * tool-voice reminder. Spike finding F5: the GAP=2 trailing-tool-free
+ * condition misses real fabrication points — contamination rides INSIDE turns
+ * that also carry calls, so condition (a) never sees it. Additional fire path
+ * (the existing one stays): any of the last TOOL_VOICE_CLAIM_WINDOW assistant
+ * messages that carries no tool_calls AND past-tense completion claims in its
+ * text. False-positive guard built into the condition: only messages WITHOUT
+ * own-turn tool_calls can count, so "I ran the tests" riding the very turn
+ * that ran them is never flagged. Default OFF until validated (ship dark,
+ * same rollout discipline as components 4–6). See
+ * docs/changes/2026-11-tool-voice-reminder.md §9.
+ */
+const TOOL_VOICE_CLAIM_ENABLED =
+  (process.env.CWK_TOOL_VOICE_CLAIM_ENABLED ?? 'false').toLowerCase() === 'true';
+const TOOL_VOICE_CLAIM_WINDOW = parseInt(
+  process.env.CWK_TOOL_VOICE_CLAIM_WINDOW ?? '4',
+  10,
+);
+// Stateless anti-nag cap (S6b), mirroring TOOL_ERROR_VOICE_MAX_STREAK's
+// reasoning: while claim-drift persists, the trailing run of tool-free
+// claiming assistant messages grows monotonically (1,2,3,...) and exactly one
+// reminder rode each preceding request, so streak > MAX implies MAX nudges
+// already delivered. Suppressing above the cap reproduces "stop nagging after
+// N" without state. Caveat (undershoot, documented honestly as in component
+// 6): several assistant rounds inside ONE user turn advance the streak
+// without an intervening request, so the implied nudge count can undershoot;
+// the cap then errs toward silence, the safe direction.
+const TOOL_VOICE_CLAIM_MAX_STREAK = parseInt(
+  process.env.CWK_TOOL_VOICE_CLAIM_MAX_STREAK ?? '3',
+  10,
+);
+
+/**
+ * [cowork] Component 7 (S5, 2026-11-16): claim-vs-call reconciliation.
+ * Post-run check attacking the contamination SOURCE (findings F3/F4): a
+ * fabricated completion claim entering history poisons later turns regardless
+ * of depth, and it is invisible to the proxy (no markup to parse) and to the
+ * stall probe BY DESIGN when the fabrication closes with the DONE tag or a
+ * question (both exempt the probe). Fires at run end via the Stop hook: final
+ * assistant message carries strong completion claims while the run contains
+ * ZERO tool calls → inject a corrective message once through the existing
+ * stall-probe slot machinery (its Mongo caps give once-per-round and
+ * per-turn-ceiling safety for free). Summarize-guard: ANY tool call anywhere
+ * in the run suppresses — we cannot map a claim to a specific call, so the
+ * possibility that the model legitimately summarizes past work wins. Default
+ * OFF until validated. See docs/changes/2026-11-claim-reconciliation.md.
+ */
+const CLAIM_RECONCILE_ENABLED =
+  (process.env.CWK_CLAIM_RECONCILE_ENABLED ?? 'false').toLowerCase() === 'true';
+
+/** Corrective injection body (component 7). Names the mismatch factually and
+ *  offers exactly two exits — produce the call, or retract the claim. */
+const CLAIM_RECONCILE_MESSAGE =
+  '[CLAIM RECONCILIATION] Your closing message states that work was completed, ' +
+  'but no tool call performed it in this turn or the previous one. Either make ' +
+  'the actual tool call now, or correct your statement and say plainly what has ' +
+  'not been done. Do not repeat the claim unchanged.';
+
+/**
+ * [cowork] Component 6: tool-error voice (2026-11).
+ * The served chat template used to be a community fork
+ * (qwen3.8-froggeric-v22.5) that classified consecutive tool errors WHILE
+ * RENDERING and injected "⚠️ SYSTEM WARNING" text inside tool_response
+ * blocks. Two structural flaws: re-rendered history makes every warning
+ * permanent (a turn-5 failure scolds the model hundreds of turns later), and
+ * the warning's authorship is invisible in transcripts (looks like tool
+ * output). Those nudges now belong HERE: injected per-request into the
+ * ephemeral proactiveContextMessage slot, so they expire the moment the
+ * error streak ends. Template side patched separately
+ * (prompts/qwen38-chat-template-cwk-patched.jinja, warnings removed) — one
+ * owner per nudge class. Classifier below is a faithful port of the removed
+ * Jinja logic (/Users/erik/Downloads/chat_template.jinja.txt lines 413-424).
+ * See docs/changes/2026-11-tool-error-voice.md.
+ */
+const TOOL_ERROR_VOICE_ENABLED =
+  (process.env.CWK_TOOL_ERROR_VOICE_ENABLED ?? 'true').toLowerCase() !== 'false';
+// Stateless anti-nag cap: during an ongoing error run the trailing streak
+// grows monotonically (1,2,3,...) and exactly one nudge rides each request,
+// so streak > MAX_STREAK implies MAX_STREAK nudges were already delivered in
+// preceding turns of the same run. Suppressing above the cap therefore
+// reproduces "stop nagging after N consecutive nudges" without any state.
+// Caveat (documented honestly): several tool batches inside ONE assistant
+// turn advance the streak without an intervening request, so the implied
+// nudge count can undershoot; the cap then errs toward silence, which is
+// the safe direction.
+const TOOL_ERROR_VOICE_MAX_STREAK = parseInt(
+  process.env.CWK_TOOL_ERROR_VOICE_MAX_STREAK ?? '3',
+  10,
+);
+
+/**
  * [cowork] Component 5: todo-list voice (2026-11). Agents use the scoped
  * tasklist sparsely even though its own tool description asks for it — tool
  * descriptions lose weight mid-conversation, the same discount docs/42 showed
@@ -888,6 +979,43 @@ function shouldFireStallProbe(runMessages) {
 }
 
 /**
+ * [cowork] Component 7 predicate (S5): did this run END on a fabricated
+ * completion claim? Operates on the Stop hook's accumulated runMessages
+ * (whole user turn, all rounds). True only when ALL hold:
+ *   - flag CWK_CLAIM_RECONCILE_ENABLED is on (default off);
+ *   - the final message is an AI reply with no tool_calls;
+ *   - NO tool call exists anywhere in the run (any typed ToolMessage, any
+ *     tool_calls array, any tool_call content part). This single check IS
+ *     the summarize-guard: if the run did real work, the closing claim may
+ *     legitimately summarize it, so silence wins. With zero calls in the
+ *     whole turn, "final turn clean AND previous turn clean" holds trivially.
+ *   - the final text carries a STRONG completion claim (weak tier skipped —
+ *     honest summaries hit weak phrasings constantly; see classifier doc).
+ * Deliberately NOT gated on DONE_TAG / trailing question: those exempt the
+ * stall probe, and F4 fabrications frequently carry both — that exemption is
+ * precisely the blind spot this component exists to cover. When BOTH this
+ * and the stall probe qualify, the probe runs first (more general nudge);
+ * see createStallRecoveryStopHook.
+ * @param {Array<object>} runMessages
+ * @returns {boolean}
+ */
+function shouldReconcileClaims(runMessages) {
+  if (!SUPERVISOR_ENABLED || !CLAIM_RECONCILE_ENABLED) return false;
+  if (!Array.isArray(runMessages) || runMessages.length === 0) return false;
+  const last = runMessages[runMessages.length - 1];
+  if (getMessageType(last) !== 'ai') return false;
+  const toolCalls = last?.tool_calls;
+  if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
+  const anyToolWork = runMessages.some(
+    (m) =>
+      getMessageType(m) === 'tool' ||
+      assistantHasToolCall(m),
+  );
+  if (anyToolWork) return false;
+  return hasCompletionClaimContent(extractMessageText(last), { strongOnly: true });
+}
+
+/**
  * True when `message` is the probe's reply AND it resolved to "nothing
  * further to do" — a plain-text AIMessage (no tool_calls) that carries the
  * DONE_TAG completion marker. Same tag, same check as shouldFireStallProbe
@@ -1089,27 +1217,90 @@ function assistantHasToolCall(message) {
 }
 
 /**
- * [cowork] Tool-voice reminder (component 4), or null when it should not fire.
+ * [cowork] Completion-claim classifier (component 4b / component 7, S1).
+ * Same tiered style as component 6's isToolErrorContent: strong signals fire
+ * regardless; weak signals suppress on code-ish content or total length ≥600
+ * (long summaries quote past work incidentally — same reasoning as the error
+ * classifier's long-output suppression). Targets PAST-TENSE completion
+ * claims ("I ran the tests", "Live docs updated…") — exactly the F4 shape.
+ * Deliberately narrow: this gates a corrective injection, so false positives
+ * cost an extra model round and erode trust in the harness voice.
+ * @param {unknown} raw assistant message body (string or multipart array)
+ * @param {{strongOnly?: boolean}} [opts] strongOnly skips the weak tier —
+ *   component 7 uses it because honest end-of-run summaries hit the weak
+ *   phrasings constantly, and a false positive there costs a model round.
+ * @returns {boolean} true when the text asserts completed actions
+ */
+function hasCompletionClaimContent(raw, { strongOnly = false } = {}) {
+  let content;
+  if (typeof raw === 'string') {
+    content = raw;
+  } else if (raw == null) {
+    content = '';
+  } else if (Array.isArray(raw)) {
+    content = raw
+      .map((p) => (typeof p === 'string' ? p : p?.text ?? ''))
+      .join('\n');
+  } else {
+    try {
+      content = JSON.stringify(raw);
+    } catch {
+      content = String(raw);
+    }
+  }
+  const lower = content.toLowerCase();
+  // Strong: first-person past-tense action verbs, proof-quoting phrasing.
+  const strongClaim =
+    /\bi (just |have |had )?(ran|wrote|updated|created|edited|called|used|executed|appended|fixed|deployed)\b/.test(
+      lower,
+    ) ||
+    /"proof:"/.test(lower) ||
+    /grep (shows|output confirms)/.test(lower) ||
+    // F4 verbatim shapes from the spike transcript ("Live docs updated…").
+    /(docs?|file|scripts?|tests?) (were |has been |have been )?updated\b/.test(lower);
+  if (strongClaim) return true;
+  // Weak: bare phrasings that legitimate summaries use constantly.
+  if (strongOnly) return false;
+  const weakClaim = /updated .*\.md/.test(lower) || /tests? pass/.test(lower);
+  if (!weakClaim) return false;
+  const isCodeish =
+    lower.includes('```') ||
+    lower.includes('$ ') ||
+    lower.includes('exit code') ||
+    lower.includes('traceback');
+  return !isCodeish && content.length < 600;
+}
+
+/**
+ * [cowork] Tool-voice decision (component 4 + claim variant 4b): returns
+ * `{ text, reason }` with reason 'gap' | 'claim', or null when silent.
  *
- * Predicate over the reduced payload messages (the same array
- * applyContextReductionWithStats produced): scan assistant messages from the
- * end; fire only when the last TOOL_VOICE_GAP of them are all tool-free AND
- * a tool call appears within the next TOOL_VOICE_RECENT_TURNS assistant
- * messages behind them. Consequences: a conversation that never used tools
- * stays silent (condition b fails); a healthy tool-using conversation stays
- * silent (condition a fails); only the drift pattern nags.
+ * Fire path A (original, unchanged): scan assistant messages from the end;
+ * fire only when the last TOOL_VOICE_GAP of them are all tool-free AND a tool
+ * call appears within the next TOOL_VOICE_RECENT_TURNS assistant messages
+ * behind them. Consequences: a conversation that never used tools stays
+ * silent (condition b fails); a healthy tool-using conversation stays silent
+ * (condition a fails); only the drift pattern nags.
  *
- * Text design rules (learned the hard way during drafting, 2026-11-13):
- * examples inside injected text are imitated with full fidelity, including
- * mistakes — so examples must be real, executable-shaped calls, and the wire
- * envelope is deliberately NOT re-taught here: chat_template.jinja injects
- * the canonical envelope fresh every request; a second copy risks teaching a
- * competing syntax. The example teaches decision + argument shape only.
+ * Fire path B (S1, flag CWK_TOOL_VOICE_CLAIM_ENABLED, default off): any of
+ * the last TOOL_VOICE_CLAIM_WINDOW assistant messages carries no tool_calls
+ * AND completion claims (see hasCompletionClaimContent), plus condition (b)
+ * still required (recent real tool use exists — pure chat never nagged). The
+ * own-turn guard is built in: claiming messages WITH their own calls cannot
+ * count. Anti-nag cap TOOL_VOICE_CLAIM_MAX_STREAK over the trailing run of
+ * tool-free claiming messages (stateless, see constant comment).
+ *
+ * Text design rules (learned the hard way during drafting, 2026-11-13;
+ * S2 hardened after F5 measured example imitation live): injected examples
+ * are imitated with full fidelity — so the reminder now names NO callable
+ * registry tool and carries NO JSON payload at all. The todo-list example
+ * lives exclusively in component 5 (different failure surface, its job IS
+ * teaching that shape).
  *
  * @param {Array<{role?: string, content?: unknown, tool_calls?: unknown[]}>} payloadMessages
- * @returns {string|null}
+ * @returns {{text: string, reason: 'gap'|'claim'}|null}
  */
-function getToolVoiceReminder(payloadMessages) {
+function decideToolVoice(payloadMessages) {
   if (!SUPERVISOR_ENABLED || !TOOL_VOICE_ENABLED) return null;
   if (!Array.isArray(payloadMessages) || payloadMessages.length === 0) {
     return null;
@@ -1117,32 +1308,278 @@ function getToolVoiceReminder(payloadMessages) {
   const assistants = payloadMessages.filter((m) => m?.role === 'assistant');
   if (assistants.length < TOOL_VOICE_GAP + 1) return null;
 
-  // Condition (a): the most recent GAP assistant turns contain no tool call.
-  const gapSlice = assistants.slice(-TOOL_VOICE_GAP);
-  if (gapSlice.some(assistantHasToolCall)) return null;
-
-  // Condition (b): a tool call exists within RECENT_TURNS assistant messages
-  // behind the gap. Nothing older counts — long-dead tool use means this is
-  // just a chat conversation again, not a drifting agent.
-  const lookback = assistants.slice(
-    -(TOOL_VOICE_GAP + TOOL_VOICE_RECENT_TURNS),
-    -TOOL_VOICE_GAP,
-  );
-  if (!lookback.some(assistantHasToolCall)) return null;
-
-  return (
+  const buildText = () =>
     '# Harness note — tool use\n\n' +
     'You have tools available and used them earlier in this conversation. ' +
     'If this request involves reading files, running commands, fetching ' +
     'data, or changing anything, act with a tool call instead of describing ' +
     'what you would do. Narrating intended actions without executing them ' +
-    'is a failure mode. Before concluding a tool does not exist, search for ' +
-    'it by exact name once more. Correct calls carry every required ' +
-    'argument, for example {"name": "tool_search", "arguments": {"query": ' +
-    '"start process shell command"}}. If a scoped tasklist tool is attached, ' +
-    'its exact name is `todo_update_mcp_todo_list` and a correct call looks ' +
-    'like {"todos": [{"content": "Run tests", "activeForm": "Running tests", ' +
-    '"status": "in_progress"}]}.'
+    'is a failure mode. Never state that an action was completed unless the ' +
+    'tool call performing it appears in your own previous turns. Before ' +
+    'concluding a tool does not exist, search for it by exact name once more. ' +
+    'A correct call names an available tool exactly and carries every ' +
+    'required argument.';
+
+  // Shared condition (b): recent REAL tool use (same span as path A's
+  // lookback, measured over the last RECENT_TURNS assistant messages). Both
+  // triggers need it: without it a pure-chat conversation whose participants
+  // merely talk about past work would be nagged, and stale tool use means
+  // this is a chat again, not a drifting agent.
+  const hasRecentToolUse = assistants
+    .slice(-TOOL_VOICE_RECENT_TURNS)
+    .some(assistantHasToolCall);
+
+  // Path B (evaluated FIRST): claim trigger (S1). Ordering rationale: the
+  // claim diagnosis is the more specific reading of the same drift (mirror
+  // of the error-voice-wins rule), and evaluating it first keeps the
+  // stateless cap reachable — with path A first, every sustained-drift case
+  // is answered identically by the uncapped gap path, leaving the cap dead
+  // code. Window of the last CLAIM_WINDOW assistant messages; a message
+  // counts when it lacks tool_calls AND claims past completions.
+  if (TOOL_VOICE_CLAIM_ENABLED && hasRecentToolUse) {
+    const window = assistants.slice(-TOOL_VOICE_CLAIM_WINDOW);
+    const claiming = window.filter(
+      (m) => !assistantHasToolCall(m) && hasCompletionClaimContent(m.content),
+    );
+    if (claiming.length > 0) {
+      // Stateless anti-nag cap: trailing run of tool-free claiming
+      // messages (newest-first walk, stop at first non-matching).
+      let streak = 0;
+      for (let i = assistants.length - 1; i >= 0; i--) {
+        const m = assistants[i];
+        if (!assistantHasToolCall(m) && hasCompletionClaimContent(m.content)) {
+          streak++;
+        } else break;
+      }
+      if (streak <= TOOL_VOICE_CLAIM_MAX_STREAK) {
+        return { text: buildText(), reason: 'claim' };
+      }
+      // Over cap: go fully silent — including suppressing path A, whose
+      // uncapped re-firing here would defeat the cap in exactly its target
+      // scenario (sustained claim-drift). Pure-chat drift (no claims)
+      // never reaches this branch and keeps path A's original dynamics.
+      return null;
+    }
+  }
+
+  // Path A: gap trigger (unchanged semantics — window-scoped lookback).
+  const gapSlice = assistants.slice(-TOOL_VOICE_GAP);
+  if (!gapSlice.some(assistantHasToolCall)) {
+    const lookback = assistants.slice(
+      -(TOOL_VOICE_GAP + TOOL_VOICE_RECENT_TURNS),
+      -TOOL_VOICE_GAP,
+    );
+    if (lookback.some(assistantHasToolCall)) {
+      return { text: buildText(), reason: 'gap' };
+    }
+  }
+  return null;
+}
+
+/**
+ * [cowork] Tool-voice reminder text (component 4), or null when it should not
+ * fire. Thin back-compat wrapper over decideToolVoice() — kept because client
+ * wiring and existing suites import the original name.
+ *
+ * @param {Array<{role?: string, content?: unknown, tool_calls?: unknown[]}>} payloadMessages
+ * @returns {string|null}
+ */
+function getToolVoiceReminder(payloadMessages) {
+  const decision = decideToolVoice(payloadMessages);
+  return decision ? decision.text : null;
+}
+
+/**
+ * [cowork] Tool-error classifier — faithful JS port of the consecutive-error
+ * classifier removed from the community chat template fork
+ * (source of truth: /Users/erik/Downloads/chat_template.jinja.txt lines
+ * 413-424, variables _content_head / _is_code_or_grep / _exit_code_zero /
+ * _error_field_ok / _strong_error / _weak_error / _weak_suppressed). Three
+ * tiers, checked against the LOWERCASED FIRST 120 CHARS exactly as Jinja did:
+ *   - strong signals: fire regardless of suppression unless code-excluded
+ *   - weak signals ('error:', 'err!'): suppressed when '$ ' or 'took '
+ *     present or total content length >= 600 (long outputs quote errors
+ *     incidentally; shell echoes and timing lines are their own tell)
+ *   - code-content exclusion: discussing errors in code is not failing with
+ *     one
+ * @param {unknown} raw a tool result body (usually a string)
+ * @returns {boolean} true when the body reads as a tool FAILURE
+ */
+function isToolErrorContent(raw) {
+  let content;
+  if (typeof raw === 'string') {
+    content = raw;
+  } else if (raw == null) {
+    content = '';
+  } else if (Array.isArray(raw)) {
+    // role:'tool' multipart content: join text parts (Jinja assumed a plain
+    // string; this is the closest faithful generalisation).
+    content = raw
+      .map((p) => (typeof p === 'string' ? p : p?.text ?? ''))
+      .join('\n');
+  } else {
+    try {
+      content = JSON.stringify(raw);
+    } catch {
+      content = String(raw);
+    }
+  }
+  const lower = content.toLowerCase();
+  const head = lower.slice(0, 120);
+  const isCodeOrGrep =
+    lower.includes('throw new ') ||
+    lower.includes('throw error') ||
+    lower.includes('console.error') ||
+    lower.includes('logger.error') ||
+    lower.includes('logging.error') ||
+    head.startsWith('import ') ||
+    head.startsWith('def ') ||
+    head.startsWith('function ');
+  const exitCodeZero =
+    head.includes('exit code: 0') || head.includes('process exited with code 0');
+  const errorFieldOk =
+    head.includes('"error": null') ||
+    head.includes('"error":null') ||
+    head.includes('"error": false') ||
+    head.includes('"error":false') ||
+    head.includes('"error": ""') ||
+    head.includes('"error":""');
+  const strongError =
+    (head.includes('"error":') && !errorFieldOk) ||
+    head.includes('"status": "error"') ||
+    head.includes('"status":"error"') ||
+    head.includes('traceback (most recent call last):') ||
+    head.includes('command not found') ||
+    head.includes('invalid syntax') ||
+    head.includes('fatal:') ||
+    ((head.includes('exit code: ') || head.includes('process exited with code')) &&
+      !exitCodeZero) ||
+    head.startsWith('exception:') ||
+    head.startsWith('failed to ');
+  const weakError = head.includes('error:') || head.includes('err!');
+  const weakSuppressed =
+    head.includes('$ ') || head.includes('took ') || content.length >= 600;
+  return !isCodeOrGrep && (strongError || (weakError && !weakSuppressed));
+}
+
+/**
+ * Collect the TRAILING run of tool-result bodies from the reduced payload,
+ * newest first, stopping at the first event that closes the run. Handles both
+ * transports a tool result can arrive as:
+ *   a) role:'tool' messages (OpenAI-style replay / imported threads), and
+ *   b) the native agents-pipeline shape, where results ride INSIDE assistant
+ *      messages as { type:'tool_call', tool_call:{ ..., output } } content
+ *      parts (see contextReduction.js header — there are no role:'tool'
+ *      messages natively, so a literal role-only scan would never fire).
+ * Run-closing events (stop the walk, streak considered closed):
+ *   - assistant text/think content AFTER its last tool_call part: the model
+ *     already saw the results and replied, whatever it concluded is history;
+ *   - a plain assistant message without tool calls: same reason;
+ *   - any user/system message between tool rounds.
+ * Leading user messages (the CURRENT request rides at the end of the payload)
+ * are skipped first: the predicate judges what the model INHERITS from the
+ * previous run, not the fresh input.
+ * @param {Array<object>} payloadMessages
+ * @returns {unknown[]} tool-result bodies, newest first (possibly empty)
+ */
+function collectTrailingToolResults(payloadMessages) {
+  const newestFirst = [];
+  let i = payloadMessages.length - 1;
+  while (
+    i >= 0 &&
+    payloadMessages[i]?.role !== 'assistant' &&
+    payloadMessages[i]?.role !== 'tool'
+  ) {
+    i--;
+  }
+  while (i >= 0) {
+    const m = payloadMessages[i];
+    if (m?.role === 'tool') {
+      newestFirst.push(m.content);
+      i--;
+      continue;
+    }
+    if (m?.role === 'assistant') {
+      const parts = Array.isArray(m.content) ? m.content : null;
+      if (!parts) break; // plain string reply → model already moved on
+      let lastTc = -1;
+      for (let p = parts.length - 1; p >= 0; p--) {
+        if (parts[p]?.type === 'tool_call') {
+          lastTc = p;
+          break;
+        }
+      }
+      if (lastTc === -1) break; // no tool calls in this message
+      const answeredAfter = parts
+        .slice(lastTc + 1)
+        .some(
+          (p) =>
+            (p?.type === 'text' && typeof p.text === 'string' && p.text.trim()) ||
+            (p?.type === 'think' && typeof p.think === 'string' && p.think.trim()),
+        );
+      if (answeredAfter) break; // replied after the batch → run closed
+      for (let p = parts.length - 1; p >= 0; p--) {
+        if (parts[p]?.type === 'tool_call') {
+          newestFirst.push(parts[p]?.tool_call?.output);
+        }
+      }
+      i--;
+      continue;
+    }
+    break; // user/system boundary
+  }
+  return newestFirst;
+}
+
+/**
+ * [cowork] Component 6: tool-error voice (component-4 sibling). Returns the
+ * nudge text or null. Scan the trailing tool-result run (see
+ * collectTrailingToolResults); count TRAILING consecutive error-classified
+ * results (n) using the ported classifier. n == 1 → one-shot diagnosis
+ * nudge; n >= 2 → escalation demanding a fundamentally different approach
+ * (wording inherited from the removed template warnings, reframed with
+ * visible harness authorship — transcript forensics was half the reason the
+ * template approach was abandoned). n > CWK_TOOL_ERROR_VOICE_MAX_STREAK →
+ * null (stateless anti-nag cap, see constant comment). Delivery is
+ * per-request and ephemeral: the warning disappears the moment the streak
+ * breaks, unlike the template's permanent re-rendered warnings.
+ * Known coverage limit (documented, not hidden): this slot is evaluated once
+ * per USER turn in buildMessages; an error streak that begins and dies
+ * entirely INSIDE one SDK run is invisible to it (the template fork used to
+ * catch those because it re-rendered every internal step). The covered case
+ * is the expensive one: a run that ENDED leaving unresolved consecutive
+ * errors, which is exactly the state the next turn inherits.
+ * @param {Array<object>|undefined|null} payloadMessages
+ * @returns {string|null}
+ */
+function getToolErrorVoice(payloadMessages) {
+  if (!SUPERVISOR_ENABLED || !TOOL_ERROR_VOICE_ENABLED) return null;
+  if (!Array.isArray(payloadMessages) || payloadMessages.length === 0) {
+    return null;
+  }
+  const trailing = collectTrailingToolResults(payloadMessages);
+  let n = 0;
+  for (const body of trailing) {
+    if (isToolErrorContent(body)) n++;
+    else break;
+  }
+  if (n === 0 || n > TOOL_ERROR_VOICE_MAX_STREAK) return null;
+  if (n === 1) {
+    return (
+      '# Harness note — tool error\n\n' +
+      'The previous tool call returned an error. Diagnose the failure and ' +
+      'retry with completely corrected arguments. Do not repeat the exact ' +
+      'call that failed.'
+    );
+  }
+  return (
+    '# Harness note — repeated tool errors\n\n' +
+    `${n} consecutive tool errors detected. Your previous approach is ` +
+    'incorrect. You MUST switch to a fundamentally different approach or ' +
+    'materially corrected arguments — inspect the error text, verify the ' +
+    'preconditions (path, arguments, tool choice) instead of guessing again. ' +
+    'If nothing fits, say plainly what is blocking you rather than ' +
+    'continuing to fail silently.'
   );
 }
 
@@ -1204,6 +1641,46 @@ function createStallRecoveryStopHook(conversationId, { onContinue } = {}) {
       return {};
     }
     if (!shouldFireStallProbe(input?.messages)) {
+      /** [cowork] Component 7 (S5): the probe declining is exactly where a
+       *  fabricated completion claim hides — its closing message looks
+       *  complete (often DONE_TAG'd or a question, both probe exemptions).
+       *  Checked only on the probe's "no", so when both qualify the probe
+       *  wins (more general nudge). Rides the same slot machinery: caps are
+       *  shared, so a fabricating run cannot spend more continuations than a
+       *  stalling one. */
+      if (shouldReconcileClaims(input?.messages)) {
+        const reserved = await tryReserveStallProbeSlot(conversationId, {
+          toolCount: 0,
+          responseText: extractMessageText(input.messages[input.messages.length - 1]),
+        });
+        if (reserved) {
+          continuationNumber += 1;
+          logger.info(
+            `[harnessSupervisor] conv=${convLabel} claim-vs-call mismatch — blocking Stop to reconcile ` +
+              `(continuation=${continuationNumber})`,
+          );
+          /** Same visibility marker as the stall probe (docs/42): a
+           *  continuation the chat cannot see looks like a glitch. */
+          if (typeof onContinue === 'function' && STALL_PROBE_INDICATOR) {
+            try {
+              await onContinue({
+                text: STALL_PROBE_INDICATOR.replace('%d', String(continuationNumber)),
+                continuationNumber,
+              });
+            } catch (e) {
+              logger.warn(`[harnessSupervisor] conv=${convLabel} indicator emit failed: ${e.message}`);
+            }
+          }
+          return {
+            decision: 'block',
+            reason: CLAIM_RECONCILE_MESSAGE,
+            additionalContext: CLAIM_RECONCILE_MESSAGE,
+          };
+        }
+        logger.info(
+          `[harnessSupervisor] conv=${convLabel} claim-vs-call mismatch detected but not continuing (cap reached)`,
+        );
+      }
       /** Debug-level either way: a silent non-firing decision was previously
        *  diagnosable only by querying Mongo directly (docs/39 §10). Reason
        *  recomputed here (cheap string checks) purely for this log line —
@@ -1293,6 +1770,12 @@ module.exports = {
   resetAutoContinueCounter,
   getStallProbeTagInstruction,
   getToolVoiceReminder,
+  decideToolVoice,
+  assistantHasToolCall,
+  hasCompletionClaimContent,
+  shouldReconcileClaims,
+  CLAIM_RECONCILE_MESSAGE,
+  getToolErrorVoice,
   STALL_PROBE_MESSAGE,
   DONE_TAG,
   STALL_PROBE_REENTRY_ENABLED,
