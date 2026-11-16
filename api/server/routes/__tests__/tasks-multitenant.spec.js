@@ -73,6 +73,37 @@ const todo = (label = 't') => [
   { content: label, activeForm: `doing ${label}`, status: 'pending' },
 ];
 
+describe('Fix 8 — per-conversation document cap', () => {
+  it('writing past the cap trims oldest so total stays <= 200', async () => {
+    const convo = 'convo-f8';
+    const uid = objId();
+    const base = Date.now() - 1000 * 60 * 60;
+    // Seed 204 older docs directly (cap is enforced on POST).
+    const seeds = Array.from({ length: 204 }, (_, i) => ({
+      _id: `${convo}:seed-${String(i).padStart(4, '0')}`,
+      userId: uid,
+      conversationId: convo,
+      messageId: `seed-${String(i).padStart(4, '0')}`,
+      todos: todo(`seed-${i}`),
+      updatedAt: new Date(base + i * 1000),
+    }));
+    await collection.insertMany(seeds);
+
+    const res = await request(app)
+      .post('/api/tasks')
+      .set(SECRET)
+      .send({ conversationId: convo, messageId: 'fresh', userId: uid, todos: todo('fresh') });
+    expect(res.status).toBe(200);
+
+    const remaining = await collection.countDocuments({ conversationId: convo });
+    expect(remaining).toBeLessThanOrEqual(200);
+    // Newest survivors kept, oldest trimmed: seed-0 gone, seed-203 kept, fresh present.
+    expect(await collection.findOne({ _id: `${convo}:seed-0000` })).toBeNull();
+    expect(await collection.findOne({ _id: `${convo}:seed-0203` })).not.toBeNull();
+    expect(await collection.findOne({ _id: `${convo}:fresh` })).not.toBeNull();
+  });
+});
+
 describe('Fix 7 — compound index for the fallback query', () => {
   it('tasklists carries TTL and conversationId+updatedAt indexes', async () => {
     await request(app) // ensure getCollection() ran at least once

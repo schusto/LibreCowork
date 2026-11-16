@@ -37,6 +37,9 @@ const db = require('~/models');
 const COLLECTION_NAME = 'tasklists';
 const TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days (design §3.2)
 const MAX_TODOS = 50;
+// F8: TTL bounds document age, not volume; one doc per assistant turn can still
+// pile up unboundedly in a busy conversation. Cap per-conversation volume.
+const MAX_DOCS_PER_CONVERSATION = 200;
 const MAX_FIELD_LEN = 500;
 const VALID_STATUSES = new Set(['pending', 'in_progress', 'completed']);
 // conversationId/messageId arrive via injected env; keep _id composition safe.
@@ -177,6 +180,26 @@ router.post('/', internalSecretAuth, async (req, res) => {
       logger.info(`[tasks] POST accepted before conversation exists (user ${userId})`);
     } else {
       return res.status(400).json({ error: 'unknown conversation and userId is not a valid id' });
+    }
+
+    // F8: keep newest 199 existing docs plus this write. Best-effort: a failed
+    // trim must never block the actual task-list write.
+    try {
+      const col = getCollection();
+      const over =
+        (await col.countDocuments({ conversationId })) - (MAX_DOCS_PER_CONVERSATION - 1);
+      if (over > 0) {
+        const stale = await col
+          .find({ conversationId })
+          .sort({ updatedAt: 1, _id: 1 })
+          .limit(over)
+          .toArray();
+        if (stale.length) {
+          await col.deleteMany({ _id: { $in: stale.map((d) => d._id) } });
+        }
+      }
+    } catch (e) {
+      logger.warn(`[tasks] growth trim failed for ${conversationId}: ${e.message}`);
     }
 
     await getCollection().updateOne(
