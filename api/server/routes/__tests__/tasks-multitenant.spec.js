@@ -73,6 +73,30 @@ const todo = (label = 't') => [
   { content: label, activeForm: `doing ${label}`, status: 'pending' },
 ];
 
+describe('Fix 2 — scope ids may not contain the ":" separator', () => {
+  it('POST rejects conversationId or messageId containing ":"', async () => {
+    const r1 = await request(app)
+      .post('/api/tasks')
+      .set(SECRET)
+      .send({ conversationId: 'a:b', messageId: 'c', userId: objId(), todos: todo() });
+    expect(r1.status).toBe(400);
+    const r2 = await request(app)
+      .post('/api/tasks')
+      .set(SECRET)
+      .send({ conversationId: 'ab', messageId: 'c:d', userId: objId(), todos: todo() });
+    expect(r2.status).toBe(400);
+    expect(await collection.countDocuments({})).toBe(0);
+  });
+
+  it('GET rejects conversationId containing ":"', async () => {
+    const res = await request(app)
+      .get('/api/tasks')
+      .set(SECRET)
+      .query({ conversationId: 'a:b' });
+    expect(res.status).toBe(400);
+  });
+});
+
 describe('Fix 1 — POST must not trust scope ids from the body', () => {
   it('rejects victim-conversation + attacker-userId with 400 and leaves the victim doc untouched', async () => {
     const victim = objId();

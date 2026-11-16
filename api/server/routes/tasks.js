@@ -39,7 +39,10 @@ const MAX_TODOS = 50;
 const MAX_FIELD_LEN = 500;
 const VALID_STATUSES = new Set(['pending', 'in_progress', 'completed']);
 // conversationId/messageId arrive via injected env; keep _id composition safe.
-const SCOPE_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
+// ':' excluded: it is the _id join separator, so allowing it inside components
+// lets ("a:b","c") and ("a","b:c") collide into one _id. Real ids (Mongo
+// ObjectIds, LibreChat uuids) never contain ':', so this only removes the class.
+const SCOPE_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/;
 
 const INTERNAL_SECRET = process.env.CWK_TASKLIST_INTERNAL_SECRET || '';
 
