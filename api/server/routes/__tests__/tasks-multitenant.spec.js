@@ -73,6 +73,42 @@ const todo = (label = 't') => [
   { content: label, activeForm: `doing ${label}`, status: 'pending' },
 ];
 
+describe('Fix 6 — DELETE keeps secret-or-JWT semantics after dedupe', () => {
+  it('internal secret deletes; non-owner JWT gets 404; owner JWT deletes', async () => {
+    const owner = objId();
+    const convo = 'convo-f6';
+    await seedConvo(owner, convo);
+    await collection.insertOne({
+      _id: `${convo}:m1`, userId: owner, conversationId: convo,
+      messageId: 'm1', todos: todo(), updatedAt: new Date(),
+    });
+    // Non-owner JWT: ownership gate 404s before touching the doc.
+    const bad = await request(app)
+      .delete('/api/tasks')
+      .set({ 'x-test-jwt-user': objId() })
+      .send({ conversationId: convo, messageId: 'm1' });
+    expect(bad.status).toBe(404);
+    expect(await collection.countDocuments({})).toBe(1);
+    // Owner JWT deletes.
+    const own = await request(app)
+      .delete('/api/tasks')
+      .set({ 'x-test-jwt-user': owner })
+      .send({ conversationId: convo, messageId: 'm1' });
+    expect(own.status).toBe(200);
+    expect(own.body.deleted).toBe(1);
+    // Internal secret deletes too.
+    await collection.insertOne({
+      _id: `${convo}:m2`, userId: owner, conversationId: convo,
+      messageId: 'm2', todos: todo(), updatedAt: new Date(),
+    });
+    const svc = await request(app)
+      .delete('/api/tasks')
+      .set(SECRET)
+      .send({ conversationId: convo, messageId: 'm2' });
+    expect(svc.status).toBe(200);
+  });
+});
+
 describe('Fix 4 — fallback sort has a deterministic tiebreaker', () => {
   it('equal updatedAt resolves to the higher _id', async () => {
     const convo = 'convo-f4';

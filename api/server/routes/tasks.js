@@ -27,6 +27,7 @@
 // (see design §3.2 fix options). Rendering (P2) is unaffected: nested lists come
 // from each thread's own content args either way.
 
+const crypto = require('crypto');
 const express = require('express');
 const mongoose = require('mongoose');
 const { logger } = require('@librechat/data-schemas');
@@ -46,6 +47,15 @@ const SCOPE_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/;
 
 const INTERNAL_SECRET = process.env.CWK_TASKLIST_INTERNAL_SECRET || '';
 
+/** Constant-time secret compare: hashing both sides first also equalises length
+ *  (timingSafeEqual throws on unequal lengths). convos.js carries the same
+ *  plain-compare pattern and should adopt this helper later; not edited here. */
+function safeEq(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
 let indexEnsured = false;
 function getCollection() {
   const collection = mongoose.connection.collection(COLLECTION_NAME);
@@ -63,7 +73,7 @@ function getCollection() {
 /** Write gate: internal secret only. Never calls next() without identity. */
 function internalSecretAuth(req, res, next) {
   const secret = req.headers['x-internal-secret'];
-  if (INTERNAL_SECRET && secret === INTERNAL_SECRET) {
+  if (INTERNAL_SECRET && safeEq(secret, INTERNAL_SECRET)) {
     req.user = { id: 'internal-service', role: 'SERVICE' };
     return next();
   }
@@ -74,7 +84,7 @@ function internalSecretAuth(req, res, next) {
  * Exactly the regenTitleAuth shape from convos.js. */
 function internalSecretOrJwt(req, res, next) {
   const secret = req.headers['x-internal-secret'];
-  if (INTERNAL_SECRET && secret === INTERNAL_SECRET) {
+  if (INTERNAL_SECRET && safeEq(secret, INTERNAL_SECRET)) {
     req.user = { id: 'internal-service', role: 'SERVICE' };
     return next();
   }
@@ -241,14 +251,7 @@ router.get('/', internalSecretOrJwt, async (req, res) => {
  * DELETE /api/tasks — clear the scoped doc.
  * Body: { conversationId, messageId }. Internal secret (MCP todo_clear) or JWT owner.
  */
-router.delete('/', (req, res, next) => {
-  const secret = req.headers['x-internal-secret'];
-  if (INTERNAL_SECRET && secret === INTERNAL_SECRET) {
-    req.user = { id: 'internal-service', role: 'SERVICE' };
-    return next();
-  }
-  return requireJwtAuth(req, res, next);
-}, async (req, res) => {
+router.delete('/', internalSecretOrJwt, async (req, res) => {
   const { conversationId, messageId } = req.body ?? {};
   const scopeErr = validateScope(conversationId, messageId);
   if (scopeErr) return res.status(400).json({ error: scopeErr });
