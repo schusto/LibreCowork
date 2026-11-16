@@ -217,8 +217,13 @@ router.get('/', internalSecretOrJwt, async (req, res) => {
       const doc = await getCollection().findOne({ _id: `${conversationId}:${messageId}` });
       return res.status(200).json({ todos: doc?.todos ?? [], updatedAt: doc?.updatedAt ?? null });
     }
+    // Tenant column must be load-bearing: a JWT caller only ever sees docs
+    // stamped with their own id (internal service reads stay unfiltered).
     const doc = await getCollection()
-      .find({ conversationId })
+      .find({
+        conversationId,
+        ...(req.user.id !== 'internal-service' && { userId: req.user.id }),
+      })
       .sort({ updatedAt: -1 })
       .limit(1)
       .next();

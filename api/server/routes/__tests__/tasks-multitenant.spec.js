@@ -73,6 +73,43 @@ const todo = (label = 't') => [
   { content: label, activeForm: `doing ${label}`, status: 'pending' },
 ];
 
+describe('Fix 3 — GET fallback filters by the JWT owner', () => {
+  it('JWT caller never receives a doc whose stored userId differs', async () => {
+    const owner = objId();
+    const convo = 'convo-f3';
+    await seedConvo(owner, convo);
+    // A doc in the owned conversation stamped with someone else's userId
+    // (possible pre-F1): must not surface on the messageId-less fallback.
+    await collection.insertOne({
+      _id: `${convo}:msg-other`,
+      userId: objId(),
+      conversationId: convo,
+      messageId: 'msg-other',
+      todos: todo('foreign'),
+      updatedAt: new Date(Date.now() + 60_000), // newest, so fallback would pick it
+    });
+    await collection.insertOne({
+      _id: `${convo}:msg-mine`,
+      userId: owner,
+      conversationId: convo,
+      messageId: 'msg-mine',
+      todos: todo('mine'),
+      updatedAt: new Date(),
+    });
+
+    const res = await request(app)
+      .get('/api/tasks')
+      .set({ 'x-test-jwt-user': owner })
+      .query({ conversationId: convo });
+    expect(res.status).toBe(200);
+    expect(res.body.todos[0].content).toBe('mine');
+
+    // Internal service still sees the newest doc regardless of userId.
+    const svc = await request(app).get('/api/tasks').set(SECRET).query({ conversationId: convo });
+    expect(svc.body.todos[0].content).toBe('foreign');
+  });
+});
+
 describe('Fix 2 — scope ids may not contain the ":" separator', () => {
   it('POST rejects conversationId or messageId containing ":"', async () => {
     const r1 = await request(app)
