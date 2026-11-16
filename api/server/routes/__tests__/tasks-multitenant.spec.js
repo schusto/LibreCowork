@@ -291,4 +291,31 @@ describe('Fix 1 — POST must not trust scope ids from the body', () => {
     expect(res.status).toBe(400);
     expect(await collection.countDocuments({})).toBe(0);
   });
+
+  // Finding 2 lock-in (docs/handover/2026-11-tasklist-finding2-null-userid.md):
+  // userId null/absent must NEVER reach $set — not even for a conversation that
+  // exists and could otherwise pass ownership checks. This closes the one gap
+  // the malformed-userId test left open (that case exercised the ghost branch).
+  it('rejects absent/null userId on an existing conversation (invariant: no null-stamped docs)', async () => {
+    const uid = objId();
+    const convo = 'convo-f2';
+    await seedConvo(uid, convo);
+
+    const absent = await request(app)
+      .post('/api/tasks')
+      .set(SECRET)
+      .send({ conversationId: convo, messageId: 'm-absent', todos: todo() });
+    expect(absent.status).toBe(400);
+
+    const explicitNull = await request(app)
+      .post('/api/tasks')
+      .set(SECRET)
+      .send({ conversationId: convo, messageId: 'm-null', userId: null, todos: todo() });
+    expect(explicitNull.status).toBe(400);
+
+    // Invariant itself: nothing was persisted under a null/missing stamp.
+    expect(await collection.countDocuments({ userId: null })).toBe(0);
+    expect(await collection.countDocuments({ userId: { $exists: false } })).toBe(0);
+    expect(await collection.countDocuments({})).toBe(0);
+  });
 });
