@@ -421,6 +421,7 @@ const startServer = async () => {
   app.use('/api/search', routes.search);
   app.use('/api/messages', routes.messages);
   app.use('/api/convos', routes.convos);
+  app.use('/api/tasks', routes.tasks); // [cowork] scoped task-list store (docs/changes/2026-11-scoped-tasklist.md)
   app.use('/api/traces', routes.traces);
   app.use('/api/presets', routes.presets);
   app.use('/api/projects', routes.projects);
@@ -453,6 +454,16 @@ const startServer = async () => {
   app.use('/api/mcp', routes.mcp);
   app.use('/api/rum', routes.rum);
 
+  /** Prefill progress — proxies to mlx-proxy so the browser avoids mixed-content */
+  app.get('/api/prefill_status', async (req, res) => {
+    try {
+      const response = await axios.get('http://host.docker.internal:1235/prefill_status', { timeout: 1000 });
+      res.json(response.data);
+    } catch {
+      res.json({ phase: 'idle' });
+    }
+  });
+
   app.use('/metrics', metricsRouter);
 
   app.use('/api', routes.openapi);
@@ -472,7 +483,52 @@ const startServer = async () => {
 
   configureGenerationStreams();
 
-  const server = app.listen(port, host, async (err) => {
+  // Node.js 18+ defaults requestTimeout to 300 000 ms (5 min), which kills
+  // long-running SSE streams (e.g. during slow model prefill) before the
+  // model produces its first token.  Must be set on the server instance
+  // BEFORE listen() so it applies to all connections from the first request.
+  const http = require('http');
+  const server = http.createServer(app);
+  server.requestTimeout = 0;
+
+  // OpenAI SDK v5 uses Node.js's built-in fetch (backed by the INTERNAL undici
+  // instance bundled with Node.js).  The npm `undici` package is a SEPARATE
+  // module instance — setGlobalDispatcher() on it does not affect the built-in
+  // fetch.  We must use `node:undici` (the built-in) to reach the same dispatcher
+  // that the built-in fetch uses.
+  //
+  // The built-in undici defaults headersTimeout and bodyTimeout to 300 000 ms
+  // (5 min).  During long LM Studio prefills the mlx-proxy holds the HTTP
+  // connection completely silent until the first token arrives; undici fires
+  // headersTimeout and closes the socket with a SocketError('terminated').
+  // Disabling both timeouts via the global dispatcher lets prefills run as long
+  // as they need.  connect.timeout keeps a fast-fail for unreachable backends.
+  // node:undici is the built-in undici instance that backs globalThis.fetch
+  // (and therefore OpenAI SDK v5's HTTP client).  The npm `undici` package is a
+  // separate module instance — patching it does nothing to the built-in fetch.
+  // headersTimeout / bodyTimeout both default to 300 000 ms; either fires during
+  // long LM Studio prefills and kills the socket with SocketError('terminated').
+  (() => {
+    let setGlobalDispatcher, Agent;
+    try {
+      ({ setGlobalDispatcher, Agent } = require('node:undici'));
+    } catch (_) {
+      try {
+        // Fallback: some Node 20 Alpine builds expose it without the node: prefix
+        ({ setGlobalDispatcher, Agent } = require('undici'));
+      } catch (e2) {
+        console.warn('[server] undici not available — long-prefill timeout not disabled:', e2.message);
+        return;
+      }
+    }
+    try {
+      setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0 }));
+      console.info('[server] undici global dispatcher set — headersTimeout and bodyTimeout disabled');
+    } catch (e) {
+      console.warn('[server] setGlobalDispatcher failed:', e.message);
+    }
+  })();
+  server.listen(port, host, async (err) => {
     if (err) {
       logger.error('Failed to start server:', err);
       process.exit(1);

@@ -229,6 +229,7 @@ export default function useChatFunctions({
   const setFilesToDelete = useSetFilesToDelete();
   const getEphemeralAgent = useGetEphemeralAgent();
   const isTemporary = useRecoilValue(store.isTemporary);
+  const contextReductionSetting = useRecoilValue(store.contextReduction);
   const { getExpiry } = useUserKey(immutableConversation?.endpoint ?? '');
   const setIsSubmitting = useSetRecoilState(store.isSubmittingFamily(index));
   const setSubmissionStart = useSetRecoilState(store.submissionStartFamily(index));
@@ -411,7 +412,10 @@ export default function useChatFunctions({
 
     setShowStopButton(false);
 
-    const ephemeralAgent = getEphemeralAgent(conversationId ?? Constants.NEW_CONVO);
+    const ephemeralAgent = {
+      ...getEphemeralAgent(conversationId ?? Constants.NEW_CONVO),
+      contextReduction: contextReductionSetting,
+    };
     /**
      * Manual skill selection resolution:
      *  - Explicit `overrideManualSkills` wins (regenerate / save-and-submit

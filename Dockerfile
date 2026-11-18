@@ -4,6 +4,8 @@
 FROM node:24.16.0-alpine AS node
 
 RUN apk upgrade --no-cache
+# Git — required by desktop-commander agents for version control operations
+RUN apk add --no-cache git
 RUN apk add --no-cache jemalloc
 RUN apk add --no-cache python3 py3-pip uv
 
@@ -25,6 +27,8 @@ RUN mkdir -p /app && chown node:node /app
 WORKDIR /app
 
 USER node
+
+RUN mkdir -p /home/node && git config --global user.name "Erik Schumann" && git config --global user.email "erik@schumann.se"
 
 COPY --chown=node:node package.json package-lock.json ./
 COPY --chown=node:node api/package.json ./api/package.json
@@ -57,8 +61,13 @@ RUN \
 COPY --chown=node:node . .
 
 RUN \
-    # React client build with configurable memory
-    NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE}" npm run frontend && \
+    # Export NODE_OPTIONS so the memory limit is inherited by every npm
+    # subprocess — including the nested `vite build` inside client/ — not
+    # just the outer npm run frontend process. Use && so a failed build
+    # aborts the image immediately instead of producing a broken container.
+    export NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE}" && \
+    npm run frontend && \
+    test -f client/dist/index.html && \
     npm prune --production && \
     npm cache clean --force
 

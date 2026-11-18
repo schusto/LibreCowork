@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/utils/contextReduction.ts",
+    "src/utils/contextReduction.spec.ts",
+    "src/endpoints/projection.ts",
+    "src/endpoints/projection.spec.ts"
+  ]
+}

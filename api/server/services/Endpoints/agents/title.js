@@ -73,7 +73,10 @@ const addTitle = async (
   let timeoutId;
   try {
     const timeoutPromise = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => reject(new Error('Title generation timeout')), 45000);
+      timeoutId = setTimeout(() => reject(new Error('Title generation timeout')),
+        // [cowork] TITLE_CONVO_TIMEOUT_MS overrides the hardcoded 45 s (slow local models).
+        Number(process.env.TITLE_CONVO_TIMEOUT_MS) || 45000,
+      );
     }).catch((error) => {
       logger.error('Title error:', error);
     });

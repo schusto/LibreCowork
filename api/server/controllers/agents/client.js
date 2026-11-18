@@ -1,5 +1,18 @@
 require('events').EventEmitter.defaultMaxListeners = 100;
 const { logger, MAX_AGENT_EVENT_ACTOR_ENCODING_LENGTH } = require('@librechat/data-schemas');
+// [cowork] Deterministic context reduction (thinking strip + tool dedup/truncation)
+const { applyContextReductionWithStats } = require('~/server/utils/contextReduction');
+// [cowork] Harness supervisor — proactive memory/work-graph injection + stuck-pattern nudge
+const {
+  getProactiveMemoryContext,
+  trackAndDetectStuckPattern,
+  createStallRecoveryStopHook,
+  resetAutoContinueCounter,
+  getStallProbeTagInstruction,
+  decideToolVoice,
+  assistantHasToolCall,
+  getToolErrorVoice,
+} = require('~/server/utils/harnessSupervisor');
 const { getBufferString, HumanMessage } = require('@librechat/agents/langchain/messages');
 const {
   createRun,
@@ -366,6 +379,62 @@ class AgentClient extends BaseClient {
       skipTotalSizeLimit: true,
       preserveTextSources: true,
     });
+  }
+
+  /**
+   * [cowork] Tells the agent where attachments it was NOT sent live on disk, so it can open
+   * them with whatever MCP/file tools it has. Companion to `fileConfig.endpoints.custom.
+   * defaultLLMDeliveryPath` in librechat.yaml: anything the model cannot read natively (PDF,
+   * Office, archives, audio, ...) resolves to delivery path `none`, which leaves it out of the
+   * prompt entirely, so without this note the agent would not know the file exists.
+   * See docs/51_attachments_as_files_for_tools.md.
+   *
+   * Local uploads only (`filepath` is `/uploads/<user>/<file>`, which the compose file mounts
+   * from CWK_HOST_UPLOADS_DIR into the container); returns null when the variable is unset,
+   * so the feature is off by default. Built from `message_file_map`, so files attached in
+   * earlier turns stay listed on later turns.
+   *
+   * KNOWN LIMITS: assumes the container's `/uploads` is the host dir in CWK_HOST_UPLOADS_DIR;
+   * other storage strategies (S3, ...) are skipped; the agent's MCP tools must be able to
+   * read that host path (the agent-sandbox ACL may deny it, see docs/49).
+   * @returns {string | null}
+   */
+  buildAttachmentPathNote() {
+    const hostRoot = process.env.CWK_HOST_UPLOADS_DIR;
+    if (!hostRoot) {
+      return null;
+    }
+    const byId = new Map();
+    for (const file of Object.values(this.message_file_map ?? {}).flat()) {
+      if (file?.file_id && !byId.has(file.file_id)) {
+        byId.set(file.file_id, file);
+      }
+    }
+    const lines = [];
+    for (const file of byId.values()) {
+      const source = file.source ?? FileSources.local;
+      const filepath = file.filepath;
+      if (
+        source !== FileSources.local ||
+        typeof filepath !== 'string' ||
+        !filepath.startsWith('/uploads/') ||
+        filepath.includes('..') ||
+        this.getAttachmentDeliveryPath(file) !== 'none'
+      ) {
+        continue;
+      }
+      const hostPath = `${hostRoot.replace(/\/+$/, '')}/${filepath.slice('/uploads/'.length)}`;
+      lines.push(`- "${file.filename}" (${file.type || 'unknown type'}): ${hostPath}`);
+    }
+    if (lines.length === 0) {
+      return null;
+    }
+    return [
+      '# Attached files (not included in the prompt)',
+      'The user attached the file(s) below. Their content was NOT sent to you; they are on disk at the paths shown.',
+      'Open them with whichever of your tools can read that file type (PDF, Office, data, audio, ...).',
+      ...lines,
+    ].join('\n');
   }
 
   getProcessableAttachmentsForEndpoint(attachments, modelBoundAttachments) {
@@ -2295,7 +2364,7 @@ class AgentClient extends BaseClient {
     const orderedMessages = this.constructor.getMessagesForConversation({
       messages,
       parentMessageId,
-      summary: this.shouldSummarize,
+      summary: false,
       mapMethod: createMultiAgentMapper(this.options.agent, this.agentConfigs),
       mapCondition: (message) => message.addedConvo === true,
     });
@@ -2333,6 +2402,38 @@ class AgentClient extends BaseClient {
       return agent;
     };
 
+    /**
+     * [cowork] Inject todo_update tool instructions when the tool is available on the agent.
+     * This ensures every agent with the todo_list MCP attached knows how to use the widget
+     * without requiring per-agent system prompt edits.
+     */
+    const injectTodoInstructions = (agent) => {
+      const TODO_TOOL = 'todo_update';
+      const hasTodoTool = Array.isArray(agent.tools) && agent.tools.some((t) => {
+        const name = typeof t === 'string' ? t : t?.name ?? t?.function?.name ?? '';
+        return name === TODO_TOOL || name.startsWith(TODO_TOOL);
+      });
+      if (!hasTodoTool) {
+        return agent;
+      }
+      const todoInstructions = `\n\n## Task tracking\n\nWhen asked to perform a multi-step task, use the \`${TODO_TOOL}\` tool to show progress.\n\nRules:\n- Call \`${TODO_TOOL}\` at the start with all planned steps as "pending"\n- Mark exactly one task "in_progress" at a time before beginning it\n- Mark it "completed" immediately after finishing, before starting the next\n- Pass the full todos array on every call — it is a snapshot, not a diff\n- Use "content" for the imperative form (e.g. "Run tests") and "activeForm" for the present-continuous form (e.g. "Running tests")\n- Do not call \`${TODO_TOOL}\` for simple single-step responses\n- Once every task is "completed", call \`todo_clear\` to dismiss the task list`;
+      agent.instructions = (agent.instructions ? agent.instructions + todoInstructions : todoInstructions.trim());
+      return agent;
+    };
+
+    /**
+     * [cowork] Inject the current conversationId into every agent's system prompt as an
+     * HTML comment. This makes it available to agents (e.g. the title-regen agent) without
+     * cluttering the visible instructions in the UI.
+     */
+    const injectConversationId = (agent) => {
+      const id = this.conversationId;
+      if (!id) return agent;
+      agent.instructions = (agent.instructions ?? '') +
+        `\n\n<!-- cowork:conversationId=${id} -->`;
+      return agent;
+    };
+
     /** Collect all runtime agents without promoting isolated subagents into the top-level graph. */
     const agentsById = new Map();
     const pendingAgents = [this.options.agent, ...(this.agentConfigs?.values() ?? [])];
@@ -2341,7 +2442,7 @@ class AgentClient extends BaseClient {
       if (!agent?.id || agentsById.has(agent.id)) {
         continue;
       }
-      agentsById.set(agent.id, normalizeInstructions(agent));
+      agentsById.set(agent.id, injectConversationId(injectTodoInstructions(normalizeInstructions(agent))));
       for (const subagent of agent.subagentAgentConfigs?.values() ?? []) {
         pendingAgents.push(subagent);
       }
@@ -2534,6 +2635,15 @@ class AgentClient extends BaseClient {
 
     /** @type {Record<number, number>} */
     const indexTokenCountMap = {};
+    /**
+     * [cowork] Per-message prompt token count computed from the PRE-reduction
+     * `formattedMessage`. Used as a cache below: `applyContextReduction` only
+     * replaces the array entries it actually strips/truncates/dedupes, so a
+     * message untouched by reduction can reuse this value instead of paying for
+     * a second tokenization pass. Indexed the same as `orderedMessages`/`payload`.
+     * @type {number[]}
+     */
+    const preReductionPromptTokenCounts = [];
     /** @type {Record<string, number>} */
     const tokenCountMap = {};
     const memoryPayload = [];
@@ -2682,8 +2792,16 @@ class AgentClient extends BaseClient {
           : 0;
 
       orderedMessages[i].tokenCount = normalizedCanonicalTokenCount;
-      indexTokenCountMap[i] = normalizedPromptTokenCount;
-      promptTokenTotal += normalizedPromptTokenCount;
+      /**
+       * [cowork] NOT written into `indexTokenCountMap`/`promptTokenTotal` here —
+       * only cached for reuse. The authoritative values are computed below from
+       * `payload` (the array AFTER `applyContextReduction` runs) so the SDK's
+       * summarization trigger and context-budget pruner see what is actually
+       * sent to the model, not the size of the original, unreduced conversation.
+       * See the recompute block after `applyContextReduction` and
+       * docs/18_context_reduction.md.
+       */
+      preReductionPromptTokenCounts[i] = normalizedPromptTokenCount;
 
       if (message.messageId) {
         tokenCountMap[message.messageId] = normalizedCanonicalTokenCount;
@@ -2751,7 +2869,57 @@ class AgentClient extends BaseClient {
       this.injectedYouTubeVideo = hasYouTubeVideoParts(latestFormatted.content);
     }
 
-    payload = formattedMessages;
+    // [cowork] Apply deterministic context reduction before sending to the backend.
+    // Strips old thinking blocks and truncates/deduplicates old tool results.
+    // No DB writes, no async, no LLM — pure transform. See docs/18_context_reduction.md.
+    // WithStats variant also surfaces `stats.toolDeduped` for the harness
+    // supervisor's stuck-pattern detector below. See docs/31_harness_memory_supervisor.md.
+    // [cowork] Per-chat override of the CWK_CONTEXT_REDUCTION default (off), set via the
+    // Chat settings "Context compaction" toggle and sent as ephemeralAgent.contextReduction.
+    const contextReductionOverride = this.options.req?.body?.ephemeralAgent?.contextReduction;
+    const { messages: reducedPayload, stats: reductionStats } = applyContextReductionWithStats(
+      formattedMessages,
+      orderedMessages,
+      this.conversationId,
+      contextReductionOverride,
+    );
+    payload = reducedPayload;
+
+    /**
+     * [cowork] Recompute per-message token counts from the REDUCED `payload`,
+     * not the pre-reduction `formattedMessages`. `indexTokenCountMap` is handed
+     * straight to the agents SDK (`formatAgentMessages` in @librechat/agents),
+     * which treats it as authoritative — it does not recount tokens from message
+     * content itself, it only reads `indexTokenCountMap[i]` per original message
+     * index and splits that number across the sub-messages the entry expands
+     * into. Left uncorrected, the SDK's token_ratio summarization trigger and its
+     * context-budget pruner would see the size of the ORIGINAL conversation —
+     * full, untruncated/undeduped tool output — even though
+     * `applyContextReduction` above has already shrunk what is actually sent to
+     * the model. That mismatch is why summarization was firing at ~90% of a 256k
+     * budget (144k+ estimated tokens) while LM Studio was only receiving ~30k
+     * tokens. See docs/18_context_reduction.md.
+     *
+     * `applyContextReduction` only replaces the entries it actually strips,
+     * truncates, or dedupes — untouched messages keep the exact same object
+     * reference as in `formattedMessages` (see contextReduction.js). Reference
+     * equality lets us skip re-tokenizing the (usually large) majority of a long
+     * conversation that reduction left alone, reusing the count already computed
+     * above instead of paying for a second full-conversation tokenization pass
+     * on every request.
+     */
+    promptTokenTotal = 0;
+    for (let i = 0; i < payload.length; i++) {
+      const wasReduced = payload[i] !== formattedMessages[i];
+      const reducedTokenCount = wasReduced
+        ? countFormattedMessageTokens(payload[i], encoding)
+        : preReductionPromptTokenCounts[i];
+      const normalizedReducedTokenCount =
+        Number.isFinite(reducedTokenCount) && reducedTokenCount > 0 ? reducedTokenCount : 0;
+      indexTokenCountMap[i] = normalizedReducedTokenCount;
+      promptTokenTotal += normalizedReducedTokenCount;
+    }
+
     this.modelBoundSteerFileIdsBySourceMessageId = new Map();
     /** Persisted steer parts of past turns replay with their attachments and
      *  quotes: one batched owner-scoped fetch, re-encoded per turn and
@@ -2867,6 +3035,157 @@ class AgentClient extends BaseClient {
       modelBoundFileContexts.add(this.augmentedPrompt);
       sharedRunContextParts.push(this.augmentedPrompt);
     }
+
+    /**
+     * [cowork] Harness supervisor — proactive work-graph/chat injection plus a
+     * stuck-pattern nudge, both independent of whether the model chooses to call
+     * search_work_graph / search_memory itself. Fails open. Global/shared: pushed
+     * into sharedRunContextParts (visible to every agent in this run), not routed
+     * through getAgentPartitionMemories/getMemoryAgentId below — that mechanism is
+     * upstream's own per-agent memory partitioning and is orthogonal to this.
+     * See docs/31_harness_memory_supervisor.md, docs/36_harness_supervisor_implementation_report.md.
+     */
+    const streamId = this.options.req?._resumableStreamId || null;
+    const latestUserText = orderedMessages[orderedMessages.length - 1]?.text;
+    const [proactiveContext, stuckNudge] = await Promise.all([
+      getProactiveMemoryContext({
+        userMessage: latestUserText,
+        conversationId: this.conversationId,
+        userId: this.options?.req?.user?.id,
+        agent: this.options?.agent,
+        /**
+         * Draws the same UI-only "did this actually fire" marker docs/41 §11
+         * built for stall-recovery continuations, using the identical splice
+         * protocol: claim the next `contentParts` index, push the part, bump
+         * the shared steer offset so later SDK-emitted indices shift past it,
+         * then emit. Everything the protocol needs — `streamId` (from
+         * `req._resumableStreamId`, set in request.js before
+         * `client.sendMessage()`/`buildMessages()` ever runs), `contentParts`
+         * / `steerOffsetState` (constructor fields, already empty at this
+         * point), and the GenerationJobManager job (created in that same
+         * request.js pass) — already exists here, before `createRun` and
+         * before any Graph. See docs/42_proactive_injection_visibility_report.md.
+         */
+        onInjected: streamId
+          ? ({ text }) => {
+              const index = this.contentParts.length;
+              const part = {
+                type: ContentTypes.ACTIVITY_LABEL,
+                [ContentTypes.ACTIVITY_LABEL]: text,
+                /** Own sub-type so it renders distinctly from the
+                 *  stall-recovery 'continuation' marker — see Part.tsx. */
+                activity_label_type: 'proactive_context',
+                status: 'ok',
+              };
+              this.contentParts.push(part);
+              this.steerOffsetState.offset += 1;
+              return GenerationJobManager.emitChunk(
+                streamId,
+                {
+                  event: ActivityLabelEvents.ON_ACTIVITY_LABEL,
+                  data: {
+                    index,
+                    part,
+                    responseMessageId: this.responseMessageId,
+                    conversationId: this.conversationId,
+                  },
+                },
+                { durable: true, expectedCreatedAt: this.jobCreatedAt },
+              );
+            }
+          : undefined,
+      }),
+      trackAndDetectStuckPattern({
+        conversationId: this.conversationId,
+        stats: reductionStats,
+        agent: this.options?.agent,
+      }),
+      // [cowork] Stall-recovery: reset the per-conversation auto-continue cap
+      // once per real user-initiated turn — see createStallRecoveryStopHook and
+      // docs/41_stall_recovery_stop_hook_report.md.
+      resetAutoContinueCounter(this.conversationId),
+    ]);
+    /**
+     * [cowork] Delivered as a final instruction message appended after the
+     * user's own message (see chatCompletion, near `hydrateMissingIndexTokenCounts`)
+     * rather than folded into `sharedRunContextParts`/`additional_instructions`.
+     * Live testing (docs/42_proactive_injection_visibility_report.md §4) showed
+     * the system-prompt-tail placement reaches the model — confirmed via
+     * `additionalInstructions` → `buildDynamicInstructionsString()` →
+     * `systemRunnable`, token-counted before the run starts — but gets
+     * discounted: a weak match was ignored even in reasoning, and a strong,
+     * clearly on-topic match got read into reasoning yet never surfaced in the
+     * visible answer. Repositioning it as the last thing before generation
+     * (same convention as the stall-recovery nudge: a `HumanMessage` with
+     * `additional_kwargs: { role: 'system', source: 'hook' }`, ephemeral to
+     * this call and never persisted) targets exactly that gap.
+     */
+    // [cowork] Attachments left out of the prompt (delivery path `none`) are announced with their
+    // host path, appended with the proactive context so it rides the same after-user-message slot.
+    const attachmentPathNote = this.buildAttachmentPathNote();
+    // [cowork] Tool-voice reminder (component 4 + claim variant 4b): re-seeds
+    // the tool-call behaviour when a tool-using conversation drifts into N
+    // consecutive tool-free assistant turns, or (flagged) when a recent
+    // tool-free assistant turn claims completed work. Rides the SAME
+    // after-user-message slot as the proactive context — docs/42 §4 showed
+    // that placement beats the system-prompt tail, which the model discounts.
+    // Predicate runs on the reduced payload (the array actually sent to the
+    // backend), so thinking stripping/truncation cannot desync the view.
+    // See harnessSupervisor.js.
+    const toolVoiceDecision = decideToolVoice(reducedPayload);
+    // [cowork] Tool-error voice (component 6): when the run ENDED with a
+    // trailing streak of error-classified tool results, nudge diagnosis —
+    // ephemeral per-request injection, expires as soon as the streak breaks
+    // (the reason it left the chat template). Precedence rule: if BOTH this
+    // and the tool-voice reminder would fire in the same turn, emit ONLY the
+    // tool-error voice; an active error streak is the more specific
+    // diagnosis of why the model should change behaviour right now. See
+    // docs/changes/2026-11-tool-error-voice.md.
+    const toolErrorVoice = getToolErrorVoice(reducedPayload);
+    const effectiveToolVoice = toolErrorVoice ?? (toolVoiceDecision ? toolVoiceDecision.text : null);
+    if (toolErrorVoice) {
+      logger.debug(
+        `[harnessSupervisor] conv=${(this.conversationId || '').slice(-8)} ` +
+          (toolVoiceDecision
+            ? 'both voices fired → tool_error_voice wins precedence'
+            : 'tool_error_voice fired'),
+      );
+    } else if (toolVoiceDecision) {
+      logger.debug(
+        `[harnessSupervisor] conv=${(this.conversationId || '').slice(-8)} ` +
+          `tool_voice_reminder fired (${toolVoiceDecision.reason})`,
+      );
+    }
+    /**
+     * [cowork] S4 fire/no-recovery telemetry (2026-11-16): one structured
+     * INFO line per request where any voice fired, so conversion rate is
+     * measurable by grep without a spike run. Stateless by construction:
+     * `last_assistant_called` reads the most recent assistant message of the
+     * SAME reducedPayload — on the next request that message is the turn
+     * following the fire, so joining consecutive tv_telemetry lines per
+     * conversation yields fired→recovered pairs without stored state.
+     * Stable field order; parse positionally.
+     */
+    if (effectiveToolVoice) {
+      const tvVoiceName = toolErrorVoice
+        ? 'error'
+        : toolVoiceDecision.reason === 'claim'
+          ? 'claim'
+          : 'tool';
+      const tvLastAssistant = [...reducedPayload].reverse().find((m) => m?.role === 'assistant');
+      logger.info(
+        `[harnessSupervisor] tv_telemetry conv=${(this.conversationId || '').slice(-8)} ` +
+          `voice=${tvVoiceName} fired=true last_assistant_called=${assistantHasToolCall(tvLastAssistant)}`,
+      );
+    }
+    this.proactiveContextMessage =
+      [proactiveContext, attachmentPathNote, effectiveToolVoice].filter(Boolean).join('\n\n') || null;
+    if (stuckNudge) sharedRunContextParts.push(stuckNudge);
+    // [cowork] Stall-recovery: establish the DONE_TAG completion-marker
+    // convention every turn (synchronous, no I/O) — see
+    // getStallProbeTagInstruction and createStallRecoveryStopHook.
+    const stallProbeTagInstruction = getStallProbeTagInstruction();
+    if (stallProbeTagInstruction) sharedRunContextParts.push(stallProbeTagInstruction);
 
     /** Memory context (user preferences/memories). Keyed context (with memory
      *  keys + token metadata) is reserved for agents that can call
@@ -4564,7 +4883,7 @@ class AgentClient extends BaseClient {
             }),
           user: createSafeUser(this.options.req.user),
         },
-        recursionLimit: resolveRecursionLimit(agentsEConfig, this.options.agent),
+        recursionLimit: agentsEConfig?.recursionLimit ?? 50,
         signal: abortController.signal,
         streamMode: 'values',
         version: 'v2',
@@ -4751,6 +5070,29 @@ class AgentClient extends BaseClient {
         files: this.modelBoundFileContexts,
       });
 
+      /**
+       * [cowork] Harness supervisor — proactive work-graph/chat context,
+       * appended as the LAST message before the run rather than folded into
+       * the system-prompt tail (see buildMessages, where it's stashed on
+       * `this.proactiveContextMessage`). Same convention the stall-recovery
+       * nudge already uses: a `HumanMessage` with `additional_kwargs: { role:
+       * 'system', source: 'hook' }`, because a bare mid-conversation
+       * `SystemMessage` is rejected by the Anthropic and Google providers.
+       * Ephemeral to this call — `initialMessages` is never itself persisted,
+       * so this doesn't stick around on later turns the way the stall-recovery
+       * nudge does within a single turn's continuations (docs/41 §12).
+       * Appended before `hydrateMissingIndexTokenCounts` runs so the new
+       * message gets a real token count instead of an undercounted context.
+       */
+      if (this.proactiveContextMessage) {
+        initialMessages.push(
+          new HumanMessage({
+            content: this.proactiveContextMessage,
+            additional_kwargs: { role: 'system', source: 'hook' },
+          }),
+        );
+      }
+
       if (indexTokenCountMap && isEnabled(process.env.AGENT_DEBUG_LOGGING)) {
         const entries = Object.entries(indexTokenCountMap);
         const perMsg = entries.map(([idx, count]) => {
@@ -4807,6 +5149,17 @@ class AgentClient extends BaseClient {
           );
         if (initialModelBoundAdmission != null) {
           config.callbacks = [initialModelBoundAdmission];
+        }
+
+        if (agents[0].recursion_limit && typeof agents[0].recursion_limit === 'number') {
+          config.recursionLimit = agents[0].recursion_limit;
+        }
+
+        if (
+          agentsEConfig?.maxRecursionLimit &&
+          config.recursionLimit > agentsEConfig?.maxRecursionLimit
+        ) {
+          config.recursionLimit = agentsEConfig?.maxRecursionLimit;
         }
 
         // TODO: needs to be added as part of AgentContext initialization
@@ -4900,6 +5253,88 @@ class AgentClient extends BaseClient {
 
         const activityLabel = this.buildActivityLabelWiring(streamId, abortController.signal);
         const activityPhase = this.buildActivityPhaseWiring(streamId, abortController.signal);
+        /** [cowork] Stall-recovery `Stop` hook; undefined when the feature is
+         *  disabled, which registers no hook at all. Deliberately scoped to
+         *  chatCompletion — `resumeCompletion` stays untouched, same as the
+         *  probe loop this replaced (docs/39 §2). */
+        const stallRecoveryHook = createStallRecoveryStopHook(this.conversationId, {
+          /**
+           * Draw the "continuing" marker in the chat, using the SAME splice
+           * protocol the activity-label wiring above uses: claim the next
+           * index in `contentParts`, push the part, bump the shared steer
+           * offset so every LATER SDK-emitted index shifts past the part the
+           * Graph doesn't know about, then emit. Skipping the bump is what
+           * would corrupt ordering — the Graph keeps numbering from its own
+           * `contentData`, which has no idea this part exists.
+           *
+           * Safe to do from inside the Stop hook: it runs within
+           * `consumeStream`, after the stalled round's content is complete and
+           * before the continuation's first event, so the marker lands exactly
+           * between them.
+           *
+           * An `activity_label` part rather than streamed text on purpose —
+           * activity labels are UI-only (never model input, never billed), so
+           * the marker cannot come back as context on a later turn.
+           */
+          onContinue: ({ text }) => {
+            const index = this.contentParts.length;
+            const part = {
+              type: ContentTypes.ACTIVITY_LABEL,
+              [ContentTypes.ACTIVITY_LABEL]: text,
+              /** Keeps it out of tool-call grouping so it renders as its own
+               *  line instead of being consumed as a group header — see
+               *  `getBatchActivityLabelPart`. */
+              activity_label_type: 'continuation',
+              status: 'ok',
+            };
+            this.contentParts.push(part);
+            this.steerOffsetState.offset += 1;
+            return GenerationJobManager.emitChunk(
+              streamId,
+              {
+                event: ActivityLabelEvents.ON_ACTIVITY_LABEL,
+                data: {
+                  index,
+                  part,
+                  responseMessageId: this.responseMessageId,
+                  conversationId: this.conversationId,
+                },
+              },
+              { durable: true, expectedCreatedAt: this.jobCreatedAt },
+            );
+          },
+        });
+        /**
+         * [cowork] EXPERIMENTAL (2026-10-07) — make clean-exit checkpoints durable so the
+         * SDK's Stop-hook continuation can find its segment checkpoint.
+         *
+         * Problem: when anything attaches a checkpointer (toolApproval.enabled, or
+         * ask_user_question), the SDK's continuation path calls resolveCompletedSegmentConfig
+         * (@librechat/agents run.ts) and throws "Cannot identify the checkpoint committed by the
+         * completed graph segment" — LazyMongoSaver discards every write-less (non-paused)
+         * checkpoint at graph exit, before our Stop hook even runs.
+         *
+         * Workaround: LazyMongoSaver persists everything for configs carrying
+         * LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY (checkpointer.ts isEventActorInvocation). We set
+         * only that key — not the owner/depth keys the real event-actor path adds.
+         *
+         * OPEN RISKS / UNVERIFIED (see docs/50_stall_recovery_checkpointer_fix.md):
+         *  1. Borrowed flag: meant for event-actor runs; only the saver's persist-everything
+         *     branches were checked, not every consumer.
+         *  2. Size: every turn now writes its full state as one Mongo doc. Past the hard limit
+         *     (16 MB less headroom) the saver throws CheckpointTooLargeError and the turn FAILS.
+         *     Long runs are exactly the ones that stall, so watch the "[checkpointer] ... MB" logs.
+         *  3. Cleanup: clean path prunes nothing after the turn (see finally below); we rely on
+         *     the pre-run prune of this generation + the Mongo TTL, so dead checkpoints linger.
+         *  4. Untested end to end: that getState/getStateHistory then yields a snapshot whose
+         *     runStepState matches (executionId, streamSegment) of the segment being continued.
+         * Fallback if this proves unsound: make the saver persist the segment-end checkpoint
+         * when a continuation is planned (saver/SDK change; reconcile with upstream).
+         */
+        if (stallRecoveryHook && runUsesCheckpointer && this.eventActorInvocationId == null) {
+          config.configurable[LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY] =
+            `cowork-stall-recovery:${this.responseMessageId}`;
+        }
         const reasoningLabel = this.buildReasoningLabelWiring(streamId, abortController.signal);
         const offsetHandlers = createSteerIndexOffsetHandlers(
           this.options.eventHandlers,
@@ -4934,6 +5369,14 @@ class AgentClient extends BaseClient {
           steering: this.buildSteerWiring(streamId),
           activityLabel,
           activityPhase,
+          // [cowork] Harness supervisor, component 3: stall recovery. The hook
+          // fires at natural run completion and, when the turn stalled without
+          // the DONE_TAG marker, returns `decision: 'block'` so the SDK
+          // continues the SAME run in place rather than finalizing it.
+          // `undefined` (feature off, or no conversation id) registers nothing.
+          // Replaces the old post-hoc `processStream()` re-entry loop, which
+          // could not render correctly — see docs/41.
+          ...(stallRecoveryHook && { stallRecovery: { hook: stallRecoveryHook } }),
           eventActorCheckpointing: this.eventActorInvocationId != null,
           // The token map is positional over the DB-derived history. A warm
           // continuation runs on checkpoint-restored state (restored messages
@@ -5964,7 +6407,23 @@ class AgentClient extends BaseClient {
         return;
       }
     }
-    const { handleLLMEnd, collected: collectedMetadata } = createMetadataAggregator();
+    const { handleLLMEnd: _handleLLMEnd, collected: collectedMetadata } = createMetadataAggregator();
+    // [cowork] @librechat/agents@3.1.78 has a bug in handleLLMEnd: it accesses
+    // `generations[last][0].message` without null-guarding [0]. When the title
+    // model (Phi-4-mini via LM Studio) returns an empty generations sub-array,
+    // this throws "Cannot read properties of undefined (reading 'message')" and
+    // aborts titleConvo entirely. Wrap with try/catch until agents is bumped to
+    // ≥3.1.79 (which added the ?.[0] null guard and the inner fallback in generateTitle).
+    const handleLLMEnd = (...args) => {
+      try {
+        return _handleLLMEnd(...args);
+      } catch (err) {
+        logger.warn(
+          '[api/server/controllers/agents/client.js #titleConvo] handleLLMEnd callback error (ignored, agents bug):',
+          err?.message,
+        );
+      }
+    };
     const { req, agent } = this.options;
 
     if (req?.body?.isTemporary) {
@@ -6087,6 +6546,17 @@ class AgentClient extends BaseClient {
       clientOptions.clientOptions = anthropicClientOptions;
     }
 
+    // [cowork] Re-apply titleModel here — getOptions() rebuilds clientOptions from
+    // options.llmConfig (which reflects the request body / current chat model),
+    // overwriting the titleModel we set earlier.  Apply it again after the rebuild.
+    if (
+      endpointConfig &&
+      endpointConfig.titleModel &&
+      endpointConfig.titleModel !== Constants.CURRENT_MODEL
+    ) {
+      clientOptions.model = endpointConfig.titleModel;
+    }
+
     if (
       provider === Providers.GOOGLE &&
       (endpointConfig?.titleMethod === TitleMethod.FUNCTIONS ||
@@ -6111,6 +6581,12 @@ class AgentClient extends BaseClient {
         parentMessageId: this.parentMessageId,
       },
     });
+
+    logger.debug(
+      `[api/server/controllers/agents/client.js #titleConvo] starting generateTitle` +
+      ` provider=${provider} model=${clientOptions.model}` +
+      ` titleMethod=${endpointConfig?.titleMethod ?? 'undefined'}`,
+    );
 
     try {
       const titleResult = await this.run.generateTitle({
@@ -6174,6 +6650,9 @@ class AgentClient extends BaseClient {
         );
       });
 
+      logger.debug(
+        `[api/server/controllers/agents/client.js #titleConvo] sanitizing titleResult.title="${titleResult?.title}"`,
+      );
       return sanitizeTitle(titleResult.title);
     } catch (err) {
       logger.error(

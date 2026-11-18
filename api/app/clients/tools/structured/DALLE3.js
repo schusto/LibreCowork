@@ -91,6 +91,17 @@ class DALLE3 extends Tool {
       };
     }
 
+    // [cowork] The DALLE tool points at the local mlx-proxy diffusion backend
+    // (DALLE_REVERSE_PROXY → host.docker.internal:1235). FLUX-dev at large sizes
+    // takes 10-15 min per image, which crosses the OpenAI SDK's default
+    // timeout (600_000 ms) — the SDK then aborts and, with the default
+    // maxRetries: 2, silently re-issues the request, so mlx-proxy runs the full
+    // generation twice (mlx-proxy does not cancel the abandoned first run).
+    // A local diffusion backend that is merely slow must never be retried:
+    // disable retries and give it a wide timeout.
+    config.maxRetries = 0;
+    config.timeout = 30 * 60 * 1000;
+
     /** @type {OpenAI} */
     this.openai = new OpenAI(config);
     this.name = 'dalle';

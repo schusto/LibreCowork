@@ -1,4 +1,5 @@
 import { memo } from 'react';
+import { RefreshCw, BrainCircuit } from 'lucide-react';
 import {
   Tools,
   Constants,
@@ -29,6 +30,8 @@ import {
   getCachedPreview,
   getActivityLabelPart,
   getActivityLabelText,
+  isContinuationActivityLabel,
+  isProactiveContextActivityLabel,
   getPartKeyIndex,
 } from '~/utils';
 import BackgroundTaskCall from './Parts/BackgroundTaskCall';
@@ -45,8 +48,13 @@ import AgentHandoff from './AgentHandoff';
 import CodeAnalyze from './CodeAnalyze';
 import Container from './Container';
 import WebSearch from './WebSearch';
+import TaskList, { useTodoRenderMode } from './TaskList';
 import ToolCall from './ToolCall';
 import Image from './Image';
+
+/** Tool names that trigger the TaskList widget instead of a generic ToolCall card. */
+const TODO_UPDATE_TOOL = 'todo_update';
+const TODO_CLEAR_TOOL  = 'todo_clear';
 
 const isFailedImageCall = (
   output: string | null | undefined,
@@ -76,7 +84,10 @@ const Part = memo(function Part({
   hideAttachments,
   onToolExpand,
 }: PartProps) {
-  const { partIndex } = useMessageContext();
+  const messageContext = useMessageContext();
+  const { partIndex } = messageContext ?? {};
+  // [cowork] 'inline' inside subagent thread/activity surfaces; 'suppressed' in root chat.
+  const todoRenderMode = useTodoRenderMode();
   if (!part) {
     return null;
   }
@@ -191,9 +202,49 @@ const Part = memo(function Part({
     /** Orphan label (its block's parts were filtered/hidden): renders as a
      *  standalone line. Labeled blocks normally render via ToolCallGroup,
      *  which consumes the label part as the group header instead. */
-    const display = getActivityLabelText(getActivityLabelPart(part));
+    const labelPart = getActivityLabelPart(part);
+    const display = getActivityLabelText(labelPart);
     if (!display) {
       return null;
+    }
+    /** [cowork] A harness stall-recovery restart, not a generated summary of
+     *  the model's own work. It gets a rule-and-icon treatment rather than the
+     *  muted italic line below because it must be findable by eye in a long
+     *  response: the first version reused the ordinary label styling and was
+     *  reported as "no output as far as I could see" — it WAS rendering, it
+     *  just looked exactly like the assistant's own commentary. */
+    if (isContinuationActivityLabel(labelPart)) {
+      return (
+        <div
+          className="my-3 flex items-center gap-2 text-xs text-amber-600 dark:text-amber-400"
+          data-testid="stall-continuation"
+        >
+          <div className="h-px flex-1 bg-amber-600/30 dark:bg-amber-400/30" />
+          <RefreshCw className="size-3.5 shrink-0" aria-hidden={true} />
+          <span className="break-words italic">{display}</span>
+          <div className="h-px flex-1 bg-amber-600/30 dark:bg-amber-400/30" />
+        </div>
+      );
+    }
+    /** [cowork] A harness proactive memory/work-graph injection, not a
+     *  generated summary. Deliberately a different accent (sky, not amber)
+     *  and icon from the stall-recovery continuation marker above so the two
+     *  are distinguishable at a glance — docs/41 §12 paid once already for
+     *  reusing the ordinary muted-italic label style and having it go
+     *  unnoticed; this gets its own unmistakable treatment from the start
+     *  instead of repeating that mistake. */
+    if (isProactiveContextActivityLabel(labelPart)) {
+      return (
+        <div
+          className="my-3 flex items-center gap-2 text-xs text-sky-600 dark:text-sky-400"
+          data-testid="proactive-context-injection"
+        >
+          <div className="h-px flex-1 bg-sky-600/30 dark:bg-sky-400/30" />
+          <BrainCircuit className="size-3.5 shrink-0" aria-hidden={true} />
+          <span className="break-words italic">{display}</span>
+          <div className="h-px flex-1 bg-sky-600/30 dark:bg-sky-400/30" />
+        </div>
+      );
     }
     const failed = part.status === 'failed' || part.status === 'partial';
     return (
@@ -448,6 +499,25 @@ const Part = memo(function Part({
           );
         } else if (toolCall.name?.startsWith(Constants.LC_TRANSFER_TO_)) {
           return <AgentHandoff args={toolCall.args ?? ''} name={toolCall.name || ''} />;
+        } else if (
+          toolCall.name?.startsWith(TODO_UPDATE_TOOL) ||
+          toolCall.name?.startsWith(TODO_CLEAR_TOOL)
+        ) {
+          // [cowork] Scoped tasklist (design §3.4/D2): in the ROOT chat the pinned
+          // bottom widget owns the display, so suppress the inline card as before.
+          // Inside a subagent thread / activity phase ('inline' mode) render this
+          // thread's OWN list from its own args — never the parent's.
+          if (todoRenderMode === 'suppressed') {
+            return null;
+          }
+          return (
+            <TaskList
+              args={toolCall.args ?? '{}'}
+              isSubmitting={isSubmitting}
+              conversationId={messageContext?.conversationId}
+              messageId={messageContext?.messageId}
+            />
+          );
         }
         return (
           <ToolCall

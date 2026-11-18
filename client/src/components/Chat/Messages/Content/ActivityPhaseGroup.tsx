@@ -27,6 +27,7 @@ import useThrottledValue from '~/hooks/Messages/useThrottledValue';
 import { AttachmentGroup, StreamingThoughtPeek } from './Parts';
 import { useMCPIconMap, useMCPServerNames } from '~/hooks/MCP';
 import { getActivityLabelText } from '~/utils/activityLabels';
+import type { ActivityLabelPart } from '~/utils/activityLabels';
 import { getOutcomeStatus, summarizeSpan } from './outcome';
 import { sandboxStartingByToolCallId } from '~/store';
 import useClockFormat from '~/hooks/useClockFormat';
@@ -49,11 +50,13 @@ import SearchVerticals from './verticals';
  *  never reached the fold. */
 const FOLD_EASING = 'duration-300 [animation-timing-function:cubic-bezier(0.16,1,0.3,1)]';
 
-type ActivityPhasePart = Extract<TMessageContentParts, { type: ContentTypes.ACTIVITY_LABEL }> & {
-  activity_label_type?: 'phase';
-  activity_start_index?: number;
-  activity_end_index?: number;
-};
+/**
+ * The shared activity-label shape rather than a narrower local twin. Only phase
+ * labels ever reach this component, but that is guaranteed by the segment
+ * builder (`isPhaseActivityLabel`), not by this prop type — and re-declaring a
+ * `'phase'`-only variant here just made the two types incompatible.
+ */
+type ActivityPhasePart = ActivityLabelPart;
 
 /**
  * Runs `callback` once the browser has painted the current styles. One frame

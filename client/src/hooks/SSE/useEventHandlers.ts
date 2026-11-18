@@ -1207,6 +1207,20 @@ export default function useEventHandlers({
             });
           }
 
+          // Propagate server-authoritative title to the sidebar list.
+          // createdHandler already moved the convo to top at turn start; by
+          // finalHandler the server has run regen_title (or any other title
+          // source) and the title in `conversation` is the true DB value.
+          // Without this call the allConversations cache stays on the old
+          // title until the next full refetch.
+          if (conversation.conversationId && conversation.title) {
+            updateConvoInAllQueries(
+              queryClient,
+              conversation.conversationId,
+              (c) => ({ ...c, title: conversation.title as string }),
+            );
+          }
+
           if (conversation.chatProjectId) {
             queryClient.invalidateQueries([QueryKeys.projects]);
             queryClient.invalidateQueries([QueryKeys.project, conversation.chatProjectId]);

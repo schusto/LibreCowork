@@ -1,0 +1,370 @@
+# LibreCowork — runs alongside LibreChat on port 443 (HTTPS).
+# Shares LibreChat's MongoDB so conversations and agents are accessible in both UIs.
+# Build from local source (required for the TaskList and other fork changes).
+#
+# Network note: librecowork joins the LibreChat stack's default network (librechat_default)
+# so it can reach 'mongodb' and 'meilisearch' by their service names, exactly as
+# the upstream LibreChat container does.
+#
+# markitdown_mcp is NOT duplicated here — the LibreChat stack already starts it on
+# port 3001, and both stacks connect to it via host.docker.internal:3001.
+#
+# nginx (cowork-proxy): single nginx container that terminates TLS for both services:
+#   - https://<LAN-IP>       → LibreCowork app  (port 443 → container 3080)
+#   - https://<LAN-IP>:8083  → sandpack-bundler  (port 8083 → container 80)
+#   - http://<LAN-IP>        → redirects to HTTPS
+# LibreChat moves to port 3443 to free up 443 for LibreCowork (primary app).
+# SANDPACK_BUNDLER_URL and SANDPACK_STATIC_BUNDLER_URL in LibreChat/.env point to
+# https://<LAN-IP>:8083 so the browser always loads the bundler over HTTPS.
+#
+# Usage: started automatically by cowork-start.sh alongside the main LibreChat stack.
+
+services:
+  sandpack-bundler:
+    image: ghcr.io/librechat-ai/codesandbox-client/bundler:latest
+    container_name: sandpack-bundler
+    # Exposed on HTTP 8083 directly (for reference), but primary access is via
+    # cowork-proxy on 8084 which also serves the patched preview-protocol.js.
+    # sandbox-startup.js is overridden to load preview-protocol.js from our
+    # local proxy instead of codesandbox.io, so the origin check passes for
+    # private IP origins (192.168.x, etc.).
+    ports:
+      - "0.0.0.0:8083:80"
+    # The image's own check hits http://localhost/, which resolves to ::1 here while nginx listens on IPv4 only.
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 3s
+    volumes:
+      - type: bind
+        source: ./nginx/sandbox-startup.js
+        target: /usr/share/nginx/html/static/js/sandbox-startup.a0ea8d1cb.js
+        read_only: true
+    networks:
+      - cowork_default
+    restart: unless-stopped
+
+  cowork-proxy:
+    image: nginx:alpine
+    container_name: cowork-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8443:8443"   # HTTPS bundler proxy (sandpack)
+      - "8444:8444"   # HTTPS Hermes dashboard (sidecar)
+      - "127.0.0.1:8933:8933"   # playwright-mcp proxy (Host-header rewrite)
+      - "8445:8445"             # HTTPS Open Notebook UI (sidecar)
+      - "8446:8446"             # HTTPS Open Notebook REST API (sidecar)
+      - "8447:8447"             # HTTPS LM Studio proxy (local dev — Office add-ins)
+    depends_on:
+      - sandpack-bundler
+      - librecowork
+    networks:
+      - cowork_default
+    volumes:
+      - type: bind
+        source: ./nginx/librecowork.conf
+        target: /etc/nginx/conf.d/librecowork.conf
+      - type: bind
+        source: ./nginx/bundler-tls.conf
+        target: /etc/nginx/conf.d/bundler-tls.conf
+      - type: bind
+        source: /Users/erik/proj/cowork/hermes/nginx/hermes-dashboard.conf
+        target: /etc/nginx/conf.d/hermes-dashboard.conf
+        read_only: true
+      - type: bind
+        source: /Users/erik/proj/cowork/OpenNotebook/nginx/opennotebook.conf
+        target: /etc/nginx/conf.d/opennotebook.conf
+        read_only: true
+      - type: bind
+        source: ./nginx/playwright-proxy.conf
+        target: /etc/nginx/conf.d/playwright-proxy.conf
+        read_only: true
+      - type: bind
+        source: ./nginx/lmstudio-tls.conf
+        target: /etc/nginx/conf.d/lmstudio-tls.conf
+        read_only: true
+      - type: bind
+        source: /etc/letsencrypt
+        target: /etc/letsencrypt
+        read_only: true
+      - type: bind
+        source: ./nginx
+        target: /etc/nginx/csb-static
+        read_only: true
+    restart: unless-stopped
+
+  librecowork:
+    container_name: LibreCowork
+    image: librecowork:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Also exposed on port 3081 (plain HTTP) for LAN access.
+    # Artifact previews (Sandpack) require HTTP — they don't work over HTTPS
+    # from a private IP without a wildcard domain + trusted cert setup.
+    ports:
+      - "0.0.0.0:3081:3080"
+    networks:
+      - cowork_infra
+      - cowork_default
+    volumes:
+      # Config + tool-approval policy live in ~/agent-controls (not writable by the agent user). Mounted read-only.
+      # librechat.yaml keeps its container path (/app/librechat.yaml: loadTitleConfig reads it directly).
+      - type: bind
+        source: /Users/erik/agent-controls/policy/librechat.yaml
+        target: /app/librechat.yaml
+        read_only: true
+      - type: bind
+        source: /Users/erik/agent-controls/policy
+        target: /agent-controls/policy
+        read_only: true
+      - type: bind
+        source: /Users/erik/proj
+        target: /Users/erik/proj
+#      - type: bind
+#        source: /Volumes/Multimedia/Musik
+#        target: /Volumes/Multimedia/Musik
+      # (desktop-commander config.json mount removed: Desktop Commander now runs natively as ai-agent)
+      - type: bind
+        source: /Users/erik/proj/cowork/uploads
+        target: /app/uploads
+      - type: bind
+        source: /Users/erik/proj/cowork/LibreCowork/images
+        target: /app/client/public/images
+      - type: bind
+        source: /Users/erik/proj/cowork/certs
+        target: /app/certs
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3080
+      - MONGO_URI=mongodb://mongodb:27017/LibreChat
+      # [cowork] Title generation timeout (ms). 10 min: slow local models / cold loads.
+      - TITLE_CONVO_TIMEOUT_MS=600000
+      # [cowork] Stale-running-job failsafe (inactivity, ms). Upstream default 20 min reaped long
+      # cold prefills as "Generation timed out". 6 h for unattended runs; 0 disables.
+      - CWK_STALE_JOB_TIMEOUT_MS=21600000
+      - MEILI_HOST=http://meilisearch:7700
+      # TLS is terminated by cowork-proxy (nginx); the Node app stays plain HTTP.
+      # [cowork] Context reduction — set to 'false' to disable all reduction for testing
+      - CWK_CONTEXT_REDUCTION=true
+      - CWK_THINK_KEEP_TURNS=2        # strip thinking blocks from turns older than N user messages
+      - CWK_TOOL_TRUNCATE_TURNS=3     # truncate/dedup filesystem tool results older than N user messages
+      - CWK_TOOL_TRUNCATE_CHARS=2000  # max chars per filesystem tool result outside the keep window
+      - CWK_TOOL_DEDUP_MIN_CHARS=300  # minimum result length to be considered for dedup
+      - CWK_RAG_TRUNCATE_TURNS=5      # RAG/knowledge-base results kept verbatim for N turns (longer — chunks referenced later)
+      - CWK_RAG_TRUNCATE_CHARS=2000   # max chars per RAG result outside the keep window
+      - CWK_WEB_TRUNCATE_TURNS=2      # web search results kept verbatim for N turns (shorter — discussed quickly)
+      - CWK_WEB_TRUNCATE_CHARS=1000   # max chars per web result outside the keep window
+      - CWK_HOST_UPLOADS_DIR=/Users/erik/proj/cowork/uploads   # [cowork] host path of the /app/uploads mount; enables the attached-file path note (client.js buildAttachmentPathNote, docs/51). Unset = off
+      - CWK_DUMP_CONTEXT=1            # dump raw formattedMessages to ~/proj/cowork/uploads/cwk-context-dumps/ (one file per request) — [cowork] temporarily on to catch the web-researcher subagent losing its user brief (see docs/44)
+      # - CWK_DUMP_DIR=/app/uploads/cwk-context-dumps  # default — maps to ~/proj/cowork/uploads/cwk-context-dumps/ on host
+      # [cowork] Harness supervisor — proactive memory/work-graph injection + stuck-pattern nudge. See docs/31_harness_memory_supervisor.md.
+      - CWK_SUPERVISOR_ENABLED=true
+      - CWK_SUPERVISOR_STALL_PROBE_REENTRY_ENABLED=true
+      - CWK_SUPERVISOR_MIN_MESSAGE_CHARS=15
+      - CWK_SUPERVISOR_WORK_GRAPH_LIMIT=2
+      - CWK_SUPERVISOR_WORK_GRAPH_THRESHOLD=0.3
+      - CWK_SUPERVISOR_CHATS_LIMIT=2
+      - CWK_SUPERVISOR_CHATS_THRESHOLD=0.25
+      - CWK_SUPERVISOR_TIMEOUT_MS=2000
+      - CWK_SUPERVISOR_STUCK_TURNS=3          # global default; per-agent overrides below
+      # - CWK_SUPERVISOR_STUCK_TURNS_BY_AGENT={"agent_xxxxxxxx":2}  # JSON, agent id (suffix-stripped) -> turns
+      - CWK_SUPERVISOR_TOPIC_SHIFT_ENABLED=true
+      - CWK_SUPERVISOR_TOPIC_SHIFT_THRESHOLD=0.92
+      - CWK_SUPERVISOR_TOPIC_SHIFT_EMA_ALPHA=0.5
+      - CWK_SUPERVISOR_TOPIC_SHIFT_MAX_STALE_TURNS=6
+      - CWK_SUPERVISOR_STATE_TTL_MS=21600000  # 6h
+      # EMBED_URL / QDRANT_URL / QDRANT_COLL_WORK_GRAPH / QDRANT_COLL_CHATS reuse
+      # the same names+defaults as mcp/memory/consolidate.sh and mcp/memory/lib/config.js —
+      # left unset here so both processes fall back to the same defaults.
+    env_file:
+      - /Users/erik/proj/cowork/LibreChat/.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # ── Playwright MCP ────────────────────────────────────────────────────────
+  # Microsoft's official @playwright/mcp server. Gives agents headless Chromium
+  # automation via ~34 MCP tools (navigate, click, fill, screenshot, a11y tree…).
+  # Uses the browser's accessibility tree — no vision model required.
+  # Exposed on host port 8931 so both LibreChat and LibreCowork can reach it
+  # via host.docker.internal:8931.
+  # LibreChat wiring: mcpServers.playwright_mcp in both librechat.yaml files.
+  playwright_mcp:
+    image: mcr.microsoft.com/playwright/mcp
+    container_name: playwright-mcp
+    init: true
+    pull_policy: always
+    entrypoint: ["node", "/app/cli.js"]
+    # --isolated: per-connection in-memory profile (stops shared-page about:blank cross-talk).
+    # --timeout-*: real ceilings so a slow/blocked site fails fast instead of hanging the session.
+    command: ["--headless", "--browser", "chromium", "--no-sandbox", "--isolated",
+              "--timeout-navigation", "45000", "--timeout-action", "15000",
+              "--port", "8931", "--host", "0.0.0.0"]
+    ports:
+      - "127.0.0.1:8931:8931"
+    networks:
+      - cowork_default
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('net').createConnection(8931,'localhost').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Code Interpreter ──────────────────────────────────────────────────────
+  # martvaha/code-interpreter: LibreChat-compatible sandboxed code execution.
+  # Runs Python (and R) in isolated Docker containers spawned via the Docker socket.
+  # LibreChat wiring: LIBRECHAT_CODE_API_KEY + LIBRECHAT_CODE_BASEURL in .env
+  # Data dirs on host:
+  #   ~/proj/cowork/mcp/code-interpreter/config  — sqlite DB + temp files
+  #   ~/proj/cowork/mcp/code-interpreter/uploads — user-uploaded files (auto-cleaned after 24h)
+  # HOST_PATH must be the *host* path so spawned execution containers can mount it.
+  code-interpreter:
+    build:
+      context: /Users/erik/proj/cowork/mcp/code-interpreter
+      dockerfile: Dockerfile
+      platforms:
+        - linux/arm64
+    image: code-interpreter:local
+    container_name: code-interpreter
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - PORT=8000
+      - HOST_PATH=/Users/erik/proj/cowork/mcp/code-interpreter
+      - HOST_CONFIG_PATH=/Users/erik/proj/cowork/mcp/code-interpreter/config
+      - HOST_FILE_UPLOAD_PATH=/Users/erik/proj/cowork/mcp/code-interpreter/uploads
+      - CONTAINER_MEMORY_LIMIT_MB=1024
+      - SANDBOX_MAX_EXECUTION_TIME=120
+      - DOCKER_NETWORK_ENABLED=false
+      # Read-only mount of the entire project tree at its real path.
+      # No path translation — /Users/erik/proj/... works verbatim inside the container.
+      - PROJ_PATH=/Users/erik/proj
+      # Comma-separated read-write paths, mounted at their real host paths.
+      # First entry becomes the container working directory.
+      # To grant write access to a specific dir: add it here and `docker compose up -d`.
+      # No image rebuild required.
+      - RW_PATHS=/Users/erik/proj/cowork-data/books
+    ports:
+      - "127.0.0.1:8100:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - /Users/erik/proj/cowork/mcp/code-interpreter/config:/app/config
+      - /Users/erik/proj/cowork/mcp/code-interpreter/uploads:/app/uploads
+      - /var/run/docker.sock:/var/run/docker.sock
+#      - /Volumes/Multimedia/Musik:/Volumes/Multimedia/Musik
+    networks:
+      - cowork_default
+
+  # ── Scraper Service ───────────────────────────────────────────────────────
+  scraper:
+    build:
+      context: /Users/erik/proj/cowork/scraper
+    container_name: scraper
+    environment:
+      - JINA_API_KEY=${JINA_API_KEY:-}
+    ports:
+      - "127.0.0.1:3002:3002"
+    networks:
+      - cowork_default
+      - cowork_infra
+
+  # ── Byparr Service ────────────────────────────────────────────────────────
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: byparr
+    environment:
+      - LOG_LEVEL=INFO
+    networks:
+      - cowork_default
+    # TODO: Check ARM64 manifest availability for this image (if not available, remove or comment out)
+
+  # ── Crawl4AI Service ──────────────────────────────────────────────────────
+  crawl4ai:
+    image: unclecode/crawl4ai:latest
+    container_name: crawl4ai
+    shm_size: 1g
+    environment:
+      - CRAWL4AI_API_TOKEN=local-token
+    networks:
+      - cowork_default
+    # TODO: Check ARM64 manifest availability for this image (if not available, remove or comment out)
+
+  # ── MCP sidecars (moved 2026-09-04 from config/LibreChat/docker-compose.override.yml) ──
+  # markitdown_mcp / mcp_office_documents are reached by LibreCowork via
+  # host.docker.internal:<port> (see librechat.yaml mcpServers), so publishing the
+  # port is all that's required — no cowork_infra membership needed.
+  markitdown_mcp:
+    build:
+      context: ../mcp/markitdown-mcp
+    container_name: librechat-markitdown_mcp-1
+    ports:
+      - '3001:3001'
+    volumes:
+      - /Users/erik/proj:/Users/erik/proj:ro
+    restart: unless-stopped
+    networks:
+      - cowork_default
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 3001)); s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  mcp_office_documents:
+    build:
+      context: ../mcp/mcp-ms-office-documents
+    container_name: librechat-mcp_office_documents-1
+    ports:
+      - '8958:8958'
+    volumes:
+      - ../mcp/mcp-ms-office-documents:/app
+      - ../uploads:/app/uploads
+      - ../uploads:/app/output
+    restart: unless-stopped
+    networks:
+      - cowork_default
+
+  # Nightly memory/work-graph consolidation. Needs MongoDB (cowork_infra) and the
+  # host MLX proxy. Its old `depends_on: [api, mongodb]` is gone — `api` is the
+  # retired LibreChat app and mongodb now lives in the infra compose.
+  memory_consolidator:
+    build:
+      context: ../mcp/memory
+    container_name: librechat-memory_consolidator-1
+    volumes:
+      - /Users/erik/proj:/Users/erik/proj
+    environment:
+      MEMORY_FILE:           /Users/erik/proj/cowork-data/memory/memory.md
+      DIGEST_FILE:           /Users/erik/proj/cowork-data/memory/digest.md
+      MONGO_URI:             mongodb://mongodb:27017/LibreChat
+      MLX_URL:               http://host.docker.internal:1235/v1
+      CONSOLIDATION_MODEL:   mlx-community/Qwen3.5-4B-OptiQ-4bit
+      CONSOLIDATION_DAYS:    "1"
+      MEMORY_TOKEN_CAP:      "1000"
+      CONTEXT_DOCS:          ""
+      NODE_PATH:             /app/node_modules
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    networks:
+      - cowork_default
+      - cowork_infra
+
+networks:
+  # Shared infra network (mongodb / meilisearch / searxng / qdrant) owned by
+  # cowork/docker-compose.infra.yml. Must be up before this stack.
+  cowork_infra:
+    external: true
+  # Own internal network for cowork services
+  cowork_default:
+    driver: bridge

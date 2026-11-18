@@ -2116,6 +2116,7 @@ export async function createRun({
   steering,
   activityLabel,
   activityPhase,
+  stallRecovery,
   eventActorCheckpointing = false,
   hitlCapable = false,
   resolvedToolApprovalHooks,
@@ -2246,6 +2247,15 @@ export async function createRun({
   activityPhase?: { hook: HookCallback<'PostToolBatch'> };
   /** Persist clean terminal checkpoints for an isolated bound-event invocation. */
   eventActorCheckpointing?: boolean;
+  /**
+   * Harness-supervisor stall recovery (Stop). Returning `decision: 'block'`
+   * from this hook makes the SDK re-enter the stream in place instead of
+   * finalizing the run, so a stalled agent continues inside the SAME
+   * `processStream()` call and streams to the client like an ordinary extra
+   * turn. The hook must supply `additionalContext` (the SDK injects it as the
+   * continuation nudge) and stay inside the SDK's `maxStopContinuations`.
+   */
+  stallRecovery?: { hook: HookCallback<'Stop'> };
   /**
    * Whether the caller implements the HITL pause/resume lifecycle (inspects
    * `run.getInterrupt()`, persists a pending action, exposes a resume route). Gates the
@@ -2835,6 +2845,13 @@ export async function createRun({
   if (activityPhase != null) {
     hooks = hooks ?? new HookRegistry();
     hooks.register('PostToolBatch', { hooks: [activityPhase.hook] });
+  }
+  /** Stall recovery is a completion-time decision, so it rides `Stop` rather
+   *  than a tool-batch boundary — nothing about it interacts with the label /
+   *  steer ordering above. */
+  if (stallRecovery != null) {
+    hooks = hooks ?? new HookRegistry();
+    hooks.register('Stop', { hooks: [stallRecovery.hook] });
   }
   if (steering != null && isSteeringSupported()) {
     hooks = hooks ?? new HookRegistry();

@@ -80,7 +80,10 @@ function createOpenAIImageTools(fields = {}) {
   };
 
   let apiKey = fields.IMAGE_GEN_OAI_API_KEY ?? getApiKey();
-  const closureConfig = { apiKey };
+  // Local diffusion (mlx-proxy) takes minutes per image. The SDK's default 600 s
+  // timeout + 2 auto-retries would abort and regenerate every slow image
+  // (same guard as the DALLE3 tool); axios (edit path) has no timeout.
+  const closureConfig = { apiKey, maxRetries: 0, timeout: 30 * 60 * 1000 };
 
   const imageModel = process.env.IMAGE_GEN_OAI_MODEL || 'gpt-image-1';
 

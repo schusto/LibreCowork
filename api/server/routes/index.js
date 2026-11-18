@@ -43,8 +43,10 @@ const user = require('./user');
 const mcp = require('./mcp');
 const rum = require('./rum');
 const insights = require('./insights');
+const tasks = require('./tasks'); // [cowork] scoped task-list store (/api/tasks)
 
 module.exports = {
+  tasks, // [cowork] scoped task-list store
   insights,
   rum,
   mcp,

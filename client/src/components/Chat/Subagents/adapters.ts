@@ -44,7 +44,7 @@ export type ChildActivityItem =
   | {
       type: 'activity_label';
       label: string;
-      labelType?: 'phase';
+      labelType?: 'phase' | 'continuation' | 'proactive_context';
       toolCallIds?: string[];
       activityStartIndex?: number;
       activityEndIndex?: number;
