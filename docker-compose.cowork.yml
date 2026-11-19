@@ -144,6 +144,11 @@ services:
       # [cowork] Stale-running-job failsafe (inactivity, ms). Upstream default 20 min reaped long
       # cold prefills as "Generation timed out". 6 h for unattended runs; 0 disables.
       - CWK_STALE_JOB_TIMEOUT_MS=21600000
+      # [cowork] Since v0.8.9 these two REPLACE our hand-rolled `server.requestTimeout = 0`
+      # (api/server/index.js). Upstream-native configureServerTimeouts() reads them; 0 disables.
+      # Long SSE streams survive model prefill only while both stay 0.
+      - HTTP_REQUEST_TIMEOUT_MS=0
+      - HTTP_HEADERS_TIMEOUT_MS=0
       - MEILI_HOST=http://meilisearch:7700
       # TLS is terminated by cowork-proxy (nginx); the Node app stays plain HTTP.
       # [cowork] Context reduction — set to 'false' to disable all reduction for testing

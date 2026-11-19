@@ -1,12 +1,32 @@
-import { Constants, EModelEndpoint } from 'librechat-data-provider';
 import { getRequestId, getTenantId, getUserId } from '@librechat/data-schemas';
+import { Constants, EModelEndpoint, ReasoningEffort } from 'librechat-data-provider';
 import type { AgentTriggerExecutionHostDeps, AgentTriggerFetch } from './host';
+import {
+  AgentTriggerExecutionError,
+  createAgentTriggerExecutionHost,
+  getTrustedNewConversationId,
+} from './host';
 import {
   EVENT_ACTOR_DETACHED_COMPLETION_SOURCE,
   EVENT_ACTOR_DETACHED_COMPLETION_TYPE,
 } from './detachedAction';
 import { createAgentTriggerEnvelope, getAgentTriggerIdempotencyKey } from './envelope';
-import { AgentTriggerExecutionError, createAgentTriggerExecutionHost } from './host';
+
+describe('trusted new conversation reservation', () => {
+  it.each([
+    [false, false, 'reserved-conversation', null],
+    [true, false, 'reserved-conversation', 'reserved-conversation'],
+    [false, true, 'reserved-conversation', 'reserved-conversation'],
+    [false, true, undefined, null],
+  ])(
+    'schedule=%s trigger=%s selects only a trusted reservation',
+    (isScheduledFire, isAgentTrigger, newConversationId, expected) => {
+      expect(
+        getTrustedNewConversationId({ isScheduledFire, isAgentTrigger, newConversationId }),
+      ).toBe(expected);
+    },
+  );
+});
 
 const createFireEnvelope = () =>
   createAgentTriggerEnvelope({
@@ -106,6 +126,35 @@ function expectExecutionError(error: unknown, expected: Partial<AgentTriggerExec
 }
 
 describe('createAgentTriggerExecutionHost fire adapter', () => {
+  it.each(['fire', 'continue'] as const)(
+    'retains exact reply identity without a parallel chat-channel lane: %s',
+    async (mode) => {
+      const original = mode === 'fire' ? createFireEnvelope() : createContinueEnvelope();
+      const envelope = {
+        ...original,
+        event: {
+          ...original.event,
+          id: 'channel-run-1',
+          source: { type: 'channel', id: 'channel-1' },
+        },
+      };
+      const fetcher = fetchMock(async () =>
+        response({
+          streamId: 'conversation-1',
+          conversationId: 'conversation-1',
+          generationCreatedAt: 40,
+          status: 'started',
+          responseMessageId: 'saved-reply-1',
+        }),
+      );
+      const result = await createAgentTriggerExecutionHost(deps(fetcher)).dispatch(envelope);
+      expect(result).toMatchObject({ responseMessageId: 'saved-reply-1' });
+      expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).not.toHaveProperty(
+        'channelExecution',
+      );
+    },
+  );
+
   it('rejects malformed serialized envelopes through its promise contract', async () => {
     const host = createAgentTriggerExecutionHost(deps(fetchMock(async () => response({}))));
     const malformed = { ...createFireEnvelope() };
@@ -576,6 +625,7 @@ describe('createAgentTriggerExecutionHost continue adapter', () => {
     const [input, init] = fetcher.mock.calls[0];
     expect(String(input)).toBe('http://127.0.0.1:3080/api/agents/chat/agents');
     expect(JSON.parse(String(init?.body))).toEqual({
+      agentCompletion: { version: 1, sourceId: 'subagent-completion' },
       text: envelope.input,
       endpoint: EModelEndpoint.agents,
       agent_id: 'agent-1',
@@ -646,6 +696,7 @@ describe('createAgentTriggerExecutionHost continue adapter', () => {
       quotes: ['quoted context'],
       manualSkills: ['research'],
       codeApprovalMode: 'acceptEdits' as const,
+      reasoningOverride: { key: 'reasoning_effort' as const, value: ReasoningEffort.high },
       admissionSource,
       settleOnAdmission,
     }));
@@ -668,6 +719,7 @@ describe('createAgentTriggerExecutionHost continue adapter', () => {
       quotes: ['quoted context'],
       manualSkills: ['research'],
       codeApprovalMode: 'acceptEdits',
+      reasoningOverride: { key: 'reasoning_effort', value: ReasoningEffort.high },
       agentContinuationAdmission: admissionSource,
     });
     expect(getBaseUrl).toHaveBeenCalledWith({ localOnly: true });

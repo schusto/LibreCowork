@@ -63,7 +63,6 @@ jest.mock('~/store', () => ({
   __esModule: true,
   default: {
     enterToSend: { key: 'enterToSend' },
-    saveDrafts: { key: 'saveDrafts' },
     pasteLongTextAsFile: { key: 'pasteLongTextAsFile' },
     activePromptByIndex: jest.fn(() => ({ key: 'activePrompt' })),
     pendingComposerTextByConvoId: jest.fn(() => ({ key: 'pendingComposerText' })),
@@ -127,7 +126,8 @@ jest.mock('~/Providers', () => ({
   useUploadModalContext: jest.fn(() => ({ openModal: mockOpenModal })),
 }));
 
-jest.mock('~/utils/shortcuts', () => ({
+jest.mock('@librechat/chat', () => ({
+  ...jest.requireActual('@librechat/chat'),
   resolveComposerKeyDown: jest.fn(),
 }));
 
@@ -162,6 +162,7 @@ const renderTextareaHook = (initialAnswerModeActive = false) => {
       submitButtonRef: { current: submitButton },
       setIsScrollable,
       answerModeActive,
+      enterToSend: true,
     }),
   );
   const rerender = (nextAnswerModeActive = answerModeActive) => {
@@ -206,6 +207,7 @@ describe('useTextarea long-paste fallback', () => {
         textAreaRef: { current: textArea },
         submitButtonRef: { current: null },
         setIsScrollable: jest.fn(),
+        enterToSend: true,
       }),
     );
 
@@ -234,6 +236,7 @@ describe('useTextarea long-paste fallback', () => {
         textAreaRef: { current: textArea },
         submitButtonRef: { current: null },
         setIsScrollable: jest.fn(),
+        enterToSend: true,
       }),
     );
 
@@ -289,14 +292,52 @@ describe('useTextarea long-paste fallback', () => {
     );
 
     expect(event.preventDefault).toHaveBeenCalledTimes(1);
-    await waitFor(() =>
-      expect(mockShowToast).toHaveBeenCalledWith({
-        message: 'com_ui_file_attached_as_text',
-        status: 'info',
-      }),
-    );
+    await waitFor(() => expect(mockRouteFiles).toHaveBeenCalled());
+    expect(mockRouteFiles.mock.calls[0][2]).toEqual(expect.objectContaining({ pastedText }));
+    expect(mockShowToast).not.toHaveBeenCalled();
     expect(mockInsertTextAtCursor).not.toHaveBeenCalled();
     expect(textArea.value).toBe('');
+  });
+
+  it('does not restore a canceled paste when its queued upload later resolves false', async () => {
+    let rejectUpload!: (accepted: boolean) => void;
+    mockRouteFiles.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          rejectUpload = resolve;
+        }),
+    );
+    const { result } = renderTextareaHook();
+    act(() =>
+      result.current.handlePaste(
+        createPasteEvent() as unknown as React.ClipboardEvent<HTMLTextAreaElement>,
+      ),
+    );
+    const lifecycle = mockRouteFiles.mock.calls[0][2] as UploadLifecycleCallbacks;
+    act(() => lifecycle.onAbort?.(lifecycle.fileId!));
+    await act(async () => rejectUpload(false));
+    expect(mockInsertTextAtCursor).not.toHaveBeenCalled();
+  });
+
+  it('does not restore a superseded source after its editor takes recovery', async () => {
+    let finish!: (accepted: boolean) => void;
+    mockRouteFiles.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const { result } = renderTextareaHook();
+    act(() =>
+      result.current.handlePaste(
+        createPasteEvent() as unknown as React.ClipboardEvent<HTMLTextAreaElement>,
+      ),
+    );
+    const lifecycle = mockRouteFiles.mock.calls[0][2] as UploadLifecycleCallbacks;
+    act(() => lifecycle.onRecoveryTransferred?.());
+    act(() => lifecycle.onError?.(lifecycle.fileId!));
+    await act(async () => finish(false));
+    expect(mockInsertTextAtCursor).not.toHaveBeenCalled();
   });
 
   it('replaces selected draft text when the attachment is accepted', async () => {
