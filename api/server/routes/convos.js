@@ -1084,15 +1084,24 @@ regenTitleRouter.post('/regen_title', regenTitleAuth, configMiddleware, async (r
   // 3. Resolve model: use configured titleModel, or discover currently-loaded model
   let model = titleModel;
   if (!model) {
-    model = await discoverCurrentModel(baseURL);
-  }
-  if (!model) {
-    return res.status(503).json({ error: 'Could not determine model — is mlx-proxy running?' });
+    try {
+      model = await discoverCurrentModel(baseURL);
+    } catch (error) {
+      logger.warn(`[regen_title] model discovery threw: ${error.message}`);
+    }
   }
 
-  // 4. Build the prompt and call the LLM
-  const prompt = titlePrompt.replace('{convo}', firstUserText);
-  const rawTitle = await fetchTitle({ baseURL, model, prompt });
+  // 4. Call the LLM only when a model actually resolved. [cowork] A missing
+  // model must NOT hard-fail: an idle LM Studio reports current_model=null,
+  // while the caller-supplied proposedTitle is a perfectly valid title. The
+  // old 503 sat *before* the proposedTitle fallback, making it unreachable.
+  let rawTitle = null;
+  if (model) {
+    const prompt = titlePrompt.replace('{convo}', firstUserText);
+    rawTitle = await fetchTitle({ baseURL, model, prompt });
+  } else {
+    logger.info('[regen_title] no model resolvable -> falling back to proposedTitle');
+  }
 
   // 5. Sanitize; fall back to proposedTitle if the LLM returned nothing
   const generatedTitle = rawTitle ? (sanitizeTitle(rawTitle) ?? rawTitle.trim().slice(0, 60)) : null;

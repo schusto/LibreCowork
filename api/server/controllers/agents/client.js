@@ -6744,11 +6744,11 @@ class AgentClient extends BaseClient {
     // options.llmConfig (which reflects the request body / current chat model),
     // overwriting the titleModel we set earlier.  Apply it again after the rebuild.
     if (
-      endpointConfig &&
-      endpointConfig.titleModel &&
-      endpointConfig.titleModel !== Constants.CURRENT_MODEL
+      titleConfig &&
+      titleConfig.titleModel &&
+      titleConfig.titleModel !== Constants.CURRENT_MODEL
     ) {
-      clientOptions.model = endpointConfig.titleModel;
+      clientOptions.model = titleConfig.titleModel;
     }
 
     if (
@@ -6780,7 +6780,7 @@ class AgentClient extends BaseClient {
     logger.debug(
       `[api/server/controllers/agents/client.js #titleConvo] starting generateTitle` +
       ` provider=${provider} model=${clientOptions.model}` +
-      ` titleMethod=${endpointConfig?.titleMethod ?? 'undefined'}`,
+      ` titleMethod=${titleConfig?.titleMethod ?? 'undefined'}`,
     );
 
     try {
