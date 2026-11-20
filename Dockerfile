@@ -1,12 +1,12 @@
-# v0.8.8
+# v0.8.9
 
 # Base node image
-FROM node:24.16.0-alpine AS node
+FROM docker.io/library/node:24.22.3-alpine AS node
 
 RUN apk upgrade --no-cache
-# Git — required by desktop-commander agents for version control operations
+# Git — required for desktop-commander agents version control
 RUN apk add --no-cache git
-RUN apk add --no-cache jemalloc
+RUN apk add --no-cache bash jemalloc
 RUN apk add --no-cache python3 py3-pip uv
 
 # Set environment variable to use jemalloc
@@ -36,6 +36,8 @@ COPY --chown=node:node client/package.json ./client/package.json
 COPY --chown=node:node packages/data-provider/package.json ./packages/data-provider/package.json
 COPY --chown=node:node packages/data-schemas/package.json ./packages/data-schemas/package.json
 COPY --chown=node:node packages/api/package.json ./packages/api/package.json
+COPY --chown=node:node vendor/code ./vendor/code
+COPY --chown=node:node packages/chat/package.json ./packages/chat/package.json
 
 RUN \
     # Allow mounting of these files, which have no default
@@ -60,15 +62,15 @@ RUN \
 
 COPY --chown=node:node . .
 
+ARG VITE_MCP_SANDBOX_URL=
 RUN \
     # Export NODE_OPTIONS so the memory limit is inherited by every npm
-    # subprocess — including the nested `vite build` inside client/ — not
-    # just the outer npm run frontend process. Use && so a failed build
-    # aborts the image immediately instead of producing a broken container.
+    # subprocess, including the nested vite build inside client/. Use && so a
+    # failed build aborts the image immediately.
     export NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE}" && \
     npm run frontend && \
     test -f client/dist/index.html && \
-    npm prune --production && \
+    npm prune --omit=dev --no-audit --no-fund && \
     npm cache clean --force
 
 # Optional build metadata surfaced in Settings -> About for support triage.

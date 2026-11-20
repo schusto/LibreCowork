@@ -58,19 +58,14 @@ const ASK_USER_QUESTION_DESCRIPTION = [
  * `askUserQuestions()` unchanged, so this schema is the wire shape inside the
  * pending-action payload.
  */
-const askUserQuestionItemSchema: z.ZodObject<
-  {
-    id: z.ZodString;
-    header: z.ZodOptional<z.ZodString>;
-    question: z.ZodString;
-    description: z.ZodOptional<z.ZodString>;
-    options: z.ZodOptional<
-      z.ZodArray<z.ZodObject<{ label: z.ZodString; value: z.ZodString }, 'strip'>, 'many'>
-    >;
-    multiSelect: z.ZodOptional<z.ZodBoolean>;
-  },
-  'strip'
-> = z.object({
+const askUserQuestionItemSchema: z.ZodObject<{
+  id: z.ZodString;
+  header: z.ZodOptional<z.ZodString>;
+  question: z.ZodString;
+  description: z.ZodOptional<z.ZodString>;
+  options: z.ZodOptional<z.ZodArray<z.ZodObject<{ label: z.ZodString; value: z.ZodString }>>>;
+  multiSelect: z.ZodOptional<z.ZodBoolean>;
+}> = z.object({
   id: z
     .string()
     .regex(ASK_USER_QUESTION_ID_PATTERN)
@@ -117,7 +112,7 @@ const askUserQuestionItemSchema: z.ZodObject<
     .describe('Allow the user to pick several options; their values are returned joined by ", ".'),
 });
 
-const askUserQuestionsArraySchema: z.ZodEffects<z.ZodArray<typeof askUserQuestionItemSchema>> = z
+const askUserQuestionsArraySchema: z.ZodArray<typeof askUserQuestionItemSchema> = z
   .array(askUserQuestionItemSchema)
   .min(1)
   .max(MAX_ASK_USER_QUESTIONS)
@@ -131,10 +126,9 @@ const askUserQuestionsArraySchema: z.ZodEffects<z.ZodArray<typeof askUserQuestio
 
 const legacyAskUserQuestionToolSchema = askUserQuestionItemSchema.omit({ id: true, header: true });
 
-export const askUserQuestionToolSchema: z.ZodObject<
-  { questions: typeof askUserQuestionsArraySchema },
-  'strip'
-> = z.object({
+export const askUserQuestionToolSchema: z.ZodObject<{
+  questions: typeof askUserQuestionsArraySchema;
+}> = z.object({
   questions: askUserQuestionsArraySchema,
 });
 
@@ -292,6 +286,42 @@ export const AskUserQuestionToolDefinition: AskUserQuestionToolDefinitionShape =
  * from the top on the resume pass, and sibling tools in the same batch re-execute —
  * which is why the description forbids parallel calls.
  */
+/**
+ * [cowork] Normalize provider-side argument envelopes to the plain questions
+ * object before validation. Observed live (v0.8.9, custom endpoint): some
+ * providers echo the whole invocation back as `{ id, name, args }` with
+ * `args` a JSON string; LangChain then validated that envelope verbatim and
+ * rejected EVERY inner shape at `at questions`. Unwrap up to three layers of
+ * envelope/string encoding; leave any other value untouched so genuinely
+ * malformed inputs still surface their real error.
+ */
+function unwrapAskUserQuestionArgs(raw: unknown): unknown {
+  let candidate: unknown = raw;
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (typeof candidate === 'string') {
+      const text = candidate.trim();
+      if (!text.startsWith('{')) {
+        break;
+      }
+      try {
+        candidate = JSON.parse(text);
+      } catch {
+        break;
+      }
+      continue;
+    }
+    if (candidate !== null && typeof candidate === 'object' && 'args' in candidate) {
+      const record = candidate as Record<string, unknown>;
+      if ('name' in record || 'type' in record || 'id' in record) {
+        candidate = record.args;
+        continue;
+      }
+    }
+    break;
+  }
+  return candidate;
+}
+
 export function createAskUserQuestionTool(
   validationErrorsByToolCallId?: Map<string, ToolInputValidationError>,
 ): DynamicStructuredTool<typeof askUserQuestionToolSchema> {
@@ -327,15 +357,18 @@ export function createAskUserQuestionTool(
   const invoke = askTool.invoke.bind(askTool);
   askTool.invoke = (async (input, config) => {
     try {
-      const candidate =
-        typeof input === 'object' && input != null && 'args' in input ? input.args : input;
+      /** [cowork] The previous code validated the unwrapped candidate but
+       *  re-invoked with the RAW envelope, so a well-formed nested request
+       *  wrapped by the provider still failed schema validation. Both tool
+       *  variants now receive the normalized payload. */
+      const candidate = unwrapAskUserQuestionArgs(input);
       if (legacyAskUserQuestionToolSchema.safeParse(candidate).success) {
         return await legacyAskTool.invoke(
-          input as unknown as Parameters<typeof legacyAskTool.invoke>[0],
+          candidate as unknown as Parameters<typeof legacyAskTool.invoke>[0],
           config,
         );
       }
-      return await invoke(input, config);
+      return await invoke(candidate as Parameters<typeof askTool.invoke>[0], config);
     } catch (error) {
       const toolCallId =
         typeof input === 'object' && input != null && 'id' in input ? input.id : undefined;

@@ -29,9 +29,11 @@ const openapi = require('./openapi');
 const search = require('./search');
 const models = require('./models');
 const convos = require('./convos');
+const pullRequests = require('./pullRequests');
 const traces = require('./traces');
 const config = require('./config');
 const agents = require('./agents');
+const channels = require('./channels');
 const roles = require('./roles');
 const oauth = require('./oauth');
 const files = require('./files');
@@ -47,6 +49,7 @@ const tasks = require('./tasks'); // [cowork] scoped task-list store (/api/tasks
 
 module.exports = {
   tasks, // [cowork] scoped task-list store
+  pullRequests,
   insights,
   rum,
   mcp,
@@ -73,6 +76,7 @@ module.exports = {
   banner,
   openapi,
   agents,
+  channels,
   convos,
   traces,
   search,

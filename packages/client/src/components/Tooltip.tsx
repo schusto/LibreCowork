@@ -2,6 +2,7 @@ import {
   memo,
   forwardRef,
   useCallback,
+  useLayoutEffect,
   useMemo,
   RefAttributes,
   ForwardRefExoticComponent,
@@ -9,16 +10,21 @@ import {
 import DOMPurify from 'dompurify';
 import * as Ariakit from '@ariakit/react';
 import { AnimatePresence, motion } from 'framer-motion';
+import type { FocusOutline } from './Focus';
 import { useDialogDepth, usePopoverZIndex } from './OriginalDialog';
-import { cn } from '~/utils';
+import { focusOutlineVariants } from './Focus';
+import { cn, resolveSide } from '~/utils';
 import './Tooltip.css';
 
 interface TooltipAnchorProps extends Ariakit.TooltipAnchorProps {
+  focusOutline?: FocusOutline;
   role?: string;
   className?: string;
   description: string;
   enableHTML?: boolean;
   portalElement?: Ariakit.TooltipProps['portalElement'];
+  /** Overrides the popup's z-index, for anchors inside a host layer above the default. */
+  zIndex?: number;
   side?: 'top' | 'bottom' | 'left' | 'right';
 }
 
@@ -31,11 +37,13 @@ const TooltipPopup = memo(function TooltipPopup({
   description,
   enableHTML,
   portalElement,
+  zIndex,
 }: {
   store: Ariakit.TooltipStore;
   description: string;
   enableHTML: boolean;
   portalElement?: Ariakit.TooltipProps['portalElement'];
+  zIndex?: number;
 }) {
   const mounted = Ariakit.useStoreState(store, (state) => state.mounted);
   const placement = Ariakit.useStoreState(store, (state) => state.placement);
@@ -44,6 +52,7 @@ const TooltipPopup = memo(function TooltipPopup({
    * the stylesheet default so tooltips never outrank freshly opened dialogs. */
   const dialogDepth = useDialogDepth();
   const popoverZIndex = usePopoverZIndex();
+  const resolvedZIndex = zIndex ?? (dialogDepth > 0 ? popoverZIndex : undefined);
 
   const sanitizer = useMemo(() => {
     const instance = DOMPurify();
@@ -99,7 +108,7 @@ const TooltipPopup = memo(function TooltipPopup({
           className="tooltip"
           render={
             <motion.div
-              style={dialogDepth > 0 ? { zIndex: popoverZIndex } : undefined}
+              style={resolvedZIndex != null ? { zIndex: resolvedZIndex } : undefined}
               initial={{ opacity: 0, x, y }}
               animate={{ opacity: 1, x: 0, y: 0 }}
               exit={{ opacity: 0, x, y }}
@@ -129,9 +138,11 @@ export const TooltipAnchor: ForwardRefExoticComponent<
     description,
     side = 'top',
     className,
+    focusOutline,
     role,
     enableHTML = false,
     portalElement,
+    zIndex,
     onKeyDown,
     tabIndex,
     ...props
@@ -139,6 +150,18 @@ export const TooltipAnchor: ForwardRefExoticComponent<
   ref,
 ) {
   const tooltip = Ariakit.useTooltipStore({ placement: side });
+
+  /** `side` is physical; resolve it against the anchor's own direction so `right` stays the
+   *  inline-end side in an RTL layout without every caller having to know. The selector re-runs
+   *  on every store change, opening included, so a language switch that flips the direction
+   *  without remounting is still picked up. Selecting the resolved side, not the anchor element,
+   *  keeps each anchor to one render on mount: message rows mount hundreds of them at once. */
+  const placement = Ariakit.useStoreState(tooltip, (state) =>
+    resolveSide(side, state.anchorElement),
+  );
+  useLayoutEffect(() => {
+    tooltip.setState('placement', placement);
+  }, [tooltip, placement]);
 
   /**
    * `role="button"` renders a plain element with no native activation, so Enter and
@@ -177,13 +200,14 @@ export const TooltipAnchor: ForwardRefExoticComponent<
         role={role}
         tabIndex={resolvedTabIndex}
         onKeyDown={handleKeyDown}
-        className={cn('cursor-pointer', className)}
+        className={cn('cursor-pointer', focusOutlineVariants({ focusOutline }), className)}
       />
       <TooltipPopup
         store={tooltip}
         description={description}
         enableHTML={enableHTML}
         portalElement={portalElement}
+        zIndex={zIndex}
       />
     </Ariakit.TooltipProvider>
   );

@@ -335,6 +335,10 @@ export type TTokenUsageEvent = {
   total_tokens?: number;
   input_token_details?: {
     cache_creation?: number;
+    /** Subset of `cache_creation` written to Anthropic's 1-hour cache */
+    cache_creation_1h?: number;
+    /** Subset of `cache_creation` written to OpenAI's 12-hour cache */
+    cache_creation_12h?: number;
     cache_read?: number;
   };
   model?: string;
@@ -540,7 +544,7 @@ export const reconcileContextUsageFromEvent = (
   cacheWrite: finiteNonNegativeInteger(event.input_token_details?.cache_creation) ?? 0,
 });
 
-/** Lifecycle phase carried on subagent-progress envelopes (mirrors SDK SubagentUpdatePhase). */
+/** SDK lifecycle phases plus host-authored applied-guidance boundaries. */
 export type SubagentUpdatePhase =
   | 'start'
   | 'run_step'
@@ -552,7 +556,8 @@ export type SubagentUpdatePhase =
   | 'message_delta'
   | 'reasoning_delta'
   | 'stop'
-  | 'error';
+  | 'error'
+  | 'steer_applied';
 
 /** Structured root-to-leaf identity for one nested subagent execution. */
 export interface SubagentAncestryEntry {
@@ -577,6 +582,8 @@ export interface SubagentUpdateEvent {
   activityEventId?: string;
   /** Host-assigned monotonic sequence within one detached child run. */
   activitySequence?: number;
+  /** Host omission marker, counted only when its event is folded. */
+  activityDroppedCount?: number;
   /** Parent-side `tool_call_id` for the `subagent` tool invocation that
    *  triggered this run. Surfaces from the SDK (`3.1.67-dev.2`+) so hosts
    *  can correlate child progress to the parent tool call deterministically. */

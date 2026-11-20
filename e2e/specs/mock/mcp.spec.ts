@@ -17,6 +17,8 @@ import {
 } from './helpers';
 
 const MCP_SERVER_NAME = 'e2e-memory';
+/** The Tool Library and the agent's tool rows label the server by its config `title`. */
+const MCP_SERVER_TITLE = 'E2E Memory';
 const MCP_TOOL_NAME = 'remember_fact';
 const MCP_SERVER_TOOL_ID = `sys__server__sys_mcp_${MCP_SERVER_NAME}`;
 const MCP_TOOL_ID = `${MCP_TOOL_NAME}_mcp_${MCP_SERVER_NAME}`;
@@ -65,7 +67,9 @@ async function addMCPServerTools(page: Page, form: Locator) {
   await expect(dialog).toBeVisible();
 
   await dialog.getByRole('textbox', { name: 'Search tools…' }).fill(MCP_SERVER_NAME);
-  const serverCard = dialog.getByRole('button', { name: new RegExp(MCP_SERVER_NAME) }).first();
+  const serverCard = dialog
+    .getByRole('button', { name: new RegExp(`^${MCP_SERVER_TITLE}\\b`) })
+    .first();
   await expect(serverCard).toBeVisible();
 
   await serverCard.click();
@@ -73,11 +77,11 @@ async function addMCPServerTools(page: Page, form: Locator) {
 
   await dialog.getByRole('button', { name: /^Close( dialog)?$/ }).click();
   await expect(dialog).toBeHidden();
-  await expect(form.getByText(MCP_SERVER_NAME, { exact: true })).toBeVisible();
+  await expect(form.getByText(MCP_SERVER_TITLE, { exact: true })).toBeVisible();
 }
 
 async function expectSelectedMCPServerTools(form: Locator) {
-  await expect(form.getByText(MCP_SERVER_NAME, { exact: true })).toBeVisible();
+  await expect(form.getByText(MCP_SERVER_TITLE, { exact: true })).toBeVisible();
 }
 
 test.describe('agent builder MCP tools', () => {
@@ -93,7 +97,7 @@ test.describe('agent builder MCP tools', () => {
 
       await form.getByLabel('Agent name').fill(agentName);
       await form.getByLabel('Agent description').fill(DESCRIPTION);
-      await form.getByLabel('Instructions').fill(INSTRUCTIONS);
+      await form.getByRole('textbox', { name: 'Instructions', exact: true }).fill(INSTRUCTIONS);
       await selectMockModel(page, true);
 
       await addMCPServerTools(page, form);
@@ -136,7 +140,9 @@ test.describe('agent builder MCP tools', () => {
 
       await expect(reopenedForm.getByLabel('Agent name')).toHaveValue(agentName);
       await expect(reopenedForm.getByLabel('Agent description')).toHaveValue(DESCRIPTION);
-      await expect(reopenedForm.getByLabel('Instructions')).toHaveValue(INSTRUCTIONS);
+      await expect(
+        reopenedForm.getByRole('textbox', { name: 'Instructions', exact: true }),
+      ).toHaveValue(INSTRUCTIONS);
       await expectSelectedMCPServerTools(reopenedForm);
 
       await reopenedForm.getByRole('button', { name: 'Select Agent' }).click();

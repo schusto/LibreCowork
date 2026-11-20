@@ -53,8 +53,6 @@ services:
       - "8443:8443"   # HTTPS bundler proxy (sandpack)
       - "8444:8444"   # HTTPS Hermes dashboard (sidecar)
       - "127.0.0.1:8933:8933"   # playwright-mcp proxy (Host-header rewrite)
-      - "8445:8445"             # HTTPS Open Notebook UI (sidecar)
-      - "8446:8446"             # HTTPS Open Notebook REST API (sidecar)
       - "8447:8447"             # HTTPS LM Studio proxy (local dev — Office add-ins)
     depends_on:
       - sandpack-bundler
@@ -71,10 +69,6 @@ services:
       - type: bind
         source: /Users/erik/proj/cowork/hermes/nginx/hermes-dashboard.conf
         target: /etc/nginx/conf.d/hermes-dashboard.conf
-        read_only: true
-      - type: bind
-        source: /Users/erik/proj/cowork/OpenNotebook/nginx/opennotebook.conf
-        target: /etc/nginx/conf.d/opennotebook.conf
         read_only: true
       - type: bind
         source: ./nginx/playwright-proxy.conf
@@ -119,6 +113,12 @@ services:
         source: /Users/erik/agent-controls/policy
         target: /agent-controls/policy
         read_only: true
+      # Seatbelt access modes (P4): the tool-approval hook reads the per-conversation mode records and modes.json to gate web tools per mode.
+      # Read-only; contains no secrets (grants, mode records, hidden list, egress allowlist).
+      - type: bind
+        source: /Users/erik/agent-controls/seatbelt/policy
+        target: /agent-controls/seatbelt-policy
+        read_only: true
       - type: bind
         source: /Users/erik/proj
         target: /Users/erik/proj
@@ -130,7 +130,7 @@ services:
         source: /Users/erik/proj/cowork/uploads
         target: /app/uploads
       - type: bind
-        source: /Users/erik/proj/cowork/LibreCowork/images
+        source: /Users/erik/proj/cowork/LibreChat/images
         target: /app/client/public/images
       - type: bind
         source: /Users/erik/proj/cowork/certs
@@ -144,6 +144,11 @@ services:
       # [cowork] Stale-running-job failsafe (inactivity, ms). Upstream default 20 min reaped long
       # cold prefills as "Generation timed out". 6 h for unattended runs; 0 disables.
       - CWK_STALE_JOB_TIMEOUT_MS=21600000
+      # [cowork] Since v0.8.9 these two REPLACE our hand-rolled `server.requestTimeout = 0`
+      # (api/server/index.js). Upstream-native configureServerTimeouts() reads them; 0 disables.
+      # Long SSE streams survive model prefill only while both stay 0. Inert on the old image.
+      - HTTP_REQUEST_TIMEOUT_MS=0
+      - HTTP_HEADERS_TIMEOUT_MS=0
       - MEILI_HOST=http://meilisearch:7700
       # TLS is terminated by cowork-proxy (nginx); the Node app stays plain HTTP.
       # [cowork] Context reduction — set to 'false' to disable all reduction for testing

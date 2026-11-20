@@ -13,6 +13,8 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 jest.mock('~/models', () => ({
   getUserKeyValues: jest.fn(),
+  initializeMessageBudget: jest.fn(),
+  initializeChannelStorageConfig: jest.fn(),
 }));
 
 const exampleConfig = {

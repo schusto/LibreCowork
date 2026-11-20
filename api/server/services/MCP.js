@@ -3,6 +3,7 @@ const { logger, getTenantId } = require('@librechat/data-schemas');
 const { Providers, Constants: AgentConstants } = require('@librechat/agents');
 const {
   sendEvent,
+  createMCPToolApprovalMetadata,
   PENDING_STALE_MS,
   MCPOAuthHandler,
   MCPTokenStorage,
@@ -21,13 +22,15 @@ const {
   GenerationJobManager,
   resolveJsonSchemaRefs,
   sanitizeGeminiSchema,
-  buildMCPAuthStepId,
-  buildMCPAuthToolCall,
   processMCPEnv,
+  createAgentMCPTool,
   preProcessGraphTokens,
-  buildMCPAuthRunStepEvent,
-  buildMCPAuthRunStepDeltaEvent,
-  buildMCPAuthRunStepEndDeltaEvent,
+  createMCPReauthenticationPrompt,
+  createMCPInitializationOAuthPrompts,
+  createMCPAuthStepEmitter,
+  createMCPAuthDeltaEmitter,
+  createMCPAuthEndEmitter,
+  createOAuthCallback,
   isUserSourced,
   hasCustomUserVars,
   checkAccessWithRequestCache,
@@ -42,11 +45,20 @@ const {
   isOAuthServer,
   isAbortError,
   isDirectOpenIDBearerRecoveryEnabled,
+  bindScheduledMCPBearerInvocation,
+  createMCPPermissionDeniedError,
+  createMCPStructuredTool,
   buildMCPDomainValidationConfig,
   OpenIDReauthRequiredError,
   MCPAuthenticationRefreshError,
   MCPAuthenticationRejectedError,
+  ScheduledMCPBearerError,
   prepareMCPAuthorizationMutation,
+  resolveMCPClientCapabilityProfile,
+  getMCPConnectionPoolKey,
+  getMCPUserConnectionPoolKey,
+  bindScheduledMCPInvocation,
+  ScheduledMCPPolicyError,
 } = require('@librechat/api');
 const {
   Time,
@@ -54,7 +66,7 @@ const {
   Constants,
   Permissions,
   PermissionTypes,
-  isAssistantsEndpoint,
+  resolveMCPAppsPolicy,
 } = require('librechat-data-provider');
 const {
   getOAuthReconnectionManager,
@@ -414,6 +426,17 @@ async function healMcpToolNames({ req, tools, toolDefinitions, accessibleServerN
 async function getAssistantToolDefinitions({ req, res, tools }) {
   const registry = getMCPServersRegistry();
   const appConfig = await getAppConfigForRequest(req);
+  const mcpApps = resolveMCPAppsPolicy(
+    appConfig?.mcpSettings?.apps,
+    undefined,
+    appConfig?.mcpAppSandbox?.maxPersistedAppBytes,
+    appConfig?.mcpAppSandbox?.maxAdmissionRequestsPerMinute,
+    appConfig?.mcpAppSandbox?.url,
+    appConfig?.mcpAppSandbox?.maxActiveViews,
+    appConfig?.mcpAppSandbox?.maxActionPreviewChars,
+    appConfig?.mcpAppSandbox?.operationLimits,
+  );
+  const capabilityProfile = resolveMCPClientCapabilityProfile(mcpApps);
   const oboIdentityContext = createAuthIdentityContext({
     user: req.user,
     tenantId: getTenantId(),
@@ -436,14 +459,13 @@ async function getAssistantToolDefinitions({ req, res, tools }) {
       ensureConfigServers: (mcpConfig) => registry.ensureConfigServers(mcpConfig),
       getAllServerConfigs: (userId, configServers, role) =>
         registry.getAllServerConfigs(userId, configServers, role),
-      getMCPServerTools,
+      getMCPServerTools: (userId, serverName, serverConfig) =>
+        getMCPServerTools(userId, serverName, serverConfig, capabilityProfile),
       getServerToolFunctionsSnapshot: async (userId, serverName, serverConfig, options) =>
-        (await getMCPManager()?.getServerToolFunctionsSnapshot(
-          userId,
-          serverName,
-          serverConfig,
-          options,
-        )) ?? {
+        (await getMCPManager()?.getServerToolFunctionsSnapshot(userId, serverName, serverConfig, {
+          ...options,
+          capabilityProfile,
+        })) ?? {
           tools: null,
         },
       recoverServerTools: async (serverName, serverConfig) => {
@@ -460,10 +482,11 @@ async function getAssistantToolDefinitions({ req, res, tools }) {
           upstreamTokenProvider,
           oboIdentityContext,
           recoveryPolicy: appConfig?.mcpSettings?.catalogRecovery,
+          mcpApps,
         });
         return result?.availableTools ?? null;
       },
-      cacheMCPServerTools,
+      cacheMCPServerTools: (params) => cacheMCPServerTools({ ...params, capabilityProfile }),
     },
   );
 }
@@ -527,11 +550,12 @@ async function resolveAllMcpConfigs(userId, user) {
   } catch {
     logger.warn('[resolveAllMcpConfigs] Config server resolution failed; continuing without');
   }
+  const lookup = { idOnTheSource: user?.idOnTheSource };
   if (user?.role) {
-    return await registry.getAllServerConfigs(userId, configServers, user.role);
+    return await registry.getAllServerConfigs(userId, configServers, user.role, lookup);
   }
 
-  return await registry.getAllServerConfigs(userId, configServers);
+  return await registry.getAllServerConfigs(userId, configServers, undefined, lookup);
 }
 
 /**
@@ -615,22 +639,8 @@ function isEmptyObjectSchema(jsonSchema) {
  * @param {string | null} [params.streamId] - The stream ID for resumable mode.
  * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  */
-function createRunStepDeltaEmitter({ res, stepId, toolCall, streamId = null, jobCreatedAt }) {
-  /**
-   * @param {string} authURL - The URL to redirect the user for OAuth authentication.
-   * @param {{ expiresAt?: number }} [options]
-   * @returns {Promise<void>}
-   */
-  return async function (authURL, options) {
-    const eventData = buildMCPAuthRunStepDeltaEvent({ authURL, stepId, toolCall, options });
-    if (streamId) {
-      await GenerationJobManager.emitChunk(streamId, eventData, {
-        expectedCreatedAt: jobCreatedAt,
-      });
-    } else {
-      sendEvent(res, eventData);
-    }
-  };
+function createRunStepDeltaEmitter(options) {
+  return createMCPAuthDeltaEmitter({ ...options, sendEvent, jobs: GenerationJobManager, logger });
 }
 
 /**
@@ -644,25 +654,8 @@ function createRunStepDeltaEmitter({ res, stepId, toolCall, streamId = null, job
  * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  * @returns {() => Promise<void>}
  */
-function createRunStepEmitter({
-  res,
-  runId,
-  stepId,
-  toolCall,
-  index,
-  streamId = null,
-  jobCreatedAt,
-}) {
-  return async function () {
-    const eventData = buildMCPAuthRunStepEvent({ runId, stepId, toolCall, index });
-    if (streamId) {
-      await GenerationJobManager.emitChunk(streamId, eventData, {
-        expectedCreatedAt: jobCreatedAt,
-      });
-    } else {
-      sendEvent(res, eventData);
-    }
-  };
+function createRunStepEmitter(options) {
+  return createMCPAuthStepEmitter({ ...options, sendEvent, jobs: GenerationJobManager, logger });
 }
 
 /**
@@ -718,18 +711,8 @@ function createOAuthStart({ flowId, flowManager, callback }) {
  * @param {string | null} [params.streamId] - The stream ID for resumable mode.
  * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  */
-function createOAuthEnd({ res, stepId, toolCall, streamId = null, jobCreatedAt }) {
-  return async function () {
-    const eventData = buildMCPAuthRunStepEndDeltaEvent({ stepId, toolCall });
-    if (streamId) {
-      await GenerationJobManager.emitChunk(streamId, eventData, {
-        expectedCreatedAt: jobCreatedAt,
-      });
-    } else {
-      sendEvent(res, eventData);
-    }
-    logger.debug('Sent OAuth login success to client');
-  };
+function createOAuthEnd(options) {
+  return createMCPAuthEndEmitter({ ...options, sendEvent, jobs: GenerationJobManager, logger });
 }
 
 /**
@@ -738,12 +721,6 @@ function createOAuthEnd({ res, stepId, toolCall, streamId = null, jobCreatedAt }
  * @param {(authURL: string, options?: { expiresAt?: number }) => Promise<void>} params.runStepDeltaEmitter
  * @returns {(authURL: string, options?: { expiresAt?: number }) => Promise<void>}
  */
-function createOAuthCallback({ runStepEmitter, runStepDeltaEmitter }) {
-  return async function (authURL, options) {
-    await runStepEmitter();
-    await runStepDeltaEmitter(authURL, options);
-  };
-}
 
 function resolveToolCallUserId({ effectiveUser, capturedUser, invocationUserId, serverConfig }) {
   const identityBoundCredential =
@@ -784,6 +761,7 @@ function resolveToolCallUserId({ effectiveUser, capturedUser, invocationUserId, 
  * @param {Record<string, Record<string, string>>} [params.userMCPAuthMap]
  * @param {import('@librechat/api').RequestScopedMCPConnectionStore} [params.requestScopedConnections]
  * @param {import('@librechat/api').ParsedServerConfig} [params.serverConfig] - Used to bypass reconnect throttling for request-scoped servers.
+ * @param {import('librechat-data-provider').TMCPAppsPolicy} [params.mcpApps]
  * @returns { Promise<Array<typeof tool | { _call: (toolInput: Object | string) => unknown}>> } An object with `_call` method to execute the tool input.
  */
 async function reconnectServer({
@@ -802,8 +780,11 @@ async function reconnectServer({
   oboIdentityContext,
   streamId = null,
   jobCreatedAt,
+  unattended,
   recoveryPolicy,
+  mcpApps,
 }) {
+  const capabilityProfile = resolveMCPClientCapabilityProfile(mcpApps);
   logger.debug('[MCP][reconnectServer] Starting reconnect', {
     userId: user?.id,
     hasUserMCPAuthMap: Boolean(userMCPAuthMap),
@@ -813,7 +794,7 @@ async function reconnectServer({
   // would stub out healthy tools for messages sent within the throttle window.
   const requestScoped = serverConfig ? requiresEphemeralUserConnection(serverConfig) : false;
   if (!requestScoped) {
-    const throttleKey = `${user.id}:${serverName}`;
+    const throttleKey = getMCPUserConnectionPoolKey(user.id, serverName, capabilityProfile);
     const now = Date.now();
     const lastAttempt = lastReconnectAttempts.get(throttleKey) ?? 0;
     if (now - lastAttempt < RECONNECT_THROTTLE_MS) {
@@ -824,58 +805,49 @@ async function reconnectServer({
     evictStale(lastReconnectAttempts, RECONNECT_THROTTLE_MS);
   }
 
-  const runId = Constants.USE_PRELIM_RESPONSE_MESSAGE_ID;
   const flowId = `${user.id}:${serverName}:${Date.now()}`;
   const flowManager = getFlowStateManager(getLogStores(CacheKeys.FLOWS));
-  const stepId = buildMCPAuthStepId(serverName);
-  const toolCall = buildMCPAuthToolCall({
-    id: flowId,
-    serverName,
-  });
-
-  const runStepEmitter = createRunStepEmitter({
+  const oauthPrompt = createMCPInitializationOAuthPrompts({
+    userId: user.id,
     res,
-    index,
-    runId,
-    stepId,
-    toolCall,
+    sendEvent,
+    jobs: GenerationJobManager,
     streamId,
     jobCreatedAt,
-  });
-  const runStepDeltaEmitter = createRunStepDeltaEmitter({
-    res,
-    stepId,
-    toolCall,
-    streamId,
-    jobCreatedAt,
-  });
-  const callback = createOAuthCallback({ runStepEmitter, runStepDeltaEmitter });
+    unattended,
+    logger,
+  }).forServer(serverName, index);
   const oauthStart = createOAuthStart({
     res,
     flowId,
-    callback,
+    callback: oauthPrompt.start,
     flowManager,
   });
-  return await reinitMCPServer({
-    user,
-    signal,
-    serverName,
-    configServers,
-    oauthStart,
-    flowManager,
-    userMCPAuthMap,
-    requestBody,
-    requestScopedConnections,
-    upstreamTokenProvider,
-    upstreamTokenProviderResolver,
-    recoveryPolicy,
-    oboIdentityContext,
-    streamId,
-    jobCreatedAt,
-    forceNew: true,
-    returnOnOAuth: false,
-    connectionTimeout: Time.THIRTY_SECONDS,
-  });
+  return await oauthPrompt.run(() =>
+    reinitMCPServer({
+      user,
+      signal,
+      serverName,
+      configServers,
+      oauthStart,
+      oauthEnd: oauthPrompt.end,
+      flowManager,
+      userMCPAuthMap,
+      requestBody,
+      requestScopedConnections,
+      upstreamTokenProvider,
+      upstreamTokenProviderResolver,
+      recoveryPolicy,
+      mcpApps,
+      oboIdentityContext,
+      streamId,
+      jobCreatedAt,
+      unattended,
+      forceNew: true,
+      returnOnOAuth: false,
+      connectionTimeout: Time.THIRTY_SECONDS,
+    }),
+  );
 }
 
 /**
@@ -902,9 +874,15 @@ async function reconnectServer({
  * @param {import('@librechat/api').UpstreamTokenProvider} [params.upstreamTokenProvider] - Live upstream-token closure for OBO, built at the request boundary.
  * @param {import('@librechat/api').UpstreamTokenProviderResolver} [params.upstreamTokenProviderResolver]
  * @param {import('@librechat/api').AuthIdentityContext} [params.oboIdentityContext] - Non-template-visible OBO identity context built from the real request user.
+ * @param {import('librechat-data-provider').TMCPAppsPolicy} [params.mcpApps] - Request-admitted MCP Apps policy.
  * @returns { Promise<Array<typeof tool | { _call: (toolInput: Object | string) => unknown}>> } An object with `_call` method to execute the tool input.
  */
-async function createMCPTools({
+function createMCPTools(params) {
+  return createAgentMCPTool(params, createMCPToolsImpl);
+}
+
+async function createMCPToolsImpl({
+  agentId,
   res,
   mcpPermissionContext,
   user,
@@ -920,12 +898,23 @@ async function createMCPTools({
   upstreamTokenProvider,
   upstreamTokenProviderResolver,
   oboIdentityContext,
+  mcpApps,
   streamId = null,
   jobCreatedAt,
+  unattended,
 }) {
   let recoveryPolicy;
   const serverConfig =
-    config ?? (await getMCPServersRegistry().getServerConfig(serverName, user?.id, configServers));
+    config ??
+    (await getMCPServersRegistry().getServerConfig(
+      serverName,
+      user?.id,
+      configServers,
+      user?.role,
+      {
+        idOnTheSource: user?.idOnTheSource,
+      },
+    ));
 
   if (serverConfig?.url) {
     const appConfig = await getAppConfig({
@@ -967,7 +956,9 @@ async function createMCPTools({
     oboIdentityContext,
     streamId,
     jobCreatedAt,
+    unattended,
     recoveryPolicy,
+    mcpApps,
   });
   if (result === null) {
     logger.debug('[MCP] Reconnect throttled; skipping tool creation');
@@ -986,6 +977,7 @@ async function createMCPTools({
   );
   for (const tool of result.tools) {
     const toolInstance = await createMCPTool({
+      agentId,
       res,
       mcpPermissionContext,
       user,
@@ -994,6 +986,7 @@ async function createMCPTools({
       configServers,
       streamId,
       jobCreatedAt,
+      unattended,
       recoveryPolicy,
       availableTools: result.availableTools,
       serverName,
@@ -1005,6 +998,7 @@ async function createMCPTools({
       upstreamTokenProvider,
       upstreamTokenProviderResolver,
       oboIdentityContext,
+      mcpApps,
       config: serverConfig,
     });
     if (toolInstance) {
@@ -1035,12 +1029,19 @@ async function createMCPTools({
  * @param {import('@librechat/api').UpstreamTokenProvider} [params.upstreamTokenProvider] - Live upstream-token closure for OBO, built at the request boundary.
  * @param {import('@librechat/api').UpstreamTokenProviderResolver} [params.upstreamTokenProviderResolver]
  * @param {import('@librechat/api').AuthIdentityContext} [params.oboIdentityContext] - Non-template-visible OBO identity context built from the real request user.
+ * @param {import('librechat-data-provider').TMCPAppsPolicy} [params.mcpApps] - Request-admitted MCP Apps policy.
  * @param {string} [params.serverName] - Resolved raw MCP server name from tool loading.
  * @param {(availableTools: LCAvailableTools) => void} [params.onAvailableTools]
  * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  * @returns { Promise<typeof tool | { _call: (toolInput: Object | string) => unknown}> } An object with `_call` method to execute the tool input.
  */
-async function createMCPTool({
+function createMCPTool(params) {
+  return createAgentMCPTool(params, createMCPToolImpl);
+}
+
+async function createMCPToolImpl({
+  invokeTool,
+  agentId,
   res,
   mcpPermissionContext,
   user,
@@ -1057,12 +1058,15 @@ async function createMCPTool({
   upstreamTokenProvider,
   upstreamTokenProviderResolver,
   oboIdentityContext,
+  mcpApps,
   serverName: resolvedServerName,
   onAvailableTools,
   streamId = null,
   jobCreatedAt,
+  unattended,
   recoveryPolicy,
 }) {
+  const capabilityProfile = resolveMCPClientCapabilityProfile(mcpApps);
   /** `loadTools` already resolved the server for this key; parsing is the fallback. */
   const [parsedToolName, parsedServerName] = splitMCPToolKey(
     toolKey,
@@ -1076,8 +1080,16 @@ async function createMCPTool({
   let serverName = resolvedServerName ?? parsedServerName;
   const toolName = parsedToolName;
 
+  const lookup = { idOnTheSource: user?.idOnTheSource };
   let serverConfig =
-    config ?? (await getMCPServersRegistry().getServerConfig(serverName, user?.id, configServers));
+    config ??
+    (await getMCPServersRegistry().getServerConfig(
+      serverName,
+      user?.id,
+      configServers,
+      user?.role,
+      lookup,
+    ));
   /** DIRECT-FIRST alias fallback: only when the parsed name resolves to no
    *  server is it treated as the normalized spelling of a raw config name —
    *  a user-DB server named like an operator server's normalized form must
@@ -1091,6 +1103,8 @@ async function createMCPTool({
         aliasedName,
         user?.id,
         configServers,
+        user?.role,
+        lookup,
       );
       if (serverConfig) {
         serverName = aliasedName;
@@ -1099,6 +1113,7 @@ async function createMCPTool({
   }
   const requestScopedTools = serverConfig ? requiresEphemeralUserConnection(serverConfig) : false;
   const useMissingToolCache = !requestScopedTools;
+  const missingToolCacheKey = getMCPConnectionPoolKey(toolKey, capabilityProfile);
 
   if (serverConfig?.url) {
     const appConfig = await getAppConfig({
@@ -1170,7 +1185,7 @@ async function createMCPTool({
   let toolEntry = findToolEntry(availableTools);
   if (!toolEntry) {
     rememberServerTools(serverName, availableTools);
-    const cachedAt = useMissingToolCache ? missingToolCache.get(toolKey) : undefined;
+    const cachedAt = useMissingToolCache ? missingToolCache.get(missingToolCacheKey) : undefined;
     if (cachedAt && Date.now() - cachedAt < MISSING_TOOL_TTL_MS) {
       logger.debug('[MCP] Tool is in negative cache; returning unavailable stub');
       return createUnavailableToolStub(toolName, serverName);
@@ -1193,7 +1208,9 @@ async function createMCPTool({
       oboIdentityContext,
       streamId,
       jobCreatedAt,
+      unattended,
       ...(recoveryPolicy && { recoveryPolicy }),
+      mcpApps,
     });
     if (result?.availableTools) {
       onAvailableTools?.(result.availableTools);
@@ -1202,7 +1219,7 @@ async function createMCPTool({
     toolEntry = findToolEntry(result?.availableTools);
 
     if (!toolEntry && useMissingToolCache) {
-      missingToolCache.set(toolKey, Date.now());
+      missingToolCache.set(missingToolCacheKey, Date.now());
       evictStale(missingToolCache, MISSING_TOOL_TTL_MS);
     }
   }
@@ -1215,6 +1232,13 @@ async function createMCPTool({
   }
 
   return createToolInstance({
+    invokeTool,
+    scheduledBearerInvocation: bindScheduledMCPBearerInvocation(
+      requestScopedConnections,
+      agentId,
+      toolName,
+    ),
+    scheduledMCPInvocation: bindScheduledMCPInvocation(requestScopedConnections, agentId, toolName),
     res,
     mcpPermissionContext,
     user,
@@ -1234,17 +1258,23 @@ async function createMCPTool({
     currentToolName: matchedToolKey === strippedToolKey ? strippedToolName : undefined,
     serverName,
     serverConfig,
+    customUserVars: userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`],
     toolDefinition: toolEntry['function'],
     upstreamTokenProvider,
     upstreamTokenProviderResolver,
     oboIdentityContext,
+    mcpApps,
     streamId,
     jobCreatedAt,
+    unattended,
     recoveryPolicy,
   });
 }
 
 function createToolInstance({
+  invokeTool,
+  scheduledBearerInvocation,
+  scheduledMCPInvocation,
   res,
   mcpPermissionContext,
   user: capturedUser = null,
@@ -1255,13 +1285,16 @@ function createToolInstance({
   currentToolName,
   serverName,
   serverConfig: capturedServerConfig,
+  customUserVars: capturedCustomUserVars,
   toolDefinition,
   provider: capturedProvider,
   upstreamTokenProvider: capturedUpstreamTokenProvider = null,
   upstreamTokenProviderResolver: capturedUpstreamTokenProviderResolver = null,
   oboIdentityContext: capturedOboIdentityContext = null,
+  mcpApps: capturedMCPApps,
   streamId = null,
   jobCreatedAt,
+  unattended,
   recoveryPolicy,
 }) {
   /** @type {LCTool} */
@@ -1307,7 +1340,11 @@ function createToolInstance({
         ? await mcpPermissionContext.canUseServers(permissionUser)
         : await userCanUseMCPServers(permissionUser);
       if (!canUseMCP) {
-        throw new Error('Forbidden: Insufficient MCP server permissions');
+        throw createMCPPermissionDeniedError(
+          scheduledBearerInvocation,
+          serverName,
+          capturedServerConfig,
+        );
       }
       const flowsCache = getLogStores(CacheKeys.FLOWS);
       const flowManager = getFlowStateManager(flowsCache);
@@ -1316,24 +1353,36 @@ function createToolInstance({
 
       const { args: _args, stepId, ...toolCall } = config.toolCall ?? {};
       const flowId = `${serverName}:oauth_login:${config.metadata.thread_id}:${config.metadata.run_id}`;
-      const runStepDeltaEmitter = createRunStepDeltaEmitter({
-        res,
+      const oauthPrompt = createMCPReauthenticationPrompt({
+        serverName,
+        logger,
+        toolCallId: toolCall.id,
         stepId,
-        toolCall,
-        streamId,
-        jobCreatedAt,
+        runId: config.metadata.run_id,
+        createStart: (step) =>
+          createOAuthCallback({
+            runStepEmitter: createRunStepEmitter({
+              res,
+              runId: config.metadata.run_id,
+              ...step,
+              streamId,
+              jobCreatedAt,
+              unattended,
+            }),
+            runStepDeltaEmitter: createRunStepDeltaEmitter({
+              res,
+              ...step,
+              streamId,
+              jobCreatedAt,
+              unattended,
+            }),
+          }),
+        createEnd: (step) => createOAuthEnd({ res, ...step, streamId, jobCreatedAt, unattended }),
       });
       const oauthStart = createOAuthStart({
         flowId,
         flowManager,
-        callback: runStepDeltaEmitter,
-      });
-      const oauthEnd = createOAuthEnd({
-        res,
-        stepId,
-        toolCall,
-        streamId,
-        jobCreatedAt,
+        callback: oauthPrompt.start,
       });
 
       const customUserVars =
@@ -1350,53 +1399,54 @@ function createToolInstance({
        * is required for OBO since the grant sends the access token to the IdP
        * as the jwt-bearer assertion.
        */
-      const result = await mcpManager.callTool({
-        serverName,
-        serverConfig: capturedServerConfig,
-        /** The upstream server never sees stripped names — a key that dropped
-         *  a redundant server-name prefix calls the ORIGINAL tool. */
-        toolName: serverToolName,
-        provider,
-        toolArguments,
-        options: {
-          signal: derivedSignal,
-        },
-        user: effectiveUser,
-        requestBody: config?.configurable?.requestBody ?? capturedRequestBody,
-        requestScopedConnections:
-          config?.configurable?.requestScopedConnections ?? capturedRequestScopedConnections,
-        customUserVars,
-        flowManager,
-        tokenMethods: {
-          findToken,
-          createToken,
-          updateToken,
-          deleteTokens,
-        },
-        onOAuthCredentialsChanging: (scope) =>
-          prepareMCPAuthorizationMutation(scope, {
-            invalidateRecoveryGeneration: invalidateCachedTools,
-            persistPublicationRetry: persistMCPAuthorizationFenceRetry,
-            clearPublicationRetry: clearMCPAuthorizationFenceRetry,
-            clearLocalRecovery: (userId, changedServerName) =>
-              mcpManager.clearCatalogRecoveryState?.(userId, changedServerName),
-            retryDelaysMs: recoveryPolicy?.authorizationFenceRetryMs,
-            attemptTimeoutMs: recoveryPolicy?.authorizationFenceTimeoutMs,
-          }),
-        oauthStart,
-        oauthEnd,
-        graphTokenResolver: getGraphApiToken,
-        oboTokenResolver: exchangeOboToken,
-        oboTrustChecker: createOboTrustChecker(),
-        upstreamTokenProvider: capturedUpstreamTokenProvider,
-        upstreamTokenProviderResolver: capturedUpstreamTokenProviderResolver,
-        oboIdentityContext: capturedOboIdentityContext,
-      });
-
-      if (isAssistantsEndpoint(provider) && Array.isArray(result)) {
-        return result[0];
-      }
-      return result;
+      return await oauthPrompt.run(() =>
+        invokeTool(mcpManager, {
+          scheduledBearerInvocation,
+          scheduledMCPInvocation,
+          serverName,
+          serverConfig: capturedServerConfig,
+          /** The upstream server never sees stripped names — a key that dropped
+           *  a redundant server-name prefix calls the ORIGINAL tool. */
+          toolName: serverToolName,
+          provider,
+          toolArguments,
+          options: {
+            signal: derivedSignal,
+          },
+          user: effectiveUser,
+          requestBody: config?.configurable?.requestBody ?? capturedRequestBody,
+          requestScopedConnections:
+            config?.configurable?.requestScopedConnections ?? capturedRequestScopedConnections,
+          customUserVars,
+          flowManager,
+          tokenMethods: {
+            findToken,
+            createToken,
+            updateToken,
+            deleteTokens,
+          },
+          onOAuthCredentialsChanging: (scope) =>
+            prepareMCPAuthorizationMutation(scope, {
+              invalidateRecoveryGeneration: invalidateCachedTools,
+              persistPublicationRetry: persistMCPAuthorizationFenceRetry,
+              clearPublicationRetry: clearMCPAuthorizationFenceRetry,
+              clearLocalRecovery: (userId, changedServerName) =>
+                mcpManager.clearCatalogRecoveryState?.(userId, changedServerName),
+              retryDelaysMs: recoveryPolicy?.authorizationFenceRetryMs,
+              attemptTimeoutMs: recoveryPolicy?.authorizationFenceTimeoutMs,
+            }),
+          oauthStart,
+          oauthEnd: oauthPrompt.end,
+          unattended,
+          graphTokenResolver: getGraphApiToken,
+          oboTokenResolver: exchangeOboToken,
+          oboTrustChecker: createOboTrustChecker(),
+          upstreamTokenProvider: capturedUpstreamTokenProvider,
+          upstreamTokenProviderResolver: capturedUpstreamTokenProviderResolver,
+          oboIdentityContext: capturedOboIdentityContext,
+          mcpApps: capturedMCPApps,
+        }),
+      );
     } catch (error) {
       /** A user Stop aborts every in-flight call at once, and that rejection is
        *  the cancellation working, so it must not reach error-level operational
@@ -1422,6 +1472,7 @@ function createToolInstance({
       // recording a durable tool failure; other tool errors are a cheap no-op.
       await require('~/server/services/Schedules').recordMCPToolAuthFailure({
         error,
+        identity: scheduledMCPInvocation?.identity ?? scheduledBearerInvocation?.identity,
         streamId,
         jobCreatedAt,
         userId,
@@ -1430,6 +1481,8 @@ function createToolInstance({
 
       /** Carries the actionable re-auth message; the substring heuristic below would misreport it as an OAuth configuration problem */
       if (
+        error instanceof ScheduledMCPBearerError ||
+        error instanceof ScheduledMCPPolicyError ||
         error instanceof OpenIDReauthRequiredError ||
         error instanceof MCPAuthenticationRefreshError ||
         error instanceof MCPAuthenticationRejectedError
@@ -1468,7 +1521,7 @@ function createToolInstance({
     }
   };
 
-  const toolInstance = tool(_call, {
+  const toolInstance = createMCPStructuredTool(_call, {
     schema,
     name: normalizedToolKey,
     description: description || '',
@@ -1476,6 +1529,17 @@ function createToolInstance({
   });
   toolInstance.mcp = true;
   toolInstance.mcpRawServerName = serverName;
+  createMCPToolApprovalMetadata().bindInstance(toolInstance, {
+    serverName,
+    config: capturedServerConfig,
+    user: capturedUser,
+    body: capturedRequestBody,
+    customUserVars: capturedCustomUserVars,
+    currentToolName,
+    upstreamName: serverToolName,
+    parameters,
+    description,
+  });
   if (serverToolName !== toolName) {
     /** Upstream identity for stripped keys — lets the options aliasing in
      *  `buildToolClassification` heal legacy `tool_options` spellings. */
@@ -1505,18 +1569,30 @@ function createToolInstance({
  * Get MCP setup data including config, connections, and OAuth servers.
  * Resolves config-source servers from admin Config overrides when tenant context is available.
  * @param {string} userId - The user ID
- * @param {{ role?: string, tenantId?: string, appConfig?: object }} [options] - Optional request context
+ * @param {{ role?: string, idOnTheSource?: string | null, tenantId?: string, appConfig?: object }} [options] - Optional request context
  * @returns {Object} Object containing mcpConfig, appConnections, userConnections, and oauthServers
  */
 async function getMCPSetupData(userId, options = {}) {
   const registry = getMCPServersRegistry();
-  const { role, tenantId } = options;
+  const { role, tenantId, idOnTheSource } = options;
 
   const appConfig = options.appConfig ?? (await getAppConfig({ role, tenantId, userId }));
+  const capabilityProfile = resolveMCPClientCapabilityProfile(
+    resolveMCPAppsPolicy(
+      appConfig?.mcpSettings?.apps,
+      undefined,
+      appConfig?.mcpAppSandbox?.maxPersistedAppBytes,
+      appConfig?.mcpAppSandbox?.maxAdmissionRequestsPerMinute,
+      appConfig?.mcpAppSandbox?.url,
+      appConfig?.mcpAppSandbox?.maxActiveViews,
+      appConfig?.mcpAppSandbox?.maxActionPreviewChars,
+      appConfig?.mcpAppSandbox?.operationLimits,
+    ),
+  );
   const configServers = await registry.ensureConfigServers(appConfig?.mcpConfig || {});
-  const mcpConfig = role
-    ? await registry.getAllServerConfigs(userId, configServers, role)
-    : await registry.getAllServerConfigs(userId, configServers);
+  const mcpConfig = await registry.getAllServerConfigs(userId, configServers, role || undefined, {
+    idOnTheSource,
+  });
   const mcpManager = getMCPManager(userId);
   /** @type {Map<string, import('@librechat/api').MCPConnection>} */
   let appConnections = new Map();
@@ -1524,11 +1600,11 @@ async function getMCPSetupData(userId, options = {}) {
     // Use getLoaded() instead of getAll() to avoid forcing connection creation.
     // getAll() creates connections for all servers, which is problematic for servers
     // that require user context (e.g., those with {{LIBRECHAT_USER_ID}} placeholders).
-    appConnections = (await mcpManager.appConnections?.getLoaded()) || new Map();
+    appConnections = await mcpManager.getLoadedAppConnections(capabilityProfile);
   } catch (error) {
     logger.error(`[MCP][User: ${userId}] Error getting app connections:`, error);
   }
-  const userConnections = mcpManager.getUserConnections(userId) || new Map();
+  const userConnections = mcpManager.getUserConnections(userId, capabilityProfile) || new Map();
   const oauthServers = new Set(
     Object.entries(mcpConfig)
       .filter(([, config]) => isOAuthServer(config))
