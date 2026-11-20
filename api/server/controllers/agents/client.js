@@ -2511,6 +2511,35 @@ class AgentClient extends BaseClient {
     };
 
     /**
+     * [cowork] Advertise `ask_user_question` usage rules whenever the capability
+     * is equipped on the agent. Upstream attaches the tool silently (opt-in via
+     * agent/spec/ephemeral toggles) and ships no system-prompt guidance, so
+     * models neither know it exists nor its calling contract until they happen
+     * to discover the schema. Mirrors {@link injectTodoInstructions}: detect on
+     * any representation (string id, {name}, {function:{name}}, toolDefinitions)
+     * and append a compact rules block to the agent instructions.
+     */
+    const injectAskUserQuestionInstructions = (agent) => {
+      const ASK_TOOL = 'ask_user_question';
+      const hasAskTool =
+        (Array.isArray(agent.tools) &&
+          agent.tools.some((t) => {
+            const name = typeof t === 'string' ? t : t?.name ?? t?.function?.name ?? '';
+            return name === ASK_TOOL;
+          })) ||
+        (Array.isArray(agent.toolDefinitions) &&
+          agent.toolDefinitions.some((d) => d?.name === ASK_TOOL));
+      if (!hasAskTool) {
+        return agent;
+      }
+      const askInstructions = `\n\n## Asking the user\n\nYou have the \`${ASK_TOOL}\` tool: it pauses the run, shows the user a question card, and returns their answers. Use it ONLY when genuinely blocked on a decision you cannot resolve from the conversation or your other tools.\n\nRules:\n- Put ALL related questions in ONE call (\`questions\` array of 1-4 items); NEVER call this tool in parallel with any other tool call.\n- Shape: \`{ "questions": [{ "id": "q1", "question": "…", "options": [{ "label": "Short choice", "value": "a" }] }] }\`\n- Each question needs a unique \`id\` matching [A-Za-z][A-Za-z0-9_-]{0,63}; answers come back keyed by that id.\n- Offer 2-6 concise \`options\` when answers are enumerable; OMIT options for open-ended questions. Never invent an \'Other\' option — the UI always offers free-form input.\n- Set \`multiSelect: true\` only when several options can apply at once.\n- Optional per-question fields: \`header\` (short heading), \`description\` (why you ask).\n- The run stays paused until the user answers or cancels; do not guess ahead while waiting.`;
+      agent.instructions = (agent.instructions
+        ? agent.instructions + askInstructions
+        : askInstructions.trim());
+      return agent;
+    };
+
+    /**
      * [cowork] Inject the current conversationId into every agent's system prompt as an
      * HTML comment. This makes it available to agents (e.g. the title-regen agent) without
      * cluttering the visible instructions in the UI.
@@ -2531,7 +2560,12 @@ class AgentClient extends BaseClient {
       if (!agent?.id || agentsById.has(agent.id)) {
         continue;
       }
-      agentsById.set(agent.id, injectConversationId(injectTodoInstructions(normalizeInstructions(agent))));
+      agentsById.set(
+        agent.id,
+        injectConversationId(
+          injectAskUserQuestionInstructions(injectTodoInstructions(normalizeInstructions(agent))),
+        ),
+      );
       for (const subagent of agent.subagentAgentConfigs?.values() ?? []) {
         pendingAgents.push(subagent);
       }
